@@ -51,6 +51,15 @@ export interface ActivationPlanData {
   changes: ActivationChange[];
   /** A pre-change config snapshot exists, so cancel can restore it. */
   snapshot_available: boolean;
+  /** Applying needs a Windows administrator approval (a firewall rule
+   *  change). Absent on older payloads; either spelling. */
+  needs_elevation?: boolean;
+  elevation_required?: boolean;
+}
+
+/** Whether applying the plan makes Windows ask for approval. */
+export function planNeedsElevation(p: ActivationPlanData): boolean {
+  return p.needs_elevation === true || p.elevation_required === true;
 }
 
 const EMPTY_PLAN: ActivationPlanData = {
@@ -176,6 +185,8 @@ export interface ActivationExecution {
   drift: boolean;
   gateway_up: boolean;
   gateway_pending: boolean;
+  /** How the drain ended, when one ran. */
+  quiesce?: { timed_out?: boolean; in_flight?: number } | null;
   items: ActivationExecutionItem[];
 }
 

@@ -283,7 +283,7 @@ check(readFileSync(join(root, "src", "views", "dashboard.ts"), "utf8").includes(
 const optimizeSrc = readFileSync(join(root, "src", "views", "optimize.ts"), "utf8");
 check(optimizeSrc.includes("data-opt-estimate"), "Optimize view renders the per-backend Estimate button (data-opt-estimate)");
 check(optimizeSrc.includes('data-opt-act="estimate-experiments"'), "Optimize view renders the Estimate experiments action");
-check(optimizeSrc.includes("Estimate —"), "Optimize view renders estimate figures under the Estimate label");
+check(optimizeSrc.includes('opt-kv-label">Estimate</span>'), "Optimize view renders estimate figures under the Estimate label");
 
 // Bench MoE offload axis + results tabs: the Run form carries
 // the expert-offload dimension for MoE backends, the results

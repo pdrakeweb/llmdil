@@ -176,6 +176,10 @@ export interface ComponentUpdateReport {
   update_available: boolean;
   applyable: boolean;
   note: string | null;
+  /** Whether the component can update itself; absent on older payloads. */
+  auto_update_supported?: boolean;
+  /** When this component was last checked (RFC 3339 or epoch ms). */
+  last_checked?: string | number | null;
   /** This component's release feed failed; the rest of the check stands. */
   check_error: string | null;
   source: string | null;
@@ -414,6 +418,8 @@ export interface MxcSelfTestCase {
 export interface MxcSelfTestData {
   cases: MxcSelfTestCase[];
   summary: { total: number; passed: number; failed: number };
+  /** Whether the MXC runtime is installed; absent on older payloads. */
+  runtime_installed?: boolean;
 }
 
 /** mxc_run_self_test — evaluate the fixed probe set against the

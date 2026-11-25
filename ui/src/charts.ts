@@ -3,10 +3,26 @@
 
 import { esc } from "./html";
 
-function points(values: number[], w: number, h: number, pad = 1): string {
+/** The value range a sparkline draws: the data's own range, widened
+ *  around its middle to at least `minSpan` (default a tenth of the
+ *  largest value), so noise — one degree, half a watt — never fills the
+ *  full height. Values are never drawn below zero when none is. */
+export function sparkRange(values: number[], minSpan?: number): [number, number] {
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  const want = minSpan ?? (Math.abs(max) * 0.1 || 1);
+  if (max - min < want) {
+    const floor = min >= 0 ? 0 : -Infinity;
+    const mid = (min + max) / 2;
+    min = Math.max(floor, mid - want / 2);
+    max = min + want;
+  }
+  return [min, max];
+}
+
+function points(values: number[], w: number, h: number, pad = 1, minSpan?: number): string {
   if (values.length === 0) return "";
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const [min, max] = sparkRange(values, minSpan);
   const span = max - min || 1;
   const stepX = values.length > 1 ? (w - pad * 2) / (values.length - 1) : 0;
   return values
@@ -18,21 +34,31 @@ function points(values: number[], w: number, h: number, pad = 1): string {
     .join(" ");
 }
 
-/** Area sparkline with line on top. */
+/** Area sparkline with line on top; shrinks with its container. */
 export function sparkline(
   values: number[],
   w: number,
   h: number,
   color: string,
   fillOpacity = 0.18,
+  minSpan?: number,
 ): string {
-  const pts = points(values, w, h);
-  if (!pts) return `<svg width="${w}" height="${h}"></svg>`;
+  const pts = points(values, w, h, 1, minSpan);
+  if (!pts) return `<svg width="${w}" height="${h}" style="max-width:100%"></svg>`;
   const area = `${1},${h} ${pts} ${w - 1},${h}`;
-  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block;max-width:100%" preserveAspectRatio="none" aria-hidden="true">
     <polygon points="${area}" fill="${color}" opacity="${fillOpacity}"/>
-    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5"/>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
   </svg>`;
+}
+
+/** `text` cut to fit `px` pixels at a font size, with an ellipsis —
+ *  SVG text neither wraps nor clips. `em` is the average glyph width
+ *  (0.62 suits the mono sublabels, 0.58 the bold titles). Put the full
+ *  text in a <title>. */
+export function fitText(text: string, px: number, fontPx: number, em = 0.62): string {
+  const max = Math.max(1, Math.floor(px / (fontPx * em)));
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}\u2026`;
 }
 
 /** Donut gauge ring with centered label. */

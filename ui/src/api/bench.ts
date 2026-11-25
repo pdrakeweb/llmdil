@@ -194,17 +194,20 @@ export async function benchPromptGenerateCancel(): Promise<CallResult<Record<str
   }
 }
 
-/** bench_run_start — validate, expand, and launch a sweep. An
+/** bench_run_start — validate, expand, and run a sweep. The call may
+ *  stay open for the whole sweep (progress comes from
+ *  bench_results_list meanwhile), so a caller polls from the moment it
+ *  calls; `sweep_id` is absent when the payload does not name one. An
  *  interlock failure rejects with a message listing the conflicting
  *  running backends; the caller parses it for the stop-and-run
  *  confirmation (nothing is stopped without that explicit action). */
-export async function benchRunStart(request: BenchSweepRequest): Promise<CallResult<{ sweep_id: string }>> {
-  if (!isTauri()) return { data: { sweep_id: "" }, live: false };
+export async function benchRunStart(request: BenchSweepRequest): Promise<CallResult<{ sweep_id?: string }>> {
+  if (!isTauri()) return { data: {}, live: false };
   try {
-    const data = await invoke<{ sweep_id: string }>("bench_run_start", { request });
-    return { data, live: true };
+    const data = await invoke<{ sweep_id?: string } | null>("bench_run_start", { request });
+    return { data: data ?? {}, live: true };
   } catch (e) {
-    return { data: { sweep_id: "" }, live: true, error: errOf(e) };
+    return { data: {}, live: true, error: errOf(e) };
   }
 }
 

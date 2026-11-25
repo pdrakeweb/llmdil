@@ -43,6 +43,9 @@ export interface McpServerRow {
    *  "failed" once a Local server exited on its own. Optional: older
    *  backends do not send it. */
   process_state?: string;
+  /** Why the server cannot run (a policy or a missing prerequisite), or
+   *  null. Absent on older payloads. */
+  blocked_reason?: string | null;
   credential_present: boolean;
   /** "present" | "missing" — the §9 card wording. */
   credential_status: string;

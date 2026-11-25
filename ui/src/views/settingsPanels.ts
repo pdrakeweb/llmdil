@@ -1,14 +1,14 @@
 /* Settings view panels: MXC policy, app updates, supervision, log
    shipping, component updates, remote access (split from static.ts). */
 
-import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, LogReceiverInfo, LogShipperInfo, MxcActivityData, MxcPolicyData, ServicesInfo, TaskRecordWire } from "../api";
+import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, ComponentUpdateReport, LogReceiverInfo, LogShipperInfo, MxcActivityData, MxcPolicyData, ServicesInfo, TaskRecordWire } from "../api";
 import { fmtCount, stackedBar, trim1 } from "../charts";
 import { esc } from "../html";
 import { icon } from "../icons";
 import { META, lifecycleChip, lifecycleLabel, logReceiverState, renderLifecycleActions, serviceRowState, serviceStore, targetKey } from "../lifecycle";
 import type { LifecycleTarget, ServiceSnapshot } from "../lifecycle";
 import { enableSwitch } from "../switch";
-import { C, cadenceBucket, fmtDate, fmtTime, loadingHtml } from "./common";
+import { C, cadenceBucket, fmtTime, loadingHtml } from "./common";
 import { fmtDateTime } from "./logs";
 
 /* ---------------- Settings ---------------- */
@@ -60,7 +60,7 @@ type SettingsRow = { key: string; value: string; tip?: string; copy?: string };
  *  (narrative) and a Copy button (addresses: paths). */
 function settingsRows(rows: SettingsRow[]): string {
   if (!rows.length) return "";
-  return `<div class="kv" style="gap:10px">${rows.map((r) => `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">${esc(r.key)}${r.tip ? `<span class="info-tip" title="${esc(r.tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:12px;text-align:right">${esc(r.value)}${r.copy !== undefined ? ` <button class="btn" data-copy-value="${esc(r.copy)}" title="Copy" aria-label="Copy value" style="padding:1px 7px;font-size:11px">${icon("copy")}</button>` : ""}</span></div>`).join("")}</div>`;
+  return `<div class="kv settings-rows">${rows.map((r) => `<div style="display:flex;justify-content:space-between;gap:16px"><span class="k">${esc(r.key)}${r.tip ? `<span class="info-tip" title="${esc(r.tip)}">${icon("info")}</span>` : ""}</span><span class="v" style="font-size:12px;text-align:right">${esc(r.value)}${r.copy !== undefined ? ` <button class="btn" data-copy-value="${esc(r.copy)}" title="Copy" aria-label="Copy value" style="padding:1px 7px;font-size:11px">${icon("copy")}</button>` : ""}</span></div>`).join("")}</div>`;
 }
 
 const MXC_MODES: { mode: string; label: string; def: string }[] = [
@@ -481,6 +481,22 @@ export function componentUpdatesInner(check: ComponentUpdateCheck | null, live: 
   return `${head}<div style="font-size:12px;color:var(--text2);margin-top:4px">Checked ${esc(fmtDateTime(check.checked_at))}</div>${rows}${actions}${taskLine}`;
 }
 
+/** Whether a component offers auto-update: what the payload says, and
+ *  without it every component but LiteLLM, which moves only by an
+ *  explicit pin. */
+export function autoUpdateSupported(name: string, stored: Record<string, unknown>, report: ComponentUpdateReport | undefined): boolean {
+  const said = report?.auto_update_supported ?? (typeof stored.auto_update_supported === "boolean" ? stored.auto_update_supported : undefined);
+  return said ?? !/litellm/i.test(name);
+}
+
+/** A component's last check, from the check this session ran or the
+ *  stored record; null when it was never checked. */
+function lastCheckText(stored: Record<string, unknown>, report: ComponentUpdateReport | undefined, checkedAt: string | undefined): string | null {
+  const raw = report?.last_checked ?? (report ? checkedAt : undefined) ?? stored.last_checked;
+  if (typeof raw === "number" && raw > 0) return fmtDateTime(new Date(raw).toISOString());
+  return typeof raw === "string" && raw ? fmtDateTime(raw) : null;
+}
+
 export function settingsPaint(
   cfg: Record<string, unknown>,
   policyR: { data: MxcPolicyData | null; error?: string; live: boolean },
@@ -492,6 +508,7 @@ export function settingsPaint(
   appUpdateHtml = "",
   logReceiverHtml = "",
   componentUpdatesHtml = "",
+  check: ComponentUpdateCheck | null = null,
 ): string {
   const notif = asRecord(cfg.notifications);
   const tabs: { id: SettingsTab; label: string }[] = [
@@ -586,22 +603,23 @@ export function settingsPaint(
       const c = asRecord(v);
       if (!c) return `<div style="display:flex;justify-content:space-between;gap:16px;padding:4px 0"><span class="k">${esc(name)}</span><span style="font-size:12px">${esc(summarizeValue(v))}</span></div>`;
       const pinned = primStr(c.pinned_version);
-      const checked = primStr(c.last_checked);
+      const report = check?.components.find((x) => x.id === name || x.name === name);
+      const checked = lastCheckText(c, report, check?.checked_at);
       // Pin and auto-update carry working controls wired to their
       // dedicated ops (updates_pin / updates_set_auto); last_checked
       // stays text — it is a recorded timestamp, not a setting.
       return `<div style="padding:4px 0;border-bottom:1px solid var(--border)">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:16px">
           <span class="k">${esc(name)}</span>
-          <span style="display:flex;gap:6px;align-items:center">
+          ${autoUpdateSupported(name, c, report) ? `<span style="display:flex;gap:6px;align-items:center">
             <span style="font-size:12px;color:var(--text2)">Auto-update</span>
             ${enableSwitch({ on: c.auto_update === true, name: `${name} auto-update`, attrs: `data-comp-auto="${esc(name)}"` })}
-          </span></div>
+          </span>` : `<span style="font-size:12px;color:var(--text2)" title="This component moves only by setting a version pin.">Updates: by pin only</span>`}</div>
         <div style="display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap">
           <label style="font-size:12px;color:var(--text2)">Pinned version <input type="text" data-comp-pin-input="${esc(name)}" value="${pinned !== null ? esc(pinned) : ""}" placeholder="unpinned" style="width:170px;font-size:12px"></label>
           <button class="btn" data-comp-pin-save="${esc(name)}" style="padding:1px 7px;font-size:11px">${pinned !== null ? "Save pin" : "Pin"}</button>
           ${pinned !== null ? `<button class="btn" data-comp-unpin="${esc(name)}" style="padding:1px 7px;font-size:11px">Unpin</button>` : ""}
-          ${checked !== null ? `<span style="font-size:12px;color:var(--text2)">Checked: ${esc(fmtDate(checked))}</span>` : ""}
+          <span style="font-size:12px;color:var(--text2)">Last checked: ${checked !== null ? esc(checked) : "never"}</span>
         </div></div>`;
     }).join("") : "";
     const restRows = humanEntries(restUpdates);

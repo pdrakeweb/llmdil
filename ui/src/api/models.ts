@@ -31,12 +31,15 @@ export interface ModelRow {
    *  else null. The final path only ever holds complete files, so a
    *  nonzero partial_bytes with on_disk=false means "partial download". */
   partial_bytes: number | null;
+  /** The transfer's own total and rate, when the backend reports them. */
+  total_bytes?: number | null;
+  bytes_per_sec?: number | null;
   /** Last terminal download failure for this model in this session
    *  (transport error, or a hash mismatch — which also removes the
    *  downloaded file), else null. */
   download_error: string | null;
   /** Curated catalog size for this model when known. An ESTIMATE, used
-   *  only for display ("~X GB (estimate)"), never for verification. */
+   *  only for display ("~X GiB (estimate)"), never for verification. */
   catalog_size_bytes: number | null;
   /** The model's rated maximum context length in tokens, from the
    *  curated catalog (null for models outside it). The backend flags

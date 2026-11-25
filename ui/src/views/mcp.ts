@@ -176,6 +176,7 @@ export async function wireMcp(root: HTMLElement): Promise<() => void> {
     if (s.exposure === "local" && s.process_state === "failed") {
       lines.push(line("Process", `<span style="color:var(--err)">exited unexpectedly</span>`));
     }
+    if (s.blocked_reason) lines.push(line("Blocked", `<span style="color:var(--err)">${esc(s.blocked_reason)}</span>`));
     // Tools are known only after a Test this session returned a
     // list (principle 12: unmeasured renders as absent, not 0).
     if (result && result.tools) lines.push(line("Tools", String(result.tools.length)));

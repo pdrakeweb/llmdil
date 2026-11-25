@@ -498,6 +498,8 @@ export interface OptimizeState {
   consult_progress?: OptimizeConsultProgress | null;
   /** The Rust apply executor is running (Phase 3). */
   applying?: boolean;
+  /** Backends a job stopped and could not start again. */
+  restore_failures?: RestoreFailure[] | null;
 }
 
 export interface OptimizeConsultProgress {
@@ -581,7 +583,11 @@ export interface TuningSweep {
   detail?: string | null;
   adopted: boolean;
   adopted_anyway: boolean;
+  /** Backends the sweep stopped and could not start again. */
+  restore_failures?: RestoreFailure[] | null;
 }
+
+export interface RestoreFailure { id: string; error: string }
 
 /** The sweep preview (Addendum B §B.2/§B.3). */
 export interface TuningPreview {

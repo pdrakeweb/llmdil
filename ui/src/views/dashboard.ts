@@ -12,16 +12,17 @@
    Backend failures keep the last good model and show an error banner —
    never fabricated data presented as live. */
 
-import { getDashboard, openRouterSpendBannerHtml, systemVerdict } from "../api";
-import type { SystemVerdict } from "../api";
+import { getDashboard, getModels, openRouterSpendBannerHtml, systemVerdict } from "../api";
+import type { ModelRow, SystemVerdict } from "../api";
 import {
   LIFECYCLE_COLORS, META, lifecycleChip, lifecycleColor, lifecycleDot, lifecycleEdge, lifecycleLabel,
   renderLifecycleActions, runLifecycle, serviceStore, summarize, toStatus, wireLifecycleActions,
 } from "../lifecycle";
 import type { LifecycleState, ServiceSnapshot } from "../lifecycle";
-import { esc } from "../html";
-import { fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
+import { esc, keepFocus } from "../html";
+import { fitText, fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
 import { icon } from "../icons";
+import { modelDisplayName } from "./common";
 import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment, Status } from "../types";
 
 type ViewMode = "appliance" | "console" | "topology";
@@ -62,6 +63,8 @@ let lastGatewayError: string | null = null;
  *  (spec §7: cap reached or ≥80% of it); empty when neither. */
 let lastSpendBanner = "";
 let tickTimer: number | null = null;
+/** Registered models, for the one display name per model. */
+let models: ModelRow[] = [];
 /** Set by the mount's teardown: an in-flight poll that resolves after
  *  navigation must not render into the next route's #view. */
 let disposed = false;
@@ -101,6 +104,7 @@ function statusLive(s: Status | undefined): boolean {
  *  the transition at once. */
 function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel {
   if (!snap.live || snap.updatedAt === 0) return m;
+  const name = (x: string): string => modelDisplayName(x, models);
   const rows = new Map(snap.backends.map((r) => [r.id, r]));
   const backends = m.backends.map((b) => {
     const r = rows.get(b.id);
@@ -108,6 +112,7 @@ function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel 
     const st = r ? serviceStore.backendState(r) : serviceStore.effective(key, b.lifecycle);
     return {
       ...b,
+      model: name(b.model),
       lifecycle: st,
       status: toStatus(st),
       transition: serviceStore.transitionOf(key, r ? r.transition ?? null : b.transition ?? null),
@@ -117,11 +122,11 @@ function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel 
   });
   const gs = serviceStore.gatewayState();
   const gateway = m.gateway && gs
-    ? { ...m.gateway, lifecycle: gs, status: toStatus(gs), transition: serviceStore.transitionOf("gateway", snap.gateway?.transition ?? null) }
+    ? { ...m.gateway, port: snap.gateway?.running_port ?? m.gateway.port, lifecycle: gs, status: toStatus(gs), transition: serviceStore.transitionOf("gateway", snap.gateway?.transition ?? null) }
     : m.gateway;
   const placement = m.placement.map((p) => {
     const b = p.backendId ? backends.find((x) => x.id === p.backendId) : undefined;
-    return b ? { ...p, backendStatus: b.status } : p;
+    return { ...p, model: name(p.model), ...(b ? { backendStatus: b.status } : {}) };
   });
   return { ...m, backends, gateway, placement, gatewayState: gs ?? m.gatewayState, gatewayUp: gs ? META[gs].isLive : m.gatewayUp };
 }
@@ -174,13 +179,15 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   // IS a percentage and drives its arc when present; when health is
   // absent the ring is omitted entirely and the rows take the width.
   let ring = "";
+  let ringTip = "Health: success share, last hour";
   if (isGateway) {
     const share = b.requests_1h !== undefined && b.requests_1h > 0
       ? 100 * (1 - (b.errors_1h ?? 0) / b.requests_1h)
       : undefined;
+    ringTip = "Success share, last hour";
     ring = share === undefined
-      ? gaugeRing(0, 64, "var(--line)", "—", "success / 1h")
-      : gaugeRing(share, 64, ringColor, `${Math.round(share)}%`, "success / 1h");
+      ? gaugeRing(0, 64, "var(--line)", "—", "success")
+      : gaugeRing(share, 64, ringColor, `${Math.round(share)}%`, "success");
   } else if (b.health !== undefined) {
     ring = gaugeRing(b.health, 64, ringColor, b.health.toFixed(0), "health");
   }
@@ -207,9 +214,9 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
       <button class="btn icon-only" data-act="logs" data-id="${esc(b.id)}" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</button>
     </div>`;
   return `<div class="card">
-    <h3>${lifecycleDot(b.lifecycle)} ${esc(b.name)} <span class="port">:${b.port}</span> ${lifecycleChip(b.lifecycle, { transition: b.transition ?? null })}</h3>
+    <h3>${lifecycleDot(b.lifecycle)} <span class="svc-name" title="${esc(b.name)}">${esc(b.name)}</span> <span class="port">:${b.port}</span> ${lifecycleChip(b.lifecycle, { transition: b.transition ?? null })}</h3>
     <div class="svc-top">
-      ${ring}
+      ${ring ? `<span title="${ringTip}" style="display:flex;flex:0 0 auto">${ring}</span>` : ""}
       <div class="kv">
         <span class="k">${m1k}</span><span class="v">${esc(m1v)}<small>${m1u}</small></span>
         <span class="k" style="margin-top:4px">${m2k}</span><span class="v">${esc(m2v)}<small>${m2u}</small></span>
@@ -278,9 +285,9 @@ function gpuStripCard(g: GpuInfo): string {
   // series keyed by its metric name); open state is module-level so
   // the poll repaint preserves it.
   const trendRows: string[] = [];
-  if (g.util_spark && g.util_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Utilization</span>${sparkline(g.util_spark, 220, 26, C.blue)}</div>`);
-  if (g.temp_spark && g.temp_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Temperature</span>${sparkline(g.temp_spark, 220, 26, C.amber)}</div>`);
-  if (g.power_w != null && g.power_spark && g.power_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Power</span>${sparkline(g.power_spark, 220, 26, C.green)}</div>`);
+  if (g.util_spark && g.util_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Utilization</span>${sparkline(g.util_spark, 220, 26, C.blue, 0.18, 20)}</div>`);
+  if (g.temp_spark && g.temp_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Temperature</span>${sparkline(g.temp_spark, 220, 26, C.amber, 0.18, 10)}</div>`);
+  if (g.power_w != null && g.power_spark && g.power_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Power</span>${sparkline(g.power_spark, 220, 26, C.green, 0.18, 20)}</div>`);
   const trendsOpen = openTrends.has(g.id);
   const trends = trendRows.length
     ? `<div style="margin-top:8px"><button class="btn" data-trends="${esc(g.id)}" aria-expanded="${trendsOpen}" title="Trends" aria-label="Trends" style="padding:2px 8px;font-size:11px">${icon(trendsOpen ? "chevD" : "chevR")}</button>
@@ -325,8 +332,8 @@ function applianceView(m: DashboardModel, live: boolean): string {
   // Placement rows are per BACKEND (placements belong to backends,
   // not models). Eventual treatment keys off actuality: a disabled
   // backend's placement, and an enabled-but-not-running backend's,
-  // are both not in effect — gray segments, reduced opacity, an
-  // "eventual" tag. Bar widths and tooltip percentages both come
+  // are both not in effect — reduced opacity and an "eventual" tag,
+  // each segment in its GPU's color. Bar widths and tooltip percentages both come
   // from the segment's unrounded fraction, so the chart and its
   // stated values are the same number; sub-1% shares render as a
   // minimum-width sliver with the true value in the tooltip. A
@@ -346,20 +353,18 @@ function applianceView(m: DashboardModel, live: boolean): string {
     const barTip = p.defaulted ? ` title="No split configured — an unsplit launch loads on GPU 0."` : "";
     const segs = p.segments.map((s, k) => ({
       pct: Math.max(s.frac * 100, s.frac > 0 ? 2 : 0),
-      color: eventual || p.defaulted ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)),
+      color: p.defaulted ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)),
       label: `${s.gpu} ${fmtPct(s.frac)}%`,
     }));
     return `<div class="place-row${eventual ? " eventual" : ""}"${p.defaulted && !eventual ? ` style="opacity:.55"` : ""}><span class="mname">${esc(label)}${p.backendId ? ` <span class="place-model">${esc(p.model)}</span>` : ""}${tag}</span>
       <div${barTip}>${stackedBar(segs)}</div></div>`;
   }).join("");
-  // The legend is built from the RUNNING rows actually rendered:
-  // each distinct segment label with the palette color its GPU
-  // position produced. Eventual and defaulted rows render gray or
-  // ghosted and stay out of the legend — their colors assert nothing.
+  // The legend lists every GPU a configured placement uses, running or
+  // not, with the palette color its GPU position produced. Defaulted
+  // rows render gray and stay out of it.
   const legendByLabel = new Map<string, string>();
   for (const p of m.placement) {
-    if (p.backendEnabled === false || p.defaulted) continue;
-    if (p.backendStatus !== undefined && !statusLive(p.backendStatus)) continue;
+    if (p.defaulted) continue;
     p.segments.forEach((s, k) => {
       if (!legendByLabel.has(s.gpu)) legendByLabel.set(s.gpu, gpuColor(segmentGpuPos(s, k, m.gpus)));
     });
@@ -430,12 +435,14 @@ function topologyView(m: DashboardModel): string {
   if (!m.backends.length && !m.gpus.length && !m.gateway) {
     return `<div class="card"><div class="empty">No topology to draw — no backends or GPUs reported. Run the setup wizard to install and configure the stack.</div></div>`;
   }
-  const W = 980, H = 380;
-  const colX = [50, 290, 530, 770];
-  const nodeW = 130, nodeH = 56;
   const backs = m.backends;
   const gpus = m.gpus;
   const models = m.placement;
+  // The canvas grows with the tallest column, so nodes never overlap.
+  const nodeW = 210, nodeH = 52, rowH = 64;
+  const colX = [20, 300, 580, 860];
+  const rows = Math.max(1, backs.length, gpus.length);
+  const W = 1090, H = Math.max(320, 80 + rows * rowH);
 
   /** Edge class follows the backend's lifecycle state (the shared
    *  lifecycleEdge rule, as on the Service Map). */
@@ -446,18 +453,18 @@ function topologyView(m: DashboardModel): string {
    *  the map shows what is configured — but unconnected. */
   const running = (s: Status | undefined): boolean => statusLive(s);
 
-  const cy = (i: number, n: number) => 60 + (i * (H - 120)) / Math.max(1, n - 1 || 1);
-  let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%" role="img" aria-label="Cluster topology mini map">`;
+  const cy = (i: number, n: number) => 44 + (H - 60) * ((i + 0.5) / Math.max(1, n));
+  let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:auto" role="img" aria-label="Cluster topology mini map">`;
   const edge = (x1: number, y1: number, x2: number, y2: number, label: string, cls = "") => {
     const mx = (x1 + x2) / 2;
     svg += `<path class="map-edge ${cls}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
     if (label) svg += `<text class="map-edge-label" x="${mx}" y="${(y1 + y2) / 2 - 4}" text-anchor="middle">${esc(label)}</text>`;
   };
   const node = (x: number, y: number, title: string, sub: string, dot: string) => {
-    svg += `<g><rect class="map-node" x="${x}" y="${y - nodeH / 2}" width="${nodeW}" height="${nodeH}" rx="8"/>
+    svg += `<g><title>${esc(`${title}\n${sub}`)}</title><rect class="map-node" x="${x}" y="${y - nodeH / 2}" width="${nodeW}" height="${nodeH}" rx="8"/>
       <circle cx="${x + 14}" cy="${y - 8}" r="4" fill="${dot}"/>
-      <text class="map-node-text" x="${x + 26}" y="${y - 2}">${esc(title)}</text>
-      <text class="map-node-sub" x="${x + 14}" y="${y + 16}">${esc(sub)}</text></g>`;
+      <text class="map-node-text" x="${x + 26}" y="${y - 2}">${esc(fitText(title, nodeW - 36, 12, 0.6))}</text>
+      <text class="map-node-sub" x="${x + 14}" y="${y + 16}">${esc(fitText(sub, nodeW - 24, 10))}</text></g>`;
   };
 
   node(colX[0], H / 2, "LiteLLM",
@@ -514,8 +521,8 @@ function topologyView(m: DashboardModel): string {
   // is the backend's status color, and the sublabel is the split
   // summary — configuration alone never asserts a model is "loaded".
   const linkedModels = models.filter(linked);
-  linkedModels.slice(0, 4).forEach((p, i) => {
-    const y = cy(i, Math.min(4, linkedModels.length));
+  linkedModels.forEach((p, i) => {
+    const y = cy(i, linkedModels.length);
     const owner = p.backendId ? backs.find((b) => b.id === p.backendId) : undefined;
     const sub = p.segments.length ? p.segments.map((s) => `${s.pct}%`).join(" \u00b7 ") : "\u2014";
     node(colX[3], y, p.model, sub, owner ? lifecycleColor(owner.lifecycle) : LIFECYCLE_COLORS.grey);
@@ -632,7 +639,11 @@ function render(): void {
     error: lastError,
   });
   const body = mode === "appliance" ? applianceView(m, lastLive) : mode === "console" ? consoleView(m) : topologyView(m);
-  el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict, startAllBar(m)) + `<div class="view">${body}</div>`;
+  // The repaint keeps the scroll position and the keyboard focus.
+  const top = el.querySelector(".view")?.scrollTop ?? 0;
+  keepFocus(el, () => { el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict, startAllBar(m)) + `<div class="view">${body}</div>`; });
+  const scroller = el.querySelector(".view");
+  if (scroller && top) scroller.scrollTop = top;
   el.querySelectorAll("[data-view]").forEach((b) =>
     b.addEventListener("click", () => { setMode((b as HTMLElement).dataset.view as ViewMode); render(); }));
   el.querySelectorAll("[data-trends]").forEach((b) =>
@@ -705,7 +716,10 @@ async function doPoll(snap?: ServiceSnapshot): Promise<void> {
     : undefined;
   let r: Awaited<ReturnType<typeof getDashboard>>;
   try {
-    r = await getDashboard(prefetched); // never rejects; failures arrive as r.error
+    // Neither rejects; failures arrive as .error.
+    const [d, mr] = await Promise.all([getDashboard(prefetched), getModels()]);
+    r = d;
+    if (!mr.error) models = mr.data;
   } finally {
     fetching = false;
   }

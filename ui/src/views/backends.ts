@@ -1925,7 +1925,8 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("click", onClick);
   root.addEventListener("click", onOvGoto);
-  root.addEventListener("keydown", onKeyDown);
+  // On the document: Escape closes the menu wherever the focus is.
+  document.addEventListener("keydown", onKeyDown);
 
   await load();
 
@@ -1968,7 +1969,7 @@ export async function wireBackends(root: HTMLElement): Promise<() => void> {
     stopPredictTicker();
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
-    root.removeEventListener("keydown", onKeyDown);
+    document.removeEventListener("keydown", onKeyDown);
     root.removeEventListener("change", syncEditModel);
     root.removeEventListener("change", syncFlagsDraft);
     root.removeEventListener("input", syncFlagsDraft);

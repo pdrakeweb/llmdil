@@ -2,7 +2,10 @@
 
 import { adminApiCreateEnrollment, adminApiCreateUser, adminApiDeleteUser, adminApiGetAudit, adminApiGetStatus, adminApiListUsers, adminApiRegenerateCert, adminApiResetPassword, adminApiSetEnabled, adminApiUpdateUser, appUpdateCheck, appUpdateDownload, appUpdateSetAuto, appUpdateSetChecking, exportDiagnostics, getAppConfig, getAppUpdateStatus, getMxcActivity, getMxcPolicy, logReceiverDeploy, logReceiverFlipEndpoint, logReceiverRemove, logReceiverStatus, mxcRunSelfTest, openFolder, sendTestNotification, servicesList, servicesRegister, servicesUnregister, setMxcMode, setNotificationConfig, setSupervisionMode, setTelemetryInterval, taskAbort, tasksList, updateAppConfig, updatesApply, updatesCheckAll, updatesPin, updatesSetAuto, winmlRecheckCapabilities } from "../api";
 import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, TaskRecordWire } from "../api";
-import { esc } from "../html";
+import { confirmDialog } from "../dialog";
+import { portError } from "../errors";
+import { esc, keepFocus } from "../html";
+import { pageState } from "../viewState";
 import { icon } from "../icons";
 import { serviceStore, wireLifecycleActions } from "../lifecycle";
 import type { LifecycleResult } from "../lifecycle";
@@ -12,8 +15,8 @@ import type { SettingsTab, SettingsUi } from "./settingsPanels";
 
 export function renderSettings(): string {
   return `${topbar("Settings")}
-  <div class="view" style="max-width:960px"><div id="setBanner"></div>
-  <div id="setMsg" style="font-size:12px;margin-bottom:8px"></div>
+  <div class="view"><div id="setBanner"></div>
+  <div id="setMsg" class="page-msg"></div>
   <div id="setBody">${loadingHtml("Loading settings\u2026")}</div></div>`;
 }
 
@@ -22,8 +25,8 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   /** Self-test result HTML survives repaints (kept in the closure). */
   let selfTestHtml = "";
   /** Tab + MXC rules-filter/expandable state, held outside the
-   *  repainted DOM. */
-  const setUi: SettingsUi = { tab: "general", rulesFilter: "fs", rulesOpen: new Set<string>(), allOpen: false };
+   *  repainted DOM and kept across visits. */
+  const setUi = pageState<SettingsUi>("settings", { tab: "general", rulesFilter: "fs", rulesOpen: new Set<string>(), allOpen: false });
 
   let lastExportPath = "";
   /** Last loaded notifications object, so a toggle click can send
@@ -104,11 +107,12 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     // "unavailable — <error>", distinct from genuine absence.
     if (setUi.tab === "remote") await loadRemote();
     if (disposed) return;
-    b.innerHTML = settingsPaint(cfgR.data, polR, actR, selfTestHtml, setUi, svcR,
+    const cfg = cfgR.data;
+    keepFocus(b, () => { b.innerHTML = settingsPaint(cfg, polR, actR, selfTestHtml, setUi, svcR,
       remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit),
       appUpdateInner(lastAppUpd, appUpdLive),
       logReceiverInner(lrR, lrNewToken),
-      componentUpdatesInner(compCheck, appUpdLive, compTask));
+      componentUpdatesInner(compCheck, appUpdLive, compTask), compCheck); });
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -145,7 +149,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     const raRegen = t.closest("[data-ra-regen]") as HTMLButtonElement | null;
     if (raRegen) {
-      if (!confirm("Regenerate the API certificate? The fingerprint changes and every paired device must pair again.")) return;
+      if (!await confirmDialog({ title: "Regenerate the API certificate?", body: "The fingerprint changes and every paired device must pair again.", confirmLabel: "Regenerate", danger: true })) return;
       raRegen.disabled = true;
       const r = await adminApiRegenerateCert();
       if (disposed) return;
@@ -236,7 +240,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     if (raDelete) {
       const id = raDelete.getAttribute("data-ra-delete") ?? "";
       const name = raDelete.getAttribute("data-ra-name") ?? "";
-      if (!confirm(`Delete user ${name}? Their sessions and API tokens are revoked.`)) return;
+      if (!await confirmDialog({ title: `Delete user ${name}?`, body: "Their sessions and API tokens are revoked.", confirmLabel: "Delete", danger: true })) return;
       const r = await adminApiDeleteUser(id);
       if (disposed) return;
       if (r.error) setMsg(`Delete failed: ${r.error}`, true);
@@ -291,6 +295,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
         const s = r.data.summary;
         const failed = r.data.cases.filter((c) => !c.passed);
         selfTestHtml = `<div style="font-size:12px;margin-top:8px">
+          ${r.data.runtime_installed === false ? `<div style="color:#e3b341">MXC runtime: not installed — the probes ran against the policy only.</div>` : ""}
           <div>Self-test: ${s.passed}/${s.total} probes passed${s.failed ? ` \u2014 ${s.failed} failed` : ""}.${failed.length ? `<span class="info-tip" title="To fix a failing case, edit the policy file at the Policy file path shown above and restart the app to apply it.">${icon("info")}</span>` : ""}</div>
           ${failed.map((c) => `<div style="color:var(--err)">${esc(c.name)}: expected ${esc(c.expected)}, got ${esc(c.actual)} \u2014 ${esc(c.description)}</div>`).join("")}
         </div>`;
@@ -384,7 +389,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       const id = compApply ? (compApply.getAttribute("data-compupd-apply") ?? "") : "all";
       const version = compApply ? (compApply.getAttribute("data-compupd-version") ?? "") : "";
       const what = id === "all" ? "every available update of an unpinned component" : `${id}${version ? ` ${version}` : ""}`;
-      if (!window.confirm(`Apply ${what}? Dependent services (backends or the gateway) are stopped and restarted; a failed update is rolled back.`)) return;
+      if (!await confirmDialog({ title: `Apply ${what}?`, body: "Dependent services (backends or the gateway) are stopped and restarted; a failed update is rolled back.", confirmLabel: "Apply" })) return;
       (compApply ?? compApplyAll)!.disabled = true;
       const r = await updatesApply(id, version || null);
       if (disposed) return;
@@ -413,10 +418,10 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     const winmlApply = t.closest("#setWinmlApply") as HTMLButtonElement | null;
     if (winmlApply) {
-      const port = Math.round(Number((root.querySelector("#setWinmlPort") as HTMLInputElement | null)?.value));
+      const port = Number((root.querySelector("#setWinmlPort") as HTMLInputElement | null)?.value);
       const model = ((root.querySelector("#setWinmlModel") as HTMLInputElement | null)?.value ?? "").trim();
-      if (!Number.isFinite(port) || port < 1 || port > 65535) {
-        setMsg("Windows ML port must be between 1 and 65535.", true);
+      if (portError(port)) {
+        setMsg("Windows ML port must be a whole number between 1 and 65,535.", true);
         return;
       }
       winmlApply.disabled = true;
@@ -452,9 +457,9 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     const pgApply = t.closest("#setPgApply") as HTMLButtonElement | null;
     if (pgApply) {
-      const port = Math.round(Number((root.querySelector("#setPgPort") as HTMLInputElement | null)?.value));
-      if (!Number.isFinite(port) || port < 1 || port > 65535) {
-        setMsg("PostgreSQL port must be between 1 and 65535.", true);
+      const port = Number((root.querySelector("#setPgPort") as HTMLInputElement | null)?.value);
+      if (portError(port)) {
+        setMsg("PostgreSQL port must be a whole number between 1 and 65,535.", true);
         return;
       }
       pgApply.disabled = true;
@@ -472,9 +477,9 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     const raPortSave = t.closest("[data-ra-port-save]") as HTMLButtonElement | null;
     if (raPortSave) {
-      const port = Math.round(Number((root.querySelector("#raPort") as HTMLInputElement | null)?.value));
-      if (!Number.isFinite(port) || port < 1 || port > 65535) {
-        setMsg("Admin API port must be between 1 and 65535.", true);
+      const port = Number((root.querySelector("#raPort") as HTMLInputElement | null)?.value);
+      if (portError(port)) {
+        setMsg("Admin API port must be a whole number between 1 and 65,535.", true);
         return;
       }
       raPortSave.disabled = true;
@@ -699,7 +704,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     const lrRemove = t.closest("[data-lr-remove]") as HTMLButtonElement | null;
     if (lrRemove) {
-      if (!confirm("Remove the log receiver service? Its store and token files stay in the data directory.")) return;
+      if (!await confirmDialog({ title: "Remove the log receiver service?", body: "Its store and token files stay in the data directory.", confirmLabel: "Remove", danger: true })) return;
       lrRemove.disabled = true;
       setMsg("Removing the log receiver — approve the elevation prompt…");
       const r = await logReceiverRemove();
@@ -730,7 +735,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
 
     const lrFlip = t.closest("[data-lr-flip]") as HTMLButtonElement | null;
     if (lrFlip) {
-      if (!confirm("Set the log streaming endpoint to the local receiver (http://127.0.0.1:8473)? config.json is backed up first, and the shipper restarts onto the new endpoint at once.")) return;
+      if (!await confirmDialog({ title: "Stream logs to the local receiver?", body: "The endpoint becomes http://127.0.0.1:8473. config.json is backed up first, and the shipper restarts onto the new endpoint at once.", confirmLabel: "Set endpoint" })) return;
       lrFlip.disabled = true;
       const r = await logReceiverFlipEndpoint();
       if (disposed) return;
@@ -749,7 +754,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     const modeBtn = t.closest("[data-mxc-mode]") as HTMLButtonElement | null;
     if (!modeBtn) return;
     const mode = modeBtn.getAttribute("data-mxc-mode") ?? "";
-    if (mode === "disabled" && !confirm("Disable the MXC sandbox? Tool execution will no longer be mediated by the policy.")) return;
+    if (mode === "disabled" && !await confirmDialog({ title: "Disable the MXC sandbox?", body: "Tool execution will no longer be mediated by the policy.", confirmLabel: "Disable", danger: true })) return;
     modeBtn.disabled = true;
     const r = await setMxcMode(mode);
     if (disposed) return;
