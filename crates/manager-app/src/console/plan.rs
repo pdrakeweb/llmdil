@@ -533,7 +533,7 @@ pub(crate) async fn build_plan(
             }
             args = manager_diag::argv::apply_overrides(&args, &resolved_set, &[]);
         }
-        let env = resolve_env(&ctx, &p.env, &mut errors, &at);
+        let mut env = resolve_env(&ctx, &p.env, &mut errors, &at);
         let workdir = match s.workdir.as_deref().map(|w| ctx.resolve_str(w)) {
             Some(Ok(w)) => Some(w),
             Some(Err(e)) => {
@@ -585,6 +585,18 @@ pub(crate) async fn build_plan(
                         {
                             args.push("-o".into());
                             args.push("json".into());
+                        }
+                        // GPU numbers in a recipe (CUDA_VISIBLE_DEVICES=0,
+                        // -mg, -dev CUDA0) mean what they mean everywhere
+                        // else in LLMdil and in nvidia-smi: PCI bus order.
+                        // CUDA's default is fastest-first, which on a
+                        // mixed-GPU machine puts a different card at 0.
+                        if gpus::is_gpu_tool(&path_str(&path))
+                            && !env
+                                .keys()
+                                .any(|k| k.eq_ignore_ascii_case("CUDA_DEVICE_ORDER"))
+                        {
+                            env.insert("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into());
                         }
                         need = gpus::infer(&path_str(&path), &args, &env, &inventory);
                         exe = Some(path_str(&path));

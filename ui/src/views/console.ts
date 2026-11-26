@@ -445,9 +445,12 @@ export async function wireConsole(root: HTMLElement): Promise<() => void> {
     if (f) fold = f.checked;
   }
 
-  function paint(): void {
+  // `capture: false` when the caller just set the editor state itself
+  // (parse, unfold, open recipe): reading the DOM back first would
+  // overwrite it with the previous, often empty, textarea contents.
+  function paint(capture = true): void {
     if (disposed) return;
-    captureInputs();
+    if (capture) captureInputs();
     const tabs: [Tab, string][] = [["import", "Import"], ["recipes", "Recipes"], ["history", "History"], ["settings", "Settings"]];
     tabsEl.innerHTML = tabs.map(([t, l]) => `<button class="con-tab${t === tab ? " active" : ""}" data-tab="${t}">${l}</button>`).join("");
     panelEl.innerHTML = tab === "import" ? panelImport() : tab === "recipes" ? panelRecipes() : tab === "history" ? panelHistory() : panelSettings();
@@ -537,7 +540,8 @@ export async function wireConsole(root: HTMLElement): Promise<() => void> {
     } else if (a === "reset-allow" && settings) {
       settings = { ...settings, exec_allowlist: settings.default_exec_allowlist };
     }
-    paint();
+    // The click handler captured the inputs before act() ran.
+    paint(false);
   }
 
   if (!isTauri()) {

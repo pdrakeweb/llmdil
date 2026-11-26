@@ -955,8 +955,16 @@ impl SupervisedProcess {
                         kill_pid_tree(pid);
                         // Confirm the exit before reporting the stop:
                         // the process holds its listening port until
-                        // it is actually gone.
-                        wait_pid_gone(pid, Duration::from_secs(5)).await;
+                        // it is actually gone. The kill can fail
+                        // outright (a backend another, elevated LLMdil
+                        // started refuses taskkill with access denied):
+                        // then the stop did not happen, so say so.
+                        if !wait_pid_gone(pid, KILL_REAP_TIMEOUT).await {
+                            self.adopted_pid = None;
+                            self.state = ProcessState::Failed;
+                            self.abort_readers();
+                            return Err(SupervisorError::DrainTimeout(self.id.clone()));
+                        }
                     }
                     self.adopted_pid = None;
                     self.state = ProcessState::Stopped;
@@ -1036,7 +1044,12 @@ impl SupervisedProcess {
             None => {
                 if let Some(pid) = self.adopted_pid.take() {
                     kill_pid_tree(pid);
-                    wait_pid_gone(pid, Duration::from_secs(5)).await;
+                    if !wait_pid_gone(pid, KILL_REAP_TIMEOUT).await {
+                        // Same as drain(): an unconfirmed kill is not a stop.
+                        self.state = ProcessState::Failed;
+                        self.abort_readers();
+                        return Err(SupervisorError::DrainTimeout(self.id.clone()));
+                    }
                 }
                 self.state = ProcessState::Stopped;
                 self.abort_readers();
