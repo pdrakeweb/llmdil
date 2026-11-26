@@ -143,6 +143,29 @@ export type {
   ModelAssignResult,
 } from "./api/models";
 export {
+  getModelStorageStatus,
+  modelStorageSet,
+  modelStoragePromote,
+  modelStorageDemote,
+  modelStorageCancel,
+  modelSetKeepHot,
+  isColdTier,
+} from "./api/modelStorage";
+export type {
+  StorageTierName,
+  ColdTierConfig,
+  ModelStorageConfig,
+  StorageMoving,
+  StorageTierFile,
+  StorageTierStatus,
+  StorageFileStatus,
+  StoragePlannedMove,
+  StorageMoveRecord,
+  ModelStorageStatus,
+  ModelStorageRow,
+  StorageMoveStart,
+} from "./api/modelStorage";
+export {
   getLogs,
   exportDiagnostics,
   openFolder,

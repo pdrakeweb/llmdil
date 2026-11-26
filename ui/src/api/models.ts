@@ -1,5 +1,6 @@
 import { errOf, invoke, isTauri } from "./core";
 import type { CallResult } from "./core";
+import type { ModelStorageRow } from "./modelStorage";
 
 /* ---------------- Models ---------------- */
 
@@ -80,6 +81,10 @@ export interface ModelRow {
    *  the EFFECTIVE capability is `catalog_mtp ?? mtp ?? false`. */
   catalog_mtp?: boolean | null;
   fit_check_available: boolean;
+  /** Tiered storage (docs/tiered-model-storage.md): where the file
+   *  resolves, pins, an in-flight move. Null when the path is not
+   *  tierable; absent from a backend without the feature. */
+  storage?: ModelStorageRow | null;
 }
 
 /** list_models — configured models with on-disk presence and size. */

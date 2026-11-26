@@ -1,7 +1,7 @@
 /* Settings view panels: MXC policy, app updates, supervision, log
    shipping, component updates, remote access (split from static.ts). */
 
-import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, ComponentUpdateReport, LogReceiverInfo, LogShipperInfo, MxcActivityData, MxcPolicyData, ServicesInfo, TaskRecordWire } from "../api";
+import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, ComponentUpdateReport, LogReceiverInfo, LogShipperInfo, ModelStorageConfig, MxcActivityData, MxcPolicyData, ServicesInfo, TaskRecordWire } from "../api";
 import { fmtCount, stackedBar, trim1 } from "../charts";
 import { esc } from "../html";
 import { icon } from "../icons";
@@ -153,7 +153,7 @@ function mxcActivityInner(activityR: { data: MxcActivityData | null; error?: str
   return `<div style="font-size:12px;color:var(--text2);margin:14px 0 6px">Recent activity</div>${mixBar}${rows}`;
 }
 
-export type SettingsTab = "general" | "remote" | "updates" | "notifications" | "mxc" | "supervision";
+export type SettingsTab = "general" | "storage" | "remote" | "updates" | "notifications" | "mxc" | "supervision";
 
 export interface SettingsUi {
   tab: SettingsTab;
@@ -497,6 +497,148 @@ function lastCheckText(stored: Record<string, unknown>, report: ComponentUpdateR
   return typeof raw === "string" && raw ? fmtDateTime(raw) : null;
 }
 
+/* ---------------- Model storage (docs/tiered-model-storage.md §4, §11) ---------------- */
+
+/** The config's model_storage section, read defensively (every field
+ *  falls back to the serde default the backend applies); null when
+ *  the section is absent (a backend without the feature). */
+export function asStorageConfig(v: unknown): ModelStorageConfig | null {
+  const r = asRecord(v);
+  if (!r) return null;
+  const num = (x: unknown, d: number): number => (typeof x === "number" && Number.isFinite(x) ? x : d);
+  const numOrNull = (x: unknown, d: number | null): number | null => (x === null ? null : typeof x === "number" && Number.isFinite(x) ? x : d);
+  const tiers = Array.isArray(r.cold_tiers) ? r.cold_tiers : [];
+  return {
+    cold_tiers: tiers.map(asRecord).filter((t): t is Record<string, unknown> => t !== null)
+      .map((t) => ({ path: primStr(t.path) ?? "", label: primStr(t.label) ?? "" })),
+    hot_budget_gib: numOrNull(r.hot_budget_gib, null),
+    hot_min_free_gib: num(r.hot_min_free_gib, 100),
+    promote_after_starts: num(r.promote_after_starts, 2),
+    promote_window_days: num(r.promote_window_days, 14),
+    demote_after_idle_days: r.demote_after_idle_days === undefined ? 30 : numOrNull(r.demote_after_idle_days, 30),
+    keep_hot: Array.isArray(r.keep_hot) ? r.keep_hot.filter((k): k is string => typeof k === "string") : [],
+    download_tier: r.download_tier === "cold" ? "cold" : "hot",
+    copy_rate_mib_s: num(r.copy_rate_mib_s, 256),
+    auto: r.auto !== false,
+  };
+}
+
+/** The Model storage edit form's fields, as typed (text, so a poll
+ *  repaint or a failed save never loses input). The UI edits the
+ *  first cold tier; later ones (config-only, §15) are kept as they are. */
+export interface StorageDraft {
+  coldPath: string;
+  coldLabel: string;
+  minFree: string;
+  budget: string;
+  promoteStarts: string;
+  promoteWindow: string;
+  demoteIdle: string;
+  downloadTier: "hot" | "cold";
+  copyRate: string;
+}
+
+export function storageDraftFrom(c: ModelStorageConfig): StorageDraft {
+  const first = c.cold_tiers[0];
+  return {
+    coldPath: first?.path ?? "",
+    coldLabel: first?.label ?? "",
+    minFree: String(c.hot_min_free_gib),
+    budget: c.hot_budget_gib === null ? "" : String(c.hot_budget_gib),
+    promoteStarts: String(c.promote_after_starts),
+    promoteWindow: String(c.promote_window_days),
+    demoteIdle: c.demote_after_idle_days === null ? "" : String(c.demote_after_idle_days),
+    downloadTier: c.download_tier,
+    copyRate: String(c.copy_rate_mib_s),
+  };
+}
+
+/** The section a draft saves as, over `base` (keep_hot, auto and the
+ *  cold tiers past the first carry over), or the first field error. */
+export function storageConfigFromDraft(d: StorageDraft, base: ModelStorageConfig): { config: ModelStorageConfig } | { error: string } {
+  const int = (raw: string, min: number, blankOk: boolean, label: string, rule: string): number | null | string => {
+    const s = raw.trim();
+    if (s === "") return blankOk ? null : `${label}: ${rule}`;
+    const n = Number(s);
+    return Number.isInteger(n) && n >= min ? n : `${label}: ${rule}`;
+  };
+  const minFree = int(d.minFree, 0, false, "Free-space reserve", "whole GiB, 0 or more.");
+  const budget = int(d.budget, 1, true, "Hot budget", "whole GiB, 1 or more, or blank for none.");
+  const starts = int(d.promoteStarts, 1, false, "Promote after", "whole number of starts, 1 or more.");
+  const win = int(d.promoteWindow, 1, false, "Promotion window", "whole days, 1 or more.");
+  const idle = int(d.demoteIdle, 1, true, "Demote after idle", "whole days, 1 or more, or blank for never.");
+  const rate = int(d.copyRate, 0, false, "Copy rate", "whole MiB/s, 0 or more (0 = unthrottled).");
+  for (const v of [minFree, budget, starts, win, idle, rate]) if (typeof v === "string") return { error: v };
+  const path = d.coldPath.trim();
+  if (path && !/^([A-Za-z]:[\\/]|\\\\)/.test(path)) return { error: "Cold tier: an absolute path, e.g. E:\\llm-models." };
+  const rest = base.cold_tiers.slice(1);
+  const cold_tiers = path ? [{ path, label: d.coldLabel.trim() }, ...rest] : rest;
+  if (d.downloadTier === "cold" && !cold_tiers.length) return { error: "Download tier: Cold needs a cold tier path." };
+  return {
+    config: {
+      ...base,
+      cold_tiers,
+      hot_min_free_gib: minFree as number,
+      hot_budget_gib: budget as number | null,
+      promote_after_starts: starts as number,
+      promote_window_days: win as number,
+      demote_after_idle_days: idle as number | null,
+      download_tier: d.downloadTier,
+      copy_rate_mib_s: rate as number,
+    },
+  };
+}
+
+/** Settings → Model storage: the Auto moves switch (immediate, rule
+ *  16), the saved values as Label: Value rows with an Edit action,
+ *  and — while editing — the form (Save closes it, rule 17). */
+export function modelStoragePanelHtml(c: ModelStorageConfig, draft: StorageDraft | null): string {
+  const autoRow = `<div style="display:flex;justify-content:space-between;align-items:center;gap:16px;padding:4px 0;border-bottom:1px solid var(--border)">
+      <span class="k">Auto moves<span class="info-tip" title="Policy-driven promotion and demotion. Off, models move only by their Promote and Demote buttons.">${icon("info")}</span></span>
+      ${enableSwitch({ on: c.auto, name: "Auto moves", attrs: `data-ms-act="auto"` })}</div>`;
+  if (!draft) {
+    const first = c.cold_tiers[0];
+    const rows: SettingsRow[] = [
+      first
+        ? { key: "Cold tier", value: first.path, copy: first.path, tip: "Directory on another drive that mirrors the data directory's models folder. Models demoted from hot land here." }
+        : { key: "Cold tier", value: "none", tip: "No cold tier: every model stays in the data directory's models folder." },
+      ...(first && first.label ? [{ key: "Cold tier label", value: first.label }] : []),
+      ...c.cold_tiers.slice(1).map((t, i) => ({ key: `Cold tier ${i + 2}`, value: t.label ? `${t.path} (${t.label})` : t.path, copy: t.path })),
+      { key: "Free-space reserve", value: `${trim1(c.hot_min_free_gib)} GiB`, tip: "Models are demoted, least recently used first, to keep at least this much free on the hot volume." },
+      { key: "Hot budget", value: c.hot_budget_gib === null ? "none" : `${trim1(c.hot_budget_gib)} GiB`, tip: "Cap on model bytes in the hot tier; none = only the free-space reserve applies." },
+      { key: "Promotion", value: `${fmtCount(c.promote_after_starts)} starts in ${fmtCount(c.promote_window_days)} days`, tip: "A cold model started this often within the window is copied to hot." },
+      { key: "Idle demotion", value: c.demote_after_idle_days === null ? "never" : `${fmtCount(c.demote_after_idle_days)} days`, tip: "A hot model not started for this long is demoted, unless a backend or Keep hot pins it." },
+      { key: "Download tier", value: c.download_tier === "cold" ? "Cold" : "Hot", tip: "Where new model downloads land (hot when the cold tier is unreachable)." },
+      { key: "Copy rate", value: c.copy_rate_mib_s === 0 ? "unthrottled" : `${fmtCount(c.copy_rate_mib_s)} MiB/s`, tip: "Throttle on tier copies, so a move does not starve running backends of disk bandwidth." },
+    ];
+    return `${autoRow}${settingsRows(rows)}
+      <div class="card-actions" style="margin-top:10px"><button class="btn" data-ms-act="edit">${icon("pencil")} Edit</button></div>`;
+  }
+  const field = (key: keyof StorageDraft, label: string, tip: string, placeholder: string, width = "100%"): string =>
+    `<label style="font-size:12px;color:var(--text2);min-width:0">${esc(label)}<span class="info-tip" title="${esc(tip)}">${icon("info")}</span><br>
+      <input type="text" data-ms-field="${key}" value="${esc(draft[key])}" placeholder="${esc(placeholder)}" style="width:${width};font-size:12px;box-sizing:border-box"></label>`;
+  return `${autoRow}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));gap:10px;margin-top:10px">
+      ${field("coldPath", "Cold tier path", "Absolute directory on a different drive from the data directory; created when missing. Blank = no cold tier (refused while the tier still holds models).", "E:\\llm-models")}
+      ${field("coldLabel", "Cold tier label", "Display name for the tier, e.g. the drive's name.", "SATA")}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,160px),1fr));gap:10px;margin-top:10px">
+      ${field("minFree", "Free-space reserve (GiB)", "Keep at least this much free on the hot volume; models are demoted, least recently used first, to hold it.", "100")}
+      ${field("budget", "Hot budget (GiB)", "Cap on model bytes in the hot tier. Blank = no cap.", "none")}
+      ${field("promoteStarts", "Promote after (starts)", "A cold model started this many times within the promotion window is copied to hot.", "2")}
+      ${field("promoteWindow", "Promotion window (days)", "The window the start count is taken over.", "14")}
+      ${field("demoteIdle", "Demote after idle (days)", "Demote a hot model not started for this many days. Blank = never demote for idleness.", "never")}
+      ${field("copyRate", "Copy rate (MiB/s)", "Throttle on tier copies. 0 = unthrottled.", "256")}
+      <label style="font-size:12px;color:var(--text2);min-width:0">Download tier<span class="info-tip" title="Where new model downloads land. Cold falls back to hot when the cold tier is unreachable.">${icon("info")}</span><br>
+        <select data-ms-field="downloadTier" style="width:100%;font-size:12px">
+          <option value="hot"${draft.downloadTier === "hot" ? " selected" : ""}>Hot</option>
+          <option value="cold"${draft.downloadTier === "cold" ? " selected" : ""}>Cold</option>
+        </select></label>
+    </div>
+    <div class="card-actions" style="margin-top:10px"><button class="btn" data-ms-act="save">${icon("check")} Save</button>
+      <button class="btn icon-only" data-ms-act="cancel" title="Cancel" aria-label="Cancel">${icon("x")}</button></div>`;
+}
+
 export function settingsPaint(
   cfg: Record<string, unknown>,
   policyR: { data: MxcPolicyData | null; error?: string; live: boolean },
@@ -509,10 +651,13 @@ export function settingsPaint(
   logReceiverHtml = "",
   componentUpdatesHtml = "",
   check: ComponentUpdateCheck | null = null,
+  storageDraft: StorageDraft | null = null,
 ): string {
   const notif = asRecord(cfg.notifications);
+  const storageCfg = asStorageConfig(cfg.model_storage);
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: "general", label: "General" },
+    ...(storageCfg ? [{ id: "storage" as SettingsTab, label: "Model storage" }] : []),
     { id: "remote", label: "Remote access" },
     { id: "updates", label: "Updates & diagnostics" },
     ...(notif ? [{ id: "notifications" as SettingsTab, label: "Notifications" }] : []),
@@ -550,7 +695,7 @@ export function settingsPaint(
   // the raw aggregate no longer duplicates it in the dump. Setup
   // completed is wizard state, not a preference — it renders as a
   // status line under the editors, not as a settings row.
-  const KNOWN_CFG = new Set(["data_dir", "config_path", "telemetry", "winml", "setup_completed", "updates", "app_update", "notifications", "mxc", "postgres"]);
+  const KNOWN_CFG = new Set(["data_dir", "config_path", "telemetry", "winml", "setup_completed", "updates", "app_update", "notifications", "mxc", "postgres", "model_storage"]);
   for (const [k, v] of Object.entries(cfg)) {
     if (KNOWN_CFG.has(k)) continue;
     extraRows.push({ key: humanLabel(k), value: summarizeValue(v) });
@@ -690,6 +835,7 @@ export function settingsPaint(
     : tab === "updates" ? updatesPanel
     : tab === "notifications" ? notifPanel
     : tab === "supervision" ? supervisionPanel
+    : tab === "storage" && storageCfg ? modelStoragePanelHtml(storageCfg, storageDraft)
     : mxcPanel;
   return `<div class="card" style="margin-bottom:12px"><div class="sec-title">${icon("gear")} Settings</div>
     <div class="viewsel" role="tablist" style="margin-bottom:12px">${tabs.map((t) => `<button data-set-tab="${t.id}"${t.id === tab ? ` class="active"` : ""}>${t.label}</button>`).join("")}</div>

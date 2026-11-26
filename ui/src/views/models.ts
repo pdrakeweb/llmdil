@@ -1,13 +1,15 @@
 /* Models view (split from static.ts). */
 
-import { cancelDownload, deleteModel, downloadModel, getBackends, getModels, isTauri, modelAdd, modelHfHeader, modelHfLookup, modelHfSuggest, modelSetEnabled, modelSetMtp, modelSetOffloadSpec, modelSetShortName, pauseModelDownload, resumeModelDownload, verifyModel } from "../api";
-import type { HfHeaderResult, HfLookupQuant, HfLookupRepo, ModelRow } from "../api";
+import { cancelDownload, deleteModel, downloadModel, getBackends, getModelStorageStatus, getModels, isTauri, modelAdd, modelHfHeader, modelHfLookup, modelHfSuggest, modelSetEnabled, modelSetKeepHot, modelSetMtp, modelSetOffloadSpec, modelSetShortName, modelStorageCancel, modelStorageDemote, modelStoragePromote, pauseModelDownload, resumeModelDownload, verifyModel } from "../api";
+import type { HfHeaderResult, HfLookupQuant, HfLookupRepo, ModelRow, ModelStorageStatus } from "../api";
 import { fmtCount, meter, stackedBar, trim1 } from "../charts";
 import { confirmDialog } from "../dialog";
-import { editingIn, esc, keepFocus } from "../html";
+import { editingIn, esc, keepFocus, setHtml } from "../html";
 import { icon } from "../icons";
 import { enableSwitch } from "../switch";
 import { C, SELECT_STYLE, bannerHtml, emptyHtml, fmtBytes, fmtDate, loadingHtml, modelShortName, onOvGoto, ovStatusBtn, sameModelFile, setBanner, topbar } from "./common";
+import { modelStorageActionsHtml, modelStorageChipsHtml, modelStorageTilesHtml, storageCardHtml, storageCtx, storageMoving } from "./modelStorage";
+import type { StorageCardUi, StorageCtx } from "./modelStorage";
 
 /* ---------------- Models ---------------- */
 
@@ -89,7 +91,7 @@ export function downloadProgressText(partial: number, total: number | null, byte
   ].filter(Boolean).join(" \u00b7 ");
 }
 
-function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null, hfRefetch?: HfHeaderResult | null, rate: number | null = null): string {
+function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, ModelNote>, stats?: { backends: number; req?: number; err?: number; toks?: number }, rename?: { draft: string } | null, detailsOpen = false, offload?: { layers: string; def: string; moe: boolean; mtp: boolean } | null, hfRefetch?: HfHeaderResult | null, rate: number | null = null, storage: StorageCtx = { hasCold: false, coldAvailable: false }): string {
   const note = notes.get(m.id);
   const noteHtml = note
     ? `<div style="margin-top:8px;font-size:12px;color:${note.err ? "var(--err)" : "var(--text2)"}">${esc(note.text)}</div>` : "";
@@ -155,6 +157,13 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
     // placeholder it could never succeed (the badge explains the state).
     actions = `${hashPinned(m) ? `<button class="btn icon-only" data-model-act="verify" data-model-id="${esc(m.id)}" title="Verify checksum" aria-label="Verify checksum of ${esc(m.id)}">${icon("shield")}</button>` : ""}
       <button class="btn" data-model-act="delete" data-model-id="${esc(m.id)}">${icon("err")} Delete</button>`;
+  }
+  // Tier moves (docs/tiered-model-storage.md §11): Promote when cold,
+  // Demote when hot and a cold tier is reachable, Cancel while a move
+  // is in flight — never alongside a download, which owns the file.
+  if (!inFlight && !m.verifying) {
+    const moveBtns = modelStorageActionsHtml(m, storage);
+    if (moveBtns) actions += ` ${moveBtns}`;
   }
   // Enable/disable is always offered: it controls whether the setup
   // wizard's download step includes this model. The control is the
@@ -265,11 +274,12 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
         ${m.sha256 ? `<div style="display:flex;gap:8px;align-items:center;min-width:0"><span style="color:var(--text2)">SHA-256:</span><span style="font-family:var(--mono);font-size:11px;word-break:break-all">${esc(m.sha256)}</span><button class="btn" data-model-act="copy-hash" data-model-id="${esc(m.id)}" title="Copy SHA-256" aria-label="Copy SHA-256" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></div>` : ""}
         ${m.verified_at ? `<div><span style="color:var(--text2)">Verified:</span> ${esc(fmtDate(m.verified_at))}</div>` : ""}
         <div style="min-width:0"><span style="color:var(--text2)">File:</span> <span style="font-family:var(--mono);font-size:11px;word-break:break-all">${esc(m.gguf_path)}</span></div>
+        ${m.storage && m.storage.path && m.storage.path !== m.gguf_path ? `<div style="display:flex;gap:8px;align-items:center;min-width:0"><span style="color:var(--text2)">Location:</span><span style="font-family:var(--mono);font-size:11px;word-break:break-all">${esc(m.storage.path)}</span><button class="btn" data-model-act="copy-location" data-model-id="${esc(m.id)}" title="Copy location" aria-label="Copy location" style="padding:1px 7px;font-size:11px">${icon("copy")}</button></div>` : ""}
         <div><span style="color:var(--text2)">Model ID:</span> <span style="font-family:var(--mono)">${esc(m.id)}</span></div>
       </div>` : ""}
     </div>`;
   return `<div class="card" id="card-model-${esc(m.id)}">
-    <h3>${icon("box")} ${esc(modelShortName(m))} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip">disabled</span>`}
+    <h3>${icon("box")} ${esc(modelShortName(m))} <span class="chip">${esc(m.quant)}</span>${m.enabled ? "" : ` <span class="chip">disabled</span>`}${m.storage ? ` ${modelStorageChipsHtml(m.storage)}` : ""}
       <span class="spacer" style="flex:1"></span>
       ${modelShaBadge(m)}${hashPinned(m) ? ` <button class="btn" data-model-act="copy-hash" data-model-id="${esc(m.id)}" title="Copy the full SHA-256" aria-label="Copy SHA-256" style="padding:2px 8px;font-size:11px">${icon("copy")}</button>` : ""}</h3>
     ${modelShortName(m) !== m.id ? `<div style="font-size:11px;color:var(--text3);font-family:var(--mono);margin-top:2px">${esc(m.id)}</div>` : ""}
@@ -281,6 +291,7 @@ function modelCard(m: ModelRow, downloading: Set<string>, notes: Map<string, Mod
       ${m.ctx_max != null ? `<div class="kv"><span class="k">Context</span><span class="v" style="font-size:12px">${fmtCount(m.ctx_max)}</span></div>` : ""}
       ${effMoeLayers != null && effMoeDefault != null ? `<div class="kv"><span class="k">Expert offload</span><span class="v" style="font-size:12px">Default: ${effMoeDefault} of ${effMoeLayers} layers</span></div>` : ""}
       ${effMtp ? `<div class="kv"><span class="k">MTP</span><span class="v" style="font-size:12px">Capable</span></div>` : ""}
+      ${modelStorageTilesHtml(m, storage)}
     </div>
     ${statsHtml}
     <div class="card-actions">${actions}</div>
@@ -346,6 +357,7 @@ function modelAddFormHtml(): string {
 export function renderModels(): string {
   return `${topbar("Models", `<button class="btn" id="modelAdd" title="Add model">${icon("plus")} Add model</button>`)}
   <div class="view"><div id="modelBanner"></div>
+  <div id="modelStorage"></div>
   <div id="modelAddForm"></div>
   <div id="modelOverview"></div>
   <div id="modelBody">${loadingHtml("Loading models…")}</div></div>`;
@@ -426,6 +438,15 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   let modelStats = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
   let pollTimer: number | null = null;
   let disposed = false;
+  /** Tiered storage: the last model_storage_status (or its error),
+   *  and the Storage card's toggles and action note. */
+  let storageStatus: ModelStorageStatus | null = null;
+  let storageErr: string | null = null;
+  const storageUi: StorageCardUi = { unregOpen: false, movesOpen: false, note: null };
+  const paintStorage = (): void => {
+    const host = root.querySelector("#modelStorage");
+    if (host) setHtml(host, storageCardHtml(storageStatus, storageErr, lastRows, storageUi));
+  };
   /** Download speed per model from successive polls' byte counts. */
   const dlSamples = new Map<string, { bytes: number; at: number; rate: number | null }>();
   const sampleDownloads = (rows: ModelRow[]): void => {
@@ -439,14 +460,15 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
   };
 
-  /** Poll every 2s while any download is in flight (or verifying) so
-   *  progress and the terminal state (complete, verified, failed)
-   *  reach the view; stop when nothing is in flight. */
+  /** Poll every 2s while any download is in flight (or verifying), or
+   *  a storage move is running or queued, so progress and the terminal
+   *  state (complete, verified, failed) reach the view; stop when
+   *  nothing is in flight. */
   const syncPoll = (): void => {
     // A load that resolves after the view was left must not start a
     // poll the (already-run) cleanup can never clear (UI-8).
     if (disposed) return;
-    const any = downloading.size > 0 || lastRows.some((m) => m.downloading || m.verifying);
+    const any = downloading.size > 0 || lastRows.some((m) => m.downloading || m.verifying) || storageMoving(storageStatus, lastRows);
     if (any && pollTimer === null) {
       pollTimer = window.setInterval(() => { void load(); }, 2000);
     } else if (!any && pollTimer !== null) {
@@ -464,6 +486,10 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     // painting into the new view and starting a poll interval nothing
     // cleared (code review v0.1.60 UI-8).
     if (disposed) return;
+    const sr = await getModelStorageStatus();
+    if (disposed) return;
+    storageStatus = sr.data;
+    storageErr = sr.error ?? null;
     if (!br.error) {
       const m = new Map<string, { backends: number; req?: number; err?: number; toks?: number }>();
       for (const model of r.data) {
@@ -490,9 +516,10 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     const b = root.querySelector("#modelBody");
     if (!b) return;
     const mov = root.querySelector("#modelOverview");
-    if (r.error) { if (mov) mov.innerHTML = ""; b.innerHTML = emptyHtml(`Models unavailable: ${r.error}`); return; }
+    if (r.error) { if (mov) mov.innerHTML = ""; b.innerHTML = emptyHtml(`Models unavailable: ${r.error}`); paintStorage(); syncPoll(); return; }
     if (!r.data.length) {
       lastRows = [];
+      paintStorage();
       if (mov) mov.innerHTML = "";
       b.innerHTML = emptyHtml(r.live
         ? "No models are configured. Add one with the Add model button."
@@ -502,12 +529,14 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     }
     lastRows = r.data;
     sampleDownloads(lastRows);
+    paintStorage();
+    const ctx = storageCtx(storageStatus);
     // While a card form's input has focus, a poll repaint would drop the
     // caret mid-word; the drafts are synced to wire state, so skipping
     // one repaint loses nothing.
     if (!editingIn(b)) keepFocus(root, () => {
       if (mov) mov.innerHTML = modelOverviewHtml(lastRows, modelStats);
-      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null, hfRefetchResults.get(m.id) ?? null, dlSamples.get(m.id)?.rate ?? null)).join("")}</div>`;
+      b.innerHTML = `<div class="cards-fluid">${lastRows.map((m) => modelCard(m, downloading, notes, modelStats.get(m.id), renameFor === m.id ? { draft: renameDraft } : null, openModelDetails.has(m.id), offloadFor === m.id ? { layers: offloadDraftLayers, def: offloadDraftDefault, moe: offloadDraftMoe, mtp: offloadDraftMtp } : null, hfRefetchResults.get(m.id) ?? null, dlSamples.get(m.id)?.rate ?? null, ctx)).join("")}</div>`;
     });
     syncPoll();
   };
@@ -524,16 +553,44 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
       return;
     }
 
-    if (act === "copy-hash" || act === "copy-path") {
+    if (act === "copy-hash" || act === "copy-path" || act === "copy-location") {
       const row = lastRows.find((m) => m.id === id);
-      const value = act === "copy-hash" ? row?.sha256 : row?.gguf_path;
+      const value = act === "copy-hash" ? row?.sha256 : act === "copy-location" ? row?.storage?.path : row?.gguf_path;
       if (!value) return;
       try {
         await navigator.clipboard.writeText(value);
-        notes.set(id, { text: act === "copy-hash" ? "SHA-256 copied to the clipboard." : "File path copied to the clipboard.", err: false });
+        notes.set(id, { text: act === "copy-hash" ? "SHA-256 copied to the clipboard." : act === "copy-location" ? "Location copied to the clipboard." : "File path copied to the clipboard.", err: false });
       } catch {
         notes.set(id, { text: "Copy failed — copy the value manually.", err: true });
       }
+      await load();
+      return;
+    }
+
+    if (act === "promote" || act === "demote" || act === "move-cancel") {
+      // Tier moves, keyed by model id (the backend maps it to the
+      // model's logical file). Success needs no note: the card's
+      // move chip and the Storage card's progress bar carry it.
+      (t as HTMLButtonElement).disabled = true;
+      const r = act === "promote" ? await modelStoragePromote(id)
+        : act === "demote" ? await modelStorageDemote(id)
+        : await modelStorageCancel(id);
+      if (disposed) return;
+      const verb = act === "promote" ? "Promote" : act === "demote" ? "Demote" : "Cancel move";
+      if (r.error) notes.set(id, { text: `${verb} failed: ${r.error}`, err: true });
+      else notes.delete(id);
+      await load();
+      return;
+    }
+
+    if (act === "keep-hot") {
+      (t as HTMLButtonElement).disabled = true;
+      const row = lastRows.find((m) => m.id === id);
+      const keep = !(row?.storage?.keep_hot ?? false);
+      const r = await modelSetKeepHot(id, keep);
+      if (disposed) return;
+      if (r.error) notes.set(id, { text: `Keep hot failed: ${r.error}`, err: true });
+      else notes.delete(id);
       await load();
       return;
     }
@@ -785,6 +842,38 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
   };
   root.addEventListener("click", onClick);
   root.addEventListener("click", onOvGoto);
+
+  /** Storage card actions: tier-path copy, the toggles, and moves of
+   *  the files listed there (targets are logical paths, so
+   *  unregistered files move too). Errors land in the card's note. */
+  const onStorageClick = async (ev: Event): Promise<void> => {
+    const t = (ev.target as HTMLElement).closest("[data-storage-act]") as HTMLElement | null;
+    if (!t) return;
+    const act = t.getAttribute("data-storage-act") ?? "";
+    const target = t.getAttribute("data-storage-target") ?? "";
+    if (act === "toggle-unreg") { storageUi.unregOpen = !storageUi.unregOpen; paintStorage(); return; }
+    if (act === "toggle-moves") { storageUi.movesOpen = !storageUi.movesOpen; paintStorage(); return; }
+    if (act === "copy-path") {
+      try {
+        await navigator.clipboard.writeText(target);
+        storageUi.note = { text: "Tier path copied to the clipboard.", err: false };
+      } catch {
+        storageUi.note = { text: "Copy failed — copy the value manually.", err: true };
+      }
+      paintStorage();
+      return;
+    }
+    if (act !== "promote" && act !== "demote" && act !== "move-cancel") return;
+    (t as HTMLButtonElement).disabled = true;
+    const r = act === "promote" ? await modelStoragePromote(target)
+      : act === "demote" ? await modelStorageDemote(target)
+      : await modelStorageCancel(target);
+    if (disposed) return;
+    const verb = act === "promote" ? "Promote" : act === "demote" ? "Demote" : "Cancel move";
+    storageUi.note = r.error ? { text: `${verb} failed: ${r.error}`, err: true } : null;
+    await load();
+  };
+  root.addEventListener("click", onStorageClick);
 
   /* ---------------- Add model form ----------------
    * Lives in #modelAddForm, outside the repainted #modelBody, so
@@ -1144,6 +1233,7 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
     if (pollTimer !== null) window.clearInterval(pollTimer);
     root.removeEventListener("click", onClick);
     root.removeEventListener("click", onOvGoto);
+    root.removeEventListener("click", onStorageClick);
     root.removeEventListener("input", syncRenameDraft);
     root.removeEventListener("input", syncOffloadDraft);
     root.removeEventListener("change", syncOffloadChecks);

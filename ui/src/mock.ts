@@ -5,6 +5,7 @@
 import { walk } from "./charts";
 import type { BackendRow, GatewayStatusData, GpuHistoryData, OptimizeExperiment, OptimizePlanItem, OptimizeState, OptimizeValidation } from "./api";
 import type { BackendInfo, DashboardModel, GpuInfo, WizardStepState } from "./types";
+import type { ModelStorageStatus } from "./api/modelStorage";
 
 export function mockBackends(): BackendInfo[] {
   return [
@@ -400,5 +401,50 @@ export function mockOptimizeState(): OptimizeState {
       experiments_dropped_invalid: 1,
       experiments_truncated: 0,
     },
+  };
+}
+
+/** Sample model_storage_status for browser mode: a hot NVMe tier and
+ *  one cold SATA tier, a promotion in flight, a hot model with a cold
+ *  archive copy, and one unregistered file. */
+export function mockModelStorageStatus(): ModelStorageStatus {
+  const GiB = 1024 ** 3;
+  const hot = [
+    { file: "models\\Qwen3-Coder-30B-Q4_K_M.gguf", model_id: "qwen3-coder-30b", bytes: 18.6 * GiB },
+    { file: "models\\Qwen3.8-27B-Q4_K_M.gguf", model_id: "qwen3.8-27b", bytes: 16.4 * GiB },
+    { file: "models\\Qwen3-0.8B-Q8_0.gguf", model_id: "qwen3-0.8b", bytes: 0.9 * GiB },
+  ];
+  const cold = [
+    { file: "models\\Qwen3-8B-Q8_0.gguf", model_id: "qwen3-8b", bytes: 8.1 * GiB },
+    { file: "models\\Llama-3.3-70B-Q4_K_M.gguf", model_id: "llama-3.3-70b", bytes: 39.6 * GiB },
+    { file: "models\\scratch-merge-Q5_K_M.gguf", model_id: null, bytes: 12.2 * GiB },
+    { file: "models\\Qwen3.8-27B-Q4_K_M.gguf", model_id: "qwen3.8-27b", bytes: 16.4 * GiB },
+  ];
+  const sum = (xs: { bytes: number }[]): number => xs.reduce((a, x) => a + x.bytes, 0);
+  return {
+    config: {
+      cold_tiers: [{ path: "E:\\llm-models", label: "SATA" }],
+      hot_budget_gib: null, hot_min_free_gib: 100, promote_after_starts: 2, promote_window_days: 14,
+      demote_after_idle_days: 30, keep_hot: ["qwen3-0.8b"], download_tier: "hot", copy_rate_mib_s: 256, auto: true,
+    },
+    tiers: [
+      { tier: "hot", path: "C:\\ProgramData\\LLMdil\\models", label: "", available: true,
+        free_bytes: 312 * GiB, total_bytes: 931 * GiB, model_bytes: sum(hot), files: hot },
+      { tier: "cold", path: "E:\\llm-models", label: "SATA", available: true,
+        free_bytes: 1490 * GiB, total_bytes: 1863 * GiB, model_bytes: sum(cold), files: cold },
+    ],
+    files: [
+      ...hot.map((f) => ({ ...f, registered: true, tier: "hot", present_in: f.model_id === "qwen3.8-27b" ? ["hot", "cold"] : ["hot"],
+        archived: f.model_id === "qwen3.8-27b", pinned: f.model_id === "qwen3-0.8b" ? "keep hot" : f.model_id === "qwen3-coder-30b" ? "used by enabled backend coder" : null, moving: null })),
+      ...cold.filter((f) => f.model_id !== "qwen3.8-27b").map((f) => ({ ...f, registered: f.model_id !== null, tier: "cold", present_in: ["cold"],
+        archived: false, pinned: null,
+        moving: f.model_id === "qwen3-8b" ? { kind: "promote" as const, to: "hot", fraction: 0.42, paused: false, task_id: "sample-move-1" } : null })),
+    ],
+    planned: [],
+    skipped: [],
+    moves: [
+      { id: "sample-move-0", logical: "models\\Llama-3.3-70B-Q4_K_M.gguf", kind: "demote", from: "hot", to: "cold", reason: "idle 30 days",
+        started_at: "2026-11-25T02:10:00Z", finished_at: "2026-11-25T02:13:41Z", outcome: "done", error: null, bytes: 39.6 * GiB, instant: false },
+    ],
   };
 }

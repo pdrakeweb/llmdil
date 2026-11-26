@@ -48,6 +48,7 @@ Every distinct card type in the UI, where it renders, and its source.
 | Throughput chart card | Dashboard (Appliance view); only when a series exists | inline in `applianceView`, `ui/src/views/dashboard.ts` |
 | Recent activity card | Dashboard (Appliance view); only when events exist | inline in `applianceView`, `ui/src/views/dashboard.ts` |
 | GPU card | GPUs view | `gpuCard`, `ui/src/views/static.ts` |
+| Storage card | Models view, above the model cards (one stacked bar per storage tier, moves in flight, unregistered files and move history behind toggles); omitted when no status is available | `storageCardHtml`, `ui/src/views/modelStorage.ts` |
 | Model card | Models view | `modelCard`, `ui/src/views/static.ts` |
 | Add-a-model card | Models view (form) | inline in `renderModels`, `ui/src/views/static.ts` |
 | Gateway summary card | Gateway view (status, port, groups, routing counts) | inline in `gatewayPaint`, `ui/src/views/static.ts` |
@@ -60,7 +61,7 @@ Every distinct card type in the UI, where it renders, and its source.
 | Activation plan card | Activation Plan view; a summary renders in the activation bar docked under every view | `activationPlanHtml`, `ui/src/views/static.ts` |
 | Pending changes card | Activation Plan view (changes table) | inline in `wireActivationPlan`, `ui/src/views/static.ts` |
 | Wizard step card | Setup Wizard view, one row per step | `wizardStepRow`, `ui/src/views/static.ts` |
-| Settings cards | Settings view — tabbed panels: General, Updates & diagnostics, Notifications, MXC sandbox, Remote Access (Admin API + admin users), Supervision | inline in `renderSettings` / `wireSettings`, `ui/src/views/static.ts` |
+| Settings cards | Settings view — tabbed panels: General, Model storage, Updates & diagnostics, Notifications, MXC sandbox, Remote Access (Admin API + admin users), Supervision | inline in `renderSettings` / `wireSettings`, `ui/src/views/static.ts` |
 | MCP server card | MCP Servers view, one per registered server | inline in `renderMcp` / `wireMcp`, `ui/src/views/mcp.ts` |
 | Optimize sections | Optimize view — consultation / plan, measurements, experiments, candidate discovery are section blocks, not cards | inline in `wireOptimize`, `ui/src/views/optimize.ts` |
 | Logs filter card | Logs view (search, scope, time window, sort, pagination bar) | inline in `renderLogs`, `ui/src/views/static.ts` |

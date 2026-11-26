@@ -1686,6 +1686,23 @@
       "title": "model_set_enabled",
       "type": "object"
     },
+    "model_set_keep_hot": {
+      "additionalProperties": false,
+      "properties": {
+        "keep": {
+          "type": "boolean"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "keep"
+      ],
+      "title": "model_set_keep_hot",
+      "type": "object"
+    },
     "model_set_mtp": {
       "additionalProperties": false,
       "properties": {
@@ -1761,6 +1778,65 @@
         "name"
       ],
       "title": "model_set_short_name",
+      "type": "object"
+    },
+    "model_storage_cancel": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "model_storage_cancel",
+      "type": "object"
+    },
+    "model_storage_demote": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "model_storage_demote",
+      "type": "object"
+    },
+    "model_storage_promote": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "model_storage_promote",
+      "type": "object"
+    },
+    "model_storage_set": {
+      "additionalProperties": false,
+      "properties": {
+        "storage": {
+          "description": "Any JSON document (validated by the operation)."
+        }
+      },
+      "required": [
+        "storage"
+      ],
+      "title": "model_storage_set",
+      "type": "object"
+    },
+    "model_storage_status": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "title": "model_storage_status",
       "type": "object"
     },
     "model_verify_checksum": {

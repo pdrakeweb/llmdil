@@ -84,11 +84,14 @@ export function gaugeRing(
   </span>`;
 }
 
-/** Horizontal stacked bar. segments: {pct, color}. */
+/** Horizontal stacked bar. segments: {pct, color}. markers: thin
+ *  vertical rules at a position (a threshold such as a budget or a
+ *  reserve), each with its label as the tooltip. */
 export function stackedBar(
   segments: { pct: number; color: string; label?: string }[],
   width = 300,
   height = 10,
+  markers: { pct: number; color: string; label: string }[] = [],
 ): string {
   let x = 0;
   const rects = segments
@@ -99,8 +102,14 @@ export function stackedBar(
       return el;
     })
     .join("");
+  const rules = markers
+    .map((m) => {
+      const mx = Math.min(width - 2, Math.max(0, (m.pct / 100) * width - 1));
+      return `<rect x="${mx.toFixed(1)}" y="0" width="2" height="${height}" fill="${m.color}"><title>${esc(m.label)}</title></rect>`;
+    })
+    .join("");
   return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" style="display:block;width:100%" preserveAspectRatio="none" aria-hidden="true">
-    <rect x="0" y="0" width="${width}" height="${height}" rx="3" fill="#2a313c"/>${rects}</svg>`;
+    <rect x="0" y="0" width="${width}" height="${height}" rx="3" fill="#2a313c"/>${rects}${rules}</svg>`;
 }
 
 /** Simple horizontal meter bar (single value). */

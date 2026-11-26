@@ -69,6 +69,8 @@ export const icons = {
   target: () =>
     svg(`<circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.4"/>`),
   plus: () => svg(`<path d="M8 3v10M3 8h10"/>`),
+  arrowUp: () => svg(`<path d="M8 13.5v-11M3.8 6.7 8 2.5l4.2 4.2"/>`),
+  arrowDown: () => svg(`<path d="M8 2.5v11M3.8 9.3 8 13.5l4.2-4.2"/>`),
   chevL: () => svg(`<path d="m10 3.5L5.5 8 10 12.5"/>`),
   chevR: () => svg(`<path d="m6 3.5L10.5 8 6 12.5"/>`),
   chevD: () => svg(`<path d="m3.5 6 4.5 4.5L12.5 6"/>`),

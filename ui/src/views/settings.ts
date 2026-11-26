@@ -1,7 +1,7 @@
 /* Settings view (split from static.ts). */
 
-import { adminApiCreateEnrollment, adminApiCreateUser, adminApiDeleteUser, adminApiGetAudit, adminApiGetStatus, adminApiListUsers, adminApiRegenerateCert, adminApiResetPassword, adminApiSetEnabled, adminApiUpdateUser, appUpdateCheck, appUpdateDownload, appUpdateSetAuto, appUpdateSetChecking, exportDiagnostics, getAppConfig, getAppUpdateStatus, getMxcActivity, getMxcPolicy, logReceiverDeploy, logReceiverFlipEndpoint, logReceiverRemove, logReceiverStatus, mxcRunSelfTest, openFolder, sendTestNotification, servicesList, servicesRegister, servicesUnregister, setMxcMode, setNotificationConfig, setSupervisionMode, setTelemetryInterval, taskAbort, tasksList, updateAppConfig, updatesApply, updatesCheckAll, updatesPin, updatesSetAuto, winmlRecheckCapabilities } from "../api";
-import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, TaskRecordWire } from "../api";
+import { adminApiCreateEnrollment, adminApiCreateUser, adminApiDeleteUser, adminApiGetAudit, adminApiGetStatus, adminApiListUsers, adminApiRegenerateCert, adminApiResetPassword, adminApiSetEnabled, adminApiUpdateUser, appUpdateCheck, appUpdateDownload, appUpdateSetAuto, appUpdateSetChecking, exportDiagnostics, getAppConfig, getAppUpdateStatus, getMxcActivity, getMxcPolicy, logReceiverDeploy, logReceiverFlipEndpoint, logReceiverRemove, logReceiverStatus, modelStorageSet, mxcRunSelfTest, openFolder, sendTestNotification, servicesList, servicesRegister, servicesUnregister, setMxcMode, setNotificationConfig, setSupervisionMode, setTelemetryInterval, taskAbort, tasksList, updateAppConfig, updatesApply, updatesCheckAll, updatesPin, updatesSetAuto, winmlRecheckCapabilities } from "../api";
+import type { AdminApiAuditEntry, AdminApiPairing, AdminApiStatus, AdminApiUser, AppUpdateInfo, ComponentUpdateCheck, ModelStorageConfig, TaskRecordWire } from "../api";
 import { confirmDialog } from "../dialog";
 import { portError } from "../errors";
 import { esc, keepFocus } from "../html";
@@ -10,8 +10,8 @@ import { icon } from "../icons";
 import { serviceStore, wireLifecycleActions } from "../lifecycle";
 import type { LifecycleResult } from "../lifecycle";
 import { bannerHtml, cadenceBucket, emptyHtml, loadingHtml, setBanner, topbar } from "./common";
-import { appUpdateInner, asRecord, componentUpdatesInner, logReceiverInner, remoteAccessHtml, settingsPaint, supervisionInner, supervisionSignature } from "./settingsPanels";
-import type { SettingsTab, SettingsUi } from "./settingsPanels";
+import { appUpdateInner, asRecord, asStorageConfig, componentUpdatesInner, logReceiverInner, remoteAccessHtml, settingsPaint, storageConfigFromDraft, storageDraftFrom, supervisionInner, supervisionSignature } from "./settingsPanels";
+import type { SettingsTab, SettingsUi, StorageDraft } from "./settingsPanels";
 
 export function renderSettings(): string {
   return `${topbar("Settings")}
@@ -32,6 +32,21 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
   /** Last loaded notifications object, so a toggle click can send
    *  the complete replacement (the command replaces the section). */
   let lastNotif: Record<string, unknown> | null = null;
+  /** Model storage tab: the saved section (the base a save or the
+   *  Auto switch builds on) and the open edit form's draft (null =
+   *  closed), synced on input so a repaint never loses typing. */
+  let lastStorage: ModelStorageConfig | null = null;
+  let storageDraft: StorageDraft | null = null;
+  const syncStorageDraft = (ev: Event): void => {
+    const t = ev.target as HTMLElement;
+    const key = t.getAttribute("data-ms-field") as keyof StorageDraft | null;
+    if (!key || !storageDraft) return;
+    const v = (t as HTMLInputElement | HTMLSelectElement).value;
+    if (key === "downloadTier") storageDraft.downloadTier = v === "cold" ? "cold" : "hot";
+    else storageDraft[key] = v;
+  };
+  root.addEventListener("input", syncStorageDraft);
+  root.addEventListener("change", syncStorageDraft);
   // Remote Access tab state, held outside the repainted DOM.
   let raStatus: AdminApiStatus | null = null;
   let raUsers: AdminApiUser[] = [];
@@ -103,6 +118,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       return;
     }
     lastNotif = asRecord(cfgR.data.notifications);
+    lastStorage = asStorageConfig(cfgR.data.model_storage);
     // Policy/activity CallResults go in whole: their .error renders as
     // "unavailable — <error>", distinct from genuine absence.
     if (setUi.tab === "remote") await loadRemote();
@@ -112,7 +128,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
       remoteAccessHtml(raStatus, raUsers, raTemp, raEnroll, raAudit),
       appUpdateInner(lastAppUpd, appUpdLive),
       logReceiverInner(lrR, lrNewToken),
-      componentUpdatesInner(compCheck, appUpdLive, compTask), compCheck); });
+      componentUpdatesInner(compCheck, appUpdLive, compTask), compCheck, storageDraft); });
   };
 
   const onClick = async (ev: Event): Promise<void> => {
@@ -122,6 +138,51 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     if (tabBtn) {
       setUi.tab = (tabBtn.getAttribute("data-set-tab") ?? "general") as SettingsTab;
       await load();
+      return;
+    }
+
+    const msBtn = t.closest("[data-ms-act]") as HTMLButtonElement | null;
+    if (msBtn) {
+      const act = msBtn.getAttribute("data-ms-act") ?? "";
+      if (act === "edit") {
+        if (!lastStorage) return;
+        storageDraft = storageDraftFrom(lastStorage);
+        setMsg("");
+        await load();
+        return;
+      }
+      if (act === "cancel") {
+        storageDraft = null;
+        setMsg("");
+        await load();
+        return;
+      }
+      if (act === "auto" && lastStorage) {
+        // The switch IS the setting (rule 16): it commits the saved
+        // section with auto flipped; an open form's draft is kept.
+        msBtn.disabled = true;
+        const r = await modelStorageSet({ ...lastStorage, auto: !lastStorage.auto });
+        if (disposed) return;
+        if (r.error) setMsg(`Auto moves change failed: ${r.error}`, true);
+        else setMsg("");
+        await load();
+        return;
+      }
+      if (act === "save" && lastStorage && storageDraft) {
+        // Rule 17: success closes the form and redisplays the saved
+        // values; a failure keeps the form open with the draft
+        // intact (it lives outside the DOM) and the error shown.
+        const parsed = storageConfigFromDraft(storageDraft, lastStorage);
+        if ("error" in parsed) { setMsg(`Model storage not saved: ${parsed.error}`, true); return; }
+        msBtn.disabled = true;
+        const r = await modelStorageSet(parsed.config);
+        if (disposed) return;
+        if (r.error) { setMsg(`Model storage save failed: ${r.error}`, true); msBtn.disabled = false; return; }
+        storageDraft = null;
+        setMsg("Model storage saved.");
+        await load();
+        return;
+      }
       return;
     }
 
@@ -803,5 +864,7 @@ export async function wireSettings(root: HTMLElement): Promise<() => void> {
     unwireLc();
     unsubscribeStore();
     root.removeEventListener("click", onClick);
+    root.removeEventListener("input", syncStorageDraft);
+    root.removeEventListener("change", syncStorageDraft);
   };
 }

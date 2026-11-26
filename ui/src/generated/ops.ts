@@ -65,6 +65,12 @@ export type OpName =
   | "model_set_enabled"
   | "model_set_offload_spec"
   | "model_set_mtp"
+  | "model_storage_status"
+  | "model_storage_set"
+  | "model_storage_promote"
+  | "model_storage_demote"
+  | "model_storage_cancel"
+  | "model_set_keep_hot"
   | "get_logs"
   | "get_gateway_config"
   | "update_gateway_config"
@@ -508,6 +514,35 @@ export interface ModelSetOffloadSpecArgs {
 export interface ModelSetMtpArgs {
   readonly id: string;
   readonly mtp?: boolean | null;
+}
+
+/** Arguments of `model_storage_status`. */
+export interface ModelStorageStatusArgs {}
+
+/** Arguments of `model_storage_set`. */
+export interface ModelStorageSetArgs {
+  readonly storage: unknown;
+}
+
+/** Arguments of `model_storage_promote`. */
+export interface ModelStoragePromoteArgs {
+  readonly target: string;
+}
+
+/** Arguments of `model_storage_demote`. */
+export interface ModelStorageDemoteArgs {
+  readonly target: string;
+}
+
+/** Arguments of `model_storage_cancel`. */
+export interface ModelStorageCancelArgs {
+  readonly target: string;
+}
+
+/** Arguments of `model_set_keep_hot`. */
+export interface ModelSetKeepHotArgs {
+  readonly target: string;
+  readonly keep: boolean;
 }
 
 /** Arguments of `get_logs`. */
@@ -1042,6 +1077,12 @@ export interface OpArgs {
   model_set_enabled: ModelSetEnabledArgs;
   model_set_offload_spec: ModelSetOffloadSpecArgs;
   model_set_mtp: ModelSetMtpArgs;
+  model_storage_status: ModelStorageStatusArgs;
+  model_storage_set: ModelStorageSetArgs;
+  model_storage_promote: ModelStoragePromoteArgs;
+  model_storage_demote: ModelStorageDemoteArgs;
+  model_storage_cancel: ModelStorageCancelArgs;
+  model_set_keep_hot: ModelSetKeepHotArgs;
   get_logs: GetLogsArgs;
   get_gateway_config: GetGatewayConfigArgs;
   update_gateway_config: UpdateGatewayConfigArgs;
