@@ -47,6 +47,10 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// instead of blocking the supervisor forever.
 pub const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the output readers of an exited process may keep draining
+/// its pipes before they are aborted.
+pub const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 /// Default ring-buffer capacity per supervised process (spec §2.4: 10k lines).
 pub const DEFAULT_LOG_RING_CAPACITY: usize = 10_000;
 
@@ -334,6 +338,14 @@ pub struct ProcessSpec {
     /// llama-server backends; other supervised processes (MCP
     /// servers) leave it false. Ignored off Windows.
     pub low_priority: bool,
+    /// Persist the captured stdout / stderr to these files as well as
+    /// the ring (backends: `logs/backend-<id>.stdout.log` /
+    /// `.stderr.log`). Opening rotates the previous run's file to
+    /// `.prev`, matching the gateway and service-mode logs, and each
+    /// file is capped at [`OUTPUT_LOG_CAP_BYTES`] (see [`CappedLog`]).
+    /// `None` keeps the output in the ring only.
+    pub stdout_log: Option<PathBuf>,
+    pub stderr_log: Option<PathBuf>,
 }
 
 impl ProcessSpec {
@@ -384,6 +396,106 @@ fn send_graceful_signal(child: &Child) {
         let _ = child;
     }
 }
+
+/// Size cap for one persisted output log segment (32 MiB). Past it
+/// the segment is renamed to its `.1` sibling (replacing an older
+/// one) and a fresh segment continues, so a long-lived backend keeps
+/// the most recent 32-64 MiB of its output (the tail, where a crash
+/// is) while the `.prev` previous run is never touched mid-run.
+pub const OUTPUT_LOG_CAP_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The overflow sibling of a capped output log (`<file>.1`).
+pub fn overflow_log_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".1");
+    PathBuf::from(s)
+}
+
+/// A persisted, size-capped output log fed by the capture readers.
+/// Writes are best-effort: a failing disk never stops capture into
+/// the ring, and is reported once.
+pub struct CappedLog {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+    cap: u64,
+    failed: bool,
+}
+
+impl CappedLog {
+    /// Rotate any previous run's file to `.prev` (and drop a stale
+    /// `.1` overflow, which belonged to that run) and open a fresh
+    /// file headed by a start marker.
+    pub fn open(path: &Path, cap: u64) -> std::io::Result<Self> {
+        let _ = std::fs::remove_file(overflow_log_path(path));
+        let mut file = lifecycle::open_rotated_log(path)?;
+        use std::io::Write as _;
+        let header = format!("[supervisor] {} capture started\n", Utc::now().to_rfc3339());
+        file.write_all(header.as_bytes())?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(file),
+            written: header.len() as u64,
+            cap: cap.max(1024),
+            failed: false,
+        })
+    }
+
+    /// Append one captured line (a newline is added).
+    pub fn write_line(&mut self, line: &str) {
+        use std::io::Write as _;
+        let len = line.len() as u64 + 1;
+        if self.written + len > self.cap && !self.failed {
+            self.file = None;
+            let over = overflow_log_path(&self.path);
+            let _ = std::fs::remove_file(&over);
+            let _ = std::fs::rename(&self.path, &over);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                Ok(mut f) => {
+                    let marker = format!(
+                        "[supervisor] {} log segment reached {} bytes; the earlier segment is {}\n",
+                        Utc::now().to_rfc3339(),
+                        self.cap,
+                        over.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    );
+                    let _ = f.write_all(marker.as_bytes());
+                    self.written = marker.len() as u64;
+                    self.file = Some(f);
+                }
+                Err(e) => self.fail(&e),
+            }
+        }
+        if let Some(f) = self.file.as_mut() {
+            let mut buf = String::with_capacity(line.len() + 1);
+            buf.push_str(line);
+            buf.push('\n');
+            match f.write_all(buf.as_bytes()) {
+                Ok(()) => self.written += len,
+                Err(e) => self.fail(&e),
+            }
+        }
+    }
+
+    fn fail(&mut self, e: &std::io::Error) {
+        if !self.failed {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "output log write failed; capture continues in memory only"
+            );
+        }
+        self.failed = true;
+        self.file = None;
+    }
+}
+
+type SharedLog = Arc<Mutex<CappedLog>>;
 
 /// Max bytes accumulated for one captured log line (64 KiB). A supervised
 /// process emitting a never-terminated line must not grow the manager's
@@ -443,6 +555,7 @@ fn push_captured_line(
     bytes: &[u8],
     truncated: bool,
     fatal: Option<&FatalFlag>,
+    tee: Option<&SharedLog>,
 ) {
     let text = String::from_utf8_lossy(bytes);
     let line = text.strip_suffix('\r').unwrap_or(&text);
@@ -460,6 +573,11 @@ fn push_captured_line(
             }
         }
     }
+    if let Some(tee) = tee {
+        if let Ok(mut t) = tee.lock() {
+            t.write_line(&line);
+        }
+    }
     if let Ok(mut r) = ring.lock() {
         r.push(LogRecord::new(which, line));
     }
@@ -470,6 +588,7 @@ fn spawn_reader<R>(
     which: LogStream,
     ring: Arc<Mutex<RingBuffer<LogRecord>>>,
     fatal: Option<FatalFlag>,
+    tee: Option<SharedLog>,
 ) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -499,6 +618,7 @@ where
                                 &line,
                                 truncated,
                                 fatal.as_ref(),
+                                tee.as_ref(),
                             );
                             line.clear();
                             truncated = false;
@@ -513,7 +633,7 @@ where
         // EOF with an unterminated tail: emit what was captured (the
         // previous read_until loop did the same via its final read).
         if !line.is_empty() || truncated {
-            push_captured_line(&ring, which, &line, truncated, fatal.as_ref());
+            push_captured_line(&ring, which, &line, truncated, fatal.as_ref(), tee.as_ref());
         }
     })
 }
@@ -566,6 +686,16 @@ fn spawn_device_watchdog(
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     });
+}
+
+/// Where a spawn persists its captured output (in addition to the
+/// ring). Empty by default.
+#[derive(Debug, Clone, Default)]
+pub struct OutputLogs {
+    pub stdout: Option<PathBuf>,
+    pub stderr: Option<PathBuf>,
+    /// Per-segment cap; [`OUTPUT_LOG_CAP_BYTES`] when `None`.
+    pub cap_bytes: Option<u64>,
 }
 
 /// A supervised child process: one live OS process with captured output.
@@ -627,6 +757,33 @@ impl SupervisedProcess {
         workdir: Option<&Path>,
         log_ring: Arc<Mutex<RingBuffer<LogRecord>>>,
         low_priority: bool,
+    ) -> Result<Self, SupervisorError> {
+        Self::spawn_with_logs(
+            id,
+            program,
+            args,
+            env,
+            workdir,
+            log_ring,
+            low_priority,
+            &OutputLogs::default(),
+        )
+        .await
+    }
+
+    /// `spawn_with_workdir` plus persisted output logs (see
+    /// [`ProcessSpec::stderr_log`]). A log that cannot be opened is a
+    /// logged warning, never a failed spawn: the ring still captures.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_logs(
+        id: &str,
+        program: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        workdir: Option<&Path>,
+        log_ring: Arc<Mutex<RingBuffer<LogRecord>>>,
+        low_priority: bool,
+        logs: &OutputLogs,
     ) -> Result<Self, SupervisorError> {
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -693,6 +850,21 @@ impl SupervisedProcess {
             }
         }
 
+        let open_tee = |path: &Option<PathBuf>| -> Option<SharedLog> {
+            let path = path.as_ref()?;
+            match CappedLog::open(path, logs.cap_bytes.unwrap_or(OUTPUT_LOG_CAP_BYTES)) {
+                Ok(l) => Some(Arc::new(Mutex::new(l))),
+                Err(e) => {
+                    tracing::warn!(
+                        process = id,
+                        path = %path.display(),
+                        error = %e,
+                        "could not open output log; capturing to memory only"
+                    );
+                    None
+                }
+            }
+        };
         let mut readers = Vec::with_capacity(2);
         if let Some(out) = child.stdout.take() {
             readers.push(spawn_reader(
@@ -700,6 +872,7 @@ impl SupervisedProcess {
                 LogStream::Stdout,
                 Arc::clone(&log_ring),
                 reader_fatal.clone(),
+                open_tee(&logs.stdout),
             ));
         }
         if let Some(err) = child.stderr.take() {
@@ -708,6 +881,7 @@ impl SupervisedProcess {
                 LogStream::Stderr,
                 Arc::clone(&log_ring),
                 reader_fatal,
+                open_tee(&logs.stderr),
             ));
         }
 
@@ -905,11 +1079,80 @@ impl SupervisedProcess {
                 self.child = None;
                 self.last_exit = Some(status);
                 self.state = ProcessState::Failed;
-                self.abort_readers();
+                // Not abort: a process that just crashed printed its
+                // cause last (the CUDA error block before an abort),
+                // and those bytes may still sit in the pipe. The
+                // readers finish at EOF on their own; retiring them
+                // bounds how long a reader held open by an inheriting
+                // grandchild can linger.
+                self.retire_readers(READER_DRAIN_GRACE);
                 Ok(Some(status))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(SupervisorError::Io(e)),
+        }
+    }
+
+    /// [`Self::poll_exited`], but on an exit waits (up to `grace`) for
+    /// the output readers to reach EOF, so every line the process
+    /// wrote is in the ring (and its output log) when this returns.
+    pub async fn poll_exited_drained(
+        &mut self,
+        grace: Duration,
+    ) -> Result<Option<std::process::ExitStatus>, SupervisorError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                self.last_exit = Some(status);
+                self.state = ProcessState::Failed;
+                let readers = std::mem::take(&mut self.readers);
+                let aborts: Vec<_> = readers.iter().map(|r| r.abort_handle()).collect();
+                let _ = tokio::time::timeout(grace, async {
+                    for r in readers {
+                        let _ = r.await;
+                    }
+                })
+                .await;
+                for a in aborts {
+                    a.abort();
+                }
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(SupervisorError::Io(e)),
+        }
+    }
+
+    /// Let the readers run to EOF in the background, aborting any still
+    /// running after `grace`. Outside a tokio runtime they are aborted.
+    fn retire_readers(&mut self, grace: Duration) {
+        let readers = std::mem::take(&mut self.readers);
+        if readers.is_empty() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                let aborts: Vec<_> = readers.iter().map(|r| r.abort_handle()).collect();
+                rt.spawn(async move {
+                    let _ = tokio::time::timeout(grace, async {
+                        for r in readers {
+                            let _ = r.await;
+                        }
+                    })
+                    .await;
+                    for a in aborts {
+                        a.abort();
+                    }
+                });
+            }
+            Err(_) => {
+                for r in readers {
+                    r.abort();
+                }
+            }
         }
     }
 
@@ -1066,7 +1309,7 @@ pub async fn spawn_process(
         }
     }
     let ring = Arc::new(Mutex::new(RingBuffer::new(DEFAULT_LOG_RING_CAPACITY)));
-    SupervisedProcess::spawn_with_workdir(
+    SupervisedProcess::spawn_with_logs(
         id,
         &spec.program,
         &spec.args,
@@ -1074,6 +1317,11 @@ pub async fn spawn_process(
         spec.workdir.as_deref(),
         ring,
         spec.low_priority,
+        &OutputLogs {
+            stdout: spec.stdout_log.clone(),
+            stderr: spec.stderr_log.clone(),
+            cap_bytes: None,
+        },
     )
     .await
 }
@@ -2818,6 +3066,8 @@ mod tests {
             workdir: None,
             port: None,
             low_priority: false,
+            stdout_log: None,
+            stderr_log: None,
         };
         sup.register_spec(spec);
         assert!(sup.spec("idle").is_some());
@@ -2855,7 +3105,6 @@ mod tests {
     // Only the cfg(unix) spawn/log tests use these three helpers;
     // gating them the same way keeps the Windows test target free of
     // dead code.
-    #[cfg(unix)]
     fn test_ring() -> Arc<Mutex<RingBuffer<LogRecord>>> {
         Arc::new(Mutex::new(RingBuffer::new(1024)))
     }
@@ -2872,6 +3121,8 @@ mod tests {
             workdir: None,
             port: None,
             low_priority: false,
+            stdout_log: None,
+            stderr_log: None,
         }
     }
 
@@ -2895,11 +3146,12 @@ mod tests {
                 workdir: None,
                 port: None,
                 low_priority: false,
+                stdout_log: None,
+                stderr_log: None,
             }
         }
     }
 
-    #[cfg(unix)]
     async fn wait_for<F>(mut cond: F, timeout: Duration)
     where
         F: FnMut() -> bool,
@@ -3374,6 +3626,80 @@ mod tests {
         proc.drain(ms(100)).await.unwrap();
     }
 
+    /// The persisted output log: the previous run rotates to `.prev`,
+    /// a full segment rolls to `.1`, and the live file keeps the tail.
+    #[test]
+    fn capped_log_rotates_and_rolls_over() {
+        let dir = std::env::temp_dir().join(format!("sup-capped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("logs").join("backend-x.stderr.log");
+        {
+            let mut l = CappedLog::open(&path, 1024).unwrap();
+            l.write_line("first run");
+        }
+        let mut l = CappedLog::open(&path, 1024).unwrap();
+        let prev = std::fs::read_to_string(lifecycle::prev_log_path(&path)).unwrap();
+        assert!(prev.contains("first run"));
+        // ~1.2 KiB: exactly one rollover.
+        for i in 0..25 {
+            l.write_line(&format!("line {i:03} {}", "x".repeat(40)));
+        }
+        let live = std::fs::read_to_string(&path).unwrap();
+        let over = std::fs::read_to_string(overflow_log_path(&path)).unwrap();
+        assert!(live.contains("line 024"), "the tail is in the live segment");
+        assert!(live.contains("log segment reached 1024 bytes"));
+        assert!(over.contains("capture started"));
+        assert!(live.len() <= 1024 + 128 && over.len() <= 1024 + 128);
+        // The next run drops the stale overflow with the rotation.
+        drop(l);
+        let _l = CappedLog::open(&path, 1024).unwrap();
+        assert!(!overflow_log_path(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spawn with an output log persists stderr to disk as well as
+    /// to the ring.
+    #[tokio::test]
+    async fn spawn_with_logs_persists_stderr() {
+        let dir = std::env::temp_dir().join(format!("sup-tee-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let err_log = dir.join("backend-t.stderr.log");
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/C".to_string(), "echo to-stderr 1>&2".to_string()])
+        } else {
+            ("/bin/sh", vec!["-c".to_string(), "echo to-stderr >&2".to_string()])
+        };
+        let ring = test_ring();
+        let mut proc = SupervisedProcess::spawn_with_logs(
+            "tee-test",
+            &PathBuf::from(program),
+            &args,
+            &[],
+            None,
+            ring.clone(),
+            false,
+            &OutputLogs {
+                stdout: None,
+                stderr: Some(err_log.clone()),
+                cap_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+        wait_for(|| !ring.lock().unwrap().is_empty(), Duration::from_secs(10)).await;
+        wait_for(
+            || {
+                std::fs::read_to_string(&err_log)
+                    .map(|t| t.contains("to-stderr"))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        proc.kill().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn spawn_with_workdir_sets_cwd() {
@@ -3739,6 +4065,8 @@ mod tests {
             workdir: None,
             port: Some(8081),
             low_priority: false,
+            stdout_log: None,
+            stderr_log: None,
         });
         assert_eq!(
             sup.launch_argv("llama").unwrap(),

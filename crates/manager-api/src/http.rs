@@ -76,9 +76,12 @@ pub fn build_router(ctx: Arc<ApiCtx>) -> (Router, Vec<RouteRecord>) {
         });
         router = router.route(
             route.path,
-            axum::routing::on(filter, move |state, path, query, body| {
-                handle_op(spec, state, path, query, body)
-            }),
+            axum::routing::on(
+                filter,
+                move |state, principal, source_ip, request_id, path, query, body| {
+                    handle_op(spec, state, principal, source_ip, request_id, path, query, body)
+                },
+            ),
         );
     }
     for (method, path) in DERIVED_ROUTES {
@@ -212,17 +215,34 @@ fn method_str(m: HttpMethod) -> &'static str {
 // The generic operation handler
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_op(
     spec: &'static OpSpec,
     State(ctx): State<Arc<ApiCtx>>,
+    principal: Option<axum::Extension<crate::auth::Principal>>,
+    source_ip: Option<axum::Extension<crate::auth_routes::SourceIp>>,
+    request_id: Option<axum::Extension<crate::auth_routes::RequestId>>,
     Path(path_params): Path<HashMap<String, String>>,
     Query(query): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Response {
-    let args = match assemble_args(spec, &path_params, &query, &body) {
+    let mut args = match assemble_args(spec, &path_params, &query, &body) {
         Ok(a) => a,
         Err(resp) => return *resp,
     };
+    // Operations that take a `caller` get it from the authenticated
+    // request, never from the client: whatever a body or query put
+    // there is overwritten (debug console design §7).
+    if spec.params.contains(&"caller") {
+        let caller = caller_value(
+            principal.as_ref().map(|p| &p.0),
+            source_ip.as_ref().map(|s| s.0 .0.as_str()),
+            request_id.as_ref().map(|r| r.0 .0.as_str()),
+        );
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("caller".to_string(), caller);
+        }
+    }
     // Asynchronous operations (rest-api.md §3.1): create the
     // operation record, spawn the dispatch, answer 202. The
     // record's detail carries the outcome the synchronous call
@@ -283,6 +303,35 @@ async fn handle_op(
         Ok(value) => shape_success(&ctx, spec, value),
         Err(e) => error_response(&ctx, &e, None),
     }
+}
+
+/// The `caller` argument for an API request: the principal's identity
+/// and role, and whether the request came from this machine.
+pub fn caller_value(
+    principal: Option<&crate::auth::Principal>,
+    source_ip: Option<&str>,
+    request_id: Option<&str>,
+) -> Value {
+    let ip = source_ip.unwrap_or("unknown");
+    let loopback = ip
+        .parse::<std::net::IpAddr>()
+        .map(|a| a.to_canonical().is_loopback())
+        .unwrap_or(false);
+    let role = principal.map(|p| match p.role {
+        manager_app::registry::Role::Viewer => "viewer",
+        manager_app::registry::Role::Operator => "operator",
+        manager_app::registry::Role::Configurator => "configurator",
+        manager_app::registry::Role::Admin => "admin",
+    });
+    json!({
+        "kind": "api",
+        "actor": principal.map(|p| p.username.clone()).unwrap_or_else(|| "unknown".into()),
+        "auth_type": principal.map(|p| p.auth_type.as_str()).unwrap_or("none"),
+        "source_ip": ip,
+        "loopback": loopback,
+        "role": role.unwrap_or("viewer"),
+        "request_id": request_id.unwrap_or(""),
+    })
 }
 
 /// The terminal outcome of an asynchronous operation, by the one
@@ -460,6 +509,7 @@ pub fn error_mapping(e: &ApiError) -> (axum::http::StatusCode, &'static str, &'s
         ApiError::Io(_) => (S::INTERNAL_SERVER_ERROR, "IO", "Io"),
         ApiError::Json(_) => (S::INTERNAL_SERVER_ERROR, "JSON", "Json"),
         ApiError::Busy(_) => (S::CONFLICT, "BUSY", "Busy"),
+        ApiError::Forbidden(_) => (S::FORBIDDEN, "FORBIDDEN", "Forbidden"),
     }
 }
 

@@ -100,6 +100,12 @@ pub struct AppConfig {
     /// feature existed.
     #[serde(default)]
     pub log_streaming: LogStreamingConfig,
+    /// Debug console (docs/debug-console.md): the remote-execution
+    /// gate, the API raw-shell gate, and the executable allowlist for
+    /// recipe steps. Absent in configurations written before the
+    /// console existed; the defaults are the locked-down ones.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     /// App self-update preferences (Settings → Updates & diagnostics):
@@ -949,6 +955,45 @@ pub struct SupervisionConfig {
     pub mode: SupervisionMode,
 }
 
+/// Debug console settings (see [`AppConfig::diagnostics`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsConfig {
+    /// Allow process-running console operations (recipe runs,
+    /// backend lifecycle, `set-flags`, the raw shell) from admin API
+    /// requests that do not originate on this machine. Off by default:
+    /// the API binds every interface, and running processes is
+    /// loopback-only unless this is deliberately turned on.
+    #[serde(default)]
+    pub allow_remote_exec: bool,
+    /// Allow the raw shell (a pwsh session) over the admin API. Off by
+    /// default; with it off, API callers can run only built-in
+    /// commands and recipe steps whose executables are allowlisted.
+    /// The desktop UI enables its raw shell per session regardless.
+    #[serde(default)]
+    pub api_raw_shell: bool,
+    /// Executables recipe steps may run. An entry is either a template
+    /// path whose file name may be a `*` glob (`{llamacpp_bin}/*`
+    /// allows every managed llama.cpp binary) or a bare program name
+    /// that must resolve through PATH (`nvidia-smi`).
+    #[serde(default = "default_exec_allowlist")]
+    pub exec_allowlist: Vec<String>,
+}
+
+/// The default allowlist: the managed llama.cpp binaries and nvidia-smi.
+pub fn default_exec_allowlist() -> Vec<String> {
+    vec!["{llamacpp_bin}/*".to_string(), "nvidia-smi".to_string()]
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            allow_remote_exec: false,
+            api_raw_shell: false,
+            exec_allowlist: default_exec_allowlist(),
+        }
+    }
+}
+
 /// Admin REST API settings (see [`AppConfig::admin_api`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminApiConfig {
@@ -1330,6 +1375,7 @@ impl AppConfig {
             supervision: SupervisionConfig::default(),
             admin_api: AdminApiConfig::default(),
             log_streaming: LogStreamingConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             updates: UpdatePolicy {
                 components: HashMap::from([(
                     LITELLM_COMPONENT.to_string(),

@@ -51,25 +51,11 @@ impl AuditLog {
     /// it is never silently dropped either.
     pub fn append(&self, entry: &AuditEntry) {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        // The app core's debug console appends its own records to the
+        // same file; manager_app::audit owns the process-wide lock and
+        // the single-write append, so the two writers never interleave.
         match serde_json::to_string(entry) {
-            Ok(line) => {
-                use std::io::Write;
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                {
-                    Ok(mut f) => {
-                        if let Err(e) = writeln!(f, "{line}") {
-                            eprintln!("admin api audit: write failed: {e}");
-                        }
-                    }
-                    Err(e) => eprintln!("admin api audit: open failed: {e}"),
-                }
-            }
+            Ok(line) => manager_app::audit::append_line(&self.path, &line),
             Err(e) => eprintln!("admin api audit: serialize failed: {e}"),
         }
     }

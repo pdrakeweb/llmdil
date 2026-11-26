@@ -11,6 +11,7 @@ import { stackedBar } from "./charts";
 import { esc, setHtml } from "./html";
 import { icon, type IconName } from "./icons";
 import { renderBench, wireBench } from "./views/bench";
+import { renderConsole, wireConsole } from "./views/console";
 import { mountDashboard } from "./views/dashboard";
 import { renderGroups, wireGroups } from "./views/groups";
 import { renderMcp, wireMcp } from "./views/mcp";
@@ -39,6 +40,7 @@ const ROUTES: Route[] = [
   { hash: "#/mcp", label: "MCP Servers", icon: "layers", title: "MCP Servers" },
   { hash: "#/optimize", label: "Optimize", icon: "target", title: "Optimize" },
   { hash: "#/bench", label: "Bench", icon: "gauge", title: "Bench" },
+  { hash: "#/console", label: "Console", icon: "terminal", title: "Console" },
   { hash: "#/activation-plan", label: "Activation Plan", icon: "warn", title: "Activation Plan" },
   { hash: "#/settings", label: "Settings", icon: "gear", title: "Settings" },
   { hash: "#/wizard", label: "Setup Wizard", icon: "wrench", title: "Setup Wizard" },
@@ -446,6 +448,14 @@ async function render(): Promise<void> {
       view.innerHTML = renderBench();
       {
         const c = await wireBench(view);
+        if (gen !== renderGen) { c(); return; }
+        cleanup = c;
+      }
+      break;
+    case "#/console":
+      view.innerHTML = renderConsole();
+      {
+        const c = await wireConsole(view);
         if (gen !== renderGen) { c(); return; }
         cleanup = c;
       }

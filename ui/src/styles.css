@@ -629,3 +629,45 @@ table.tbl tr:last-child td { border-bottom: 0; }
 .group-mini-line { font-size: 12px; color: var(--text2); margin-top: 4px; min-width: 0; overflow-wrap: anywhere; }
 .group-ext-chip { margin-bottom: 8px; }
 .group-drop-hint { font-size: 12px; color: var(--text3); border: 1px dashed var(--border); border-radius: 8px; padding: 10px; text-align: center; }
+
+/* ---------------- Debug console ---------------- */
+.con-view { display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding-bottom: 12px; }
+.con-root { display: flex; gap: 14px; flex: 1; min-height: 0; }
+.con-main { flex: 1 1 60%; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; }
+.con-out { flex: 1; overflow-y: auto; padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; min-height: 0; }
+.con-line { min-height: 1.45em; }
+.con-err { color: #ff9a92; }
+.con-sys { color: var(--text3); }
+.con-in { color: var(--accent); }
+.con-res { color: var(--text); }
+.con-block { margin: 6px 0; white-space: normal; }
+.con-res-head { color: var(--text2); margin-bottom: 4px; display: flex; gap: 6px; align-items: center; }
+.con-prompt { display: flex; gap: 8px; align-items: center; border-top: 1px solid var(--border); padding: 8px 10px; }
+.con-ps { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+.con-ps-shell { color: var(--warn); }
+.con-prompt input { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; }
+.con-side { flex: 0 1 40%; min-width: 320px; display: flex; flex-direction: column; min-height: 0; }
+.con-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+.con-tab { background: var(--panel); color: var(--text2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
+.con-tab.active { color: var(--text); border-color: var(--accent); }
+.con-panel { flex: 1; overflow-y: auto; min-height: 0; }
+.con-sec { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; }
+.con-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.04em; }
+.con-ta { width: 100%; background: var(--bg2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+.con-in { flex: 1 1 140px; background: var(--bg2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12px; min-width: 120px; }
+.con-narrow { flex: 0 0 90px; }
+.con-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+.con-muted { color: var(--text3); font-size: 12px; }
+.con-tag { font-size: 10px; color: var(--text2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; margin-left: 4px; }
+.con-item { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.con-plan { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.con-plan-sum { color: var(--text2); }
+.con-step { border-left: 2px solid var(--border); padding-left: 8px; }
+.con-cmd, .con-env { font-size: 11px; color: var(--text2); overflow-wrap: anywhere; }
+.con-stops, .con-confirm { color: var(--warn); font-size: 12px; }
+.con-confirm { border: 1px solid rgba(210, 153, 34, 0.5); border-radius: 8px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.con-check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; }
+.con-pre { font-family: var(--mono); font-size: 11px; white-space: pre-wrap; word-break: break-word; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+.con-table td { font-size: 11px; vertical-align: top; }
+.con-shell-toggle { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--text2); }
+.mono { font-family: var(--mono); }

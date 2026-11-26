@@ -1482,6 +1482,27 @@ an entry is identified by the pair. Removes that one entry from
 the store; history is otherwise append-only. → `{ "deleted": true,
 "fingerprint", "measured_at" }`; `404` when no such entry exists.
 
+### 6.19 Debug console
+
+Recipes, paste import, runs, results, built-in commands and backend
+logs — the full table, request shapes and security model are in
+[`docs/debug-console.md`](../debug-console.md) §6–§7 and the agent
+workflow in [`AGENTS.md`](../../AGENTS.md).
+
+- `GET|POST /api/v1/console/recipes`, `GET|PUT|DELETE /api/v1/console/recipes/{name}`
+- `POST /api/v1/console/import` — parse a pasted block into a draft recipe + plan (runs nothing)
+- `POST /api/v1/console/plan` — resolve a recipe against this machine
+- `POST /api/v1/console/runs` — start a run (`started: false, needs_confirmation` until the backends to stop are confirmed); `GET /api/v1/console/runs`
+- `GET /api/v1/console/runs/{run_id}` (`?full=true`), `/output?since=&wait_ms=` (long-poll), `/export`, `POST …/cancel`
+- `POST /api/v1/console/exec` — one built-in command line; `GET /api/v1/console/backends/{id}/logs`
+- `GET /api/v1/console/settings` (the write is desktop-only)
+- `POST|DELETE /api/v1/console/shell/{session_id}`, `POST …/input`, `GET …/output` — only with `diagnostics.api_raw_shell`
+
+Operations that take `caller` have it filled by the API layer from the
+principal and peer address (a client-supplied value is overwritten).
+Process-running operations answer `403 FORBIDDEN` for non-loopback
+peers unless `diagnostics.allow_remote_exec` is set.
+
 ## 7. Capabilities that do not map cleanly
 
 1. **`open_url` — no endpoint.** It opens a browser on the managed

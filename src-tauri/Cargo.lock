@@ -2411,6 +2411,7 @@ dependencies = [
  "chrono",
  "manager-bench",
  "manager-config",
+ "manager-diag",
  "manager-gateway",
  "manager-logship",
  "manager-mcp",
@@ -2450,6 +2451,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "zip",
+]
+
+[[package]]
+name = "manager-diag"
+version = "0.1.62"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2538,6 +2547,7 @@ version = "0.1.62"
 name = "manager-services"
 version = "0.1.62"
 dependencies = [
+ "chrono",
  "manager-supervisor",
  "serde",
  "serde_json",
@@ -2604,6 +2614,7 @@ dependencies = [
  "manager-mxc",
  "manager-present",
  "manager-services",
+ "manager-supervisor",
  "manager-telemetry",
  "manager-winml",
  "reqwest 0.12.28",

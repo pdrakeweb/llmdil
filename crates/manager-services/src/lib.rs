@@ -1046,6 +1046,8 @@ mod tests {
             workdir: None,
             port: Some(8081),
             low_priority: false,
+            stdout_log: None,
+            stderr_log: None,
         }
     }
 

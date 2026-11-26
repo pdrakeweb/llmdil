@@ -31,3 +31,4 @@ manager-optimize = { path = "../manager-optimize" }
 manager-services = { path = "../manager-services" }
 manager-mxc = { path = "../manager-mxc" }
 manager-winml = { path = "../manager-winml" }
+manager-diag = { path = "../manager-diag" }

@@ -907,13 +907,13 @@ fn cpu_offload(b: &BackendConfig) -> bool {
 /// still conflicts with everything (conservative: a sweep that
 /// cannot prove isolation does not run).
 #[derive(Debug, Clone, PartialEq)]
-enum BenchPlacement {
+pub(crate) enum BenchPlacement {
     CpuOnly,
     Gpus(std::collections::BTreeSet<u32>),
     Undetermined,
 }
 
-fn bench_placement(b: &BackendConfig) -> BenchPlacement {
+pub(crate) fn bench_placement(b: &BackendConfig) -> BenchPlacement {
     if crate::raw_flags_pin_cpu_only(b.raw_flags.as_deref()) {
         return BenchPlacement::CpuOnly;
     }
@@ -1594,6 +1594,13 @@ pub async fn op_bench_run_start(
         return Err(ApiError::InvalidInput(
             "a bench sweep is already running".to_string(),
         ));
+    }
+    // Nor alongside a debug console run (it stops and restores
+    // backends on the same GPUs).
+    if let Some(run) = crate::console::active_run_id(state).await {
+        return Err(ApiError::Busy(format!(
+            "debug console run {run} is running; wait for it or cancel it"
+        )));
     }
     if state.optimize_job_abort.lock().await.is_some() {
         return Err(ApiError::InvalidInput(

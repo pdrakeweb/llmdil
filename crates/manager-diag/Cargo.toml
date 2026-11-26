@@ -1,0 +1,17 @@
+[package]
+name = "manager-diag"
+version = "0.1.62"
+edition = "2021"
+
+# Pure logic for the debug console (docs/debug-console.md): recipe
+# types and variant expansion, template resolution, the paste
+# importer (PowerShell / cmd blocks -> recipes, never a shell
+# string), the console command-line grammar, output parsers
+# (llama-bench, llama-server timings, CUDA/ggml error blocks),
+# NTSTATUS decoding, GPU-requirement inference, a GGUF metadata
+# reader, and the shipped built-in recipes. Process, HTTP and
+# supervisor glue live in manager-app (`console` module).
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

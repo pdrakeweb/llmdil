@@ -290,6 +290,8 @@ pub fn process_spec_for(server: &ServerSpec) -> Option<ProcessSpec> {
         workdir: None,
         port: None,
         low_priority: false,
+        stdout_log: None,
+        stderr_log: None,
     })
 }
 

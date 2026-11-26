@@ -208,6 +208,9 @@ pub enum Origin {
     Monitor,
     Startup,
     Scm,
+    /// The debug console (a recipe run's stop/restore, or a console
+    /// `start`/`stop`/`restart` command).
+    Console,
 }
 
 impl Origin {
@@ -225,6 +228,7 @@ impl Origin {
             Origin::Monitor => "monitor",
             Origin::Startup => "startup",
             Origin::Scm => "scm",
+            Origin::Console => "console",
         }
     }
 
@@ -245,6 +249,7 @@ impl Origin {
             "monitor" => Origin::Monitor,
             "startup" => Origin::Startup,
             "scm" | "service" => Origin::Scm,
+            "console" | "diagnostics" => Origin::Console,
             _ => return None,
         })
     }

@@ -98,6 +98,17 @@ pub use bench::{
 };
 pub use optimize_tuning::{op_optimize_tuning_adopt, op_optimize_tuning_preview, op_optimize_tuning_run};
 pub mod registry;
+pub mod audit;
+pub mod console;
+pub use console::{
+    op_console_backend_logs, op_console_exec, op_console_import, op_console_plan,
+    op_console_recipe_create, op_console_recipe_delete, op_console_recipe_get,
+    op_console_recipe_update, op_console_recipes_list, op_console_run_cancel,
+    op_console_run_export, op_console_run_output, op_console_run_result, op_console_run_start,
+    op_console_runs_list, op_console_settings_get, op_console_settings_set,
+    op_console_shell_close, op_console_shell_open, op_console_shell_read,
+    op_console_shell_send,
+};
 
 // ---------------------------------------------------------------------------
 // Events (Rust -> UI, spec §14)
@@ -232,6 +243,10 @@ pub enum ApiError {
     /// restart already in progress (started by activation 12 s ago)").
     /// REST maps it to 409 / `BUSY`.
     Busy(String),
+    /// The caller may not do this here (a process-running console
+    /// action from a non-loopback API request, a role short of the
+    /// command's class, a disabled raw shell). REST maps it to 403.
+    Forbidden(String),
 }
 
 impl fmt::Display for ApiError {
@@ -254,6 +269,7 @@ impl fmt::Display for ApiError {
             ApiError::Io(e) => write!(f, "io error: {e}"),
             ApiError::Json(e) => write!(f, "json error: {e}"),
             ApiError::Busy(e) => write!(f, "{e}"),
+            ApiError::Forbidden(e) => write!(f, "forbidden: {e}"),
         }
     }
 }
@@ -592,6 +608,8 @@ pub struct AppState {
     /// The lifecycle monitor's counters between ticks (see
     /// [`lifecycle_monitor`]). std Mutex: synchronous updates only.
     lifecycle_monitor: std::sync::Mutex<lifecycle_monitor::MonitorState>,
+    /// Debug console: the active run, live output buffers, raw shells.
+    console: console::ConsoleState,
 }
 
 /// One running Estimate/Measure job's descriptor (tracker #69),
@@ -759,6 +777,7 @@ impl AppState {
             lifecycle_monitor: std::sync::Mutex::new(lifecycle_monitor::MonitorState::default()),
             activation_apply_lock: Mutex::new(()),
             activation_progress: std::sync::Mutex::new(None),
+            console: console::ConsoleState::default(),
         }
     }
 
@@ -2166,7 +2185,24 @@ fn backend_spec(
         // backend thrashing memory must yield the operator's
         // desktop session (Part B of the start-preflight build).
         low_priority: true,
+        // Captured output also persists to logs/backend-<id>.std*.log
+        // (the previous run in `.prev`, a 32 MiB segment cap): the
+        // cause of an earlier crash must survive the in-memory ring
+        // and an app restart (debug console design §1).
+        stdout_log: Some(backend_output_log(&cfg.data_dir, &b.id, "stdout")),
+        stderr_log: Some(backend_output_log(&cfg.data_dir, &b.id, "stderr")),
     }
+}
+
+/// `logs/backend-<id>.<stream>.log` under the data dir: the file both
+/// process mode (supervisor capture) and service mode (the shim)
+/// write a backend's output to.
+pub(crate) fn backend_output_log(
+    data_dir: &std::path::Path,
+    id: &str,
+    stream: &str,
+) -> PathBuf {
+    data_dir.join("logs").join(format!("backend-{id}.{stream}.log"))
 }
 
 
@@ -5084,7 +5120,25 @@ pub async fn op_get_logs(
         .into_iter()
         .map(|s| json!({ "id": s.id, "previous": s.previous }))
         .collect();
+    // Ids whose output the supervisor ring already holds (process
+    // mode, this session): their persisted stdout/stderr files carry
+    // the same lines, so only the lifecycle file is merged for them.
+    // Service-mode and adopted backends have empty rings and are
+    // served from the files (debug console design §1).
+    let ring_ids: std::collections::HashSet<String> =
+        records.iter().map(|r| r.source.clone()).collect();
     for (id, files) in file_log_scopes(&state.data_dir, &backend_ids) {
+        let files: Vec<(PathBuf, LogStream)> = if ring_ids.contains(&id) {
+            files
+                .into_iter()
+                .filter(|(p, _)| {
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                    !name.is_some_and(|n| n.ends_with(".stdout.log") || n.ends_with(".stderr.log"))
+                })
+                .collect()
+        } else {
+            files
+        };
         let wanted = scope == "all" || scope == id;
         let (present, previous) = if wanted {
             let (file_records, previous) = file_scope_records(&id, &files, true);

@@ -437,7 +437,36 @@ macro_rules! for_each_operation {
             (AppUpdateSetChecking, app_update_set_checking, C, op_app_update_set_checking, [enabled: bool], Some(route(HttpMethod::Put, "/api/v1/app-update/checking"))),
             (AppUpdateSetAuto, app_update_set_auto, C, op_app_update_set_auto, [enabled: bool], Some(route(HttpMethod::Put, "/api/v1/app-update/auto"))),
             (AppUpdateDownload, app_update_download, L, op_app_update_download, [], Some(route(HttpMethod::Post, "/api/v1/app-update/download"))),
-            (AppUpdateRestart, app_update_restart, D, op_app_update_restart, [], Some(route(HttpMethod::Post, "/api/v1/app-update/restart")))
+            (AppUpdateRestart, app_update_restart, D, op_app_update_restart, [], Some(route(HttpMethod::Post, "/api/v1/app-update/restart"))),
+            // Debug console (docs/debug-console.md). `caller` is never
+            // a client field: the REST layer overwrites it with the
+            // authenticated principal and the request's source (the
+            // loopback gate keys off it); the desktop passes none and
+            // is the local operator. Process-running operations are D
+            // (admin); console_exec is read-class at the route and
+            // checks each command's own class. The settings write is
+            // desktop-only so an API caller can never widen its gates.
+            (ConsoleRecipesList, console_recipes_list, R, op_console_recipes_list, [], Some(route(HttpMethod::Get, "/api/v1/console/recipes"))),
+            (ConsoleRecipeGet, console_recipe_get, SConfig, op_console_recipe_get, [name: String], Some(route(HttpMethod::Get, "/api/v1/console/recipes/{name}"))),
+            (ConsoleRecipeCreate, console_recipe_create, C, op_console_recipe_create, [recipe: Value, overwrite: Option<bool>, caller: Option<Value>], Some(route_created(HttpMethod::Post, "/api/v1/console/recipes"))),
+            (ConsoleRecipeUpdate, console_recipe_update, C, op_console_recipe_update, [name: String, recipe: Value, caller: Option<Value>], Some(route_wrap(HttpMethod::Put, "/api/v1/console/recipes/{name}", "recipe"))),
+            (ConsoleRecipeDelete, console_recipe_delete, C, op_console_recipe_delete, [name: String, caller: Option<Value>], Some(route(HttpMethod::Delete, "/api/v1/console/recipes/{name}"))),
+            (ConsoleImport, console_import, C, op_console_import, [text: String, name: Option<String>, fold: Option<bool>, save: Option<bool>, caller: Option<Value>], Some(route(HttpMethod::Post, "/api/v1/console/import"))),
+            (ConsolePlan, console_plan, R, op_console_plan, [recipe: Option<String>, recipe_doc: Option<Value>, variant: Option<usize>, params: Option<std::collections::BTreeMap<String, String>>, set: Option<std::collections::BTreeMap<String, String>>], Some(route(HttpMethod::Post, "/api/v1/console/plan"))),
+            (ConsoleRunStart, console_run_start, D, op_console_run_start, [recipe: Option<String>, recipe_doc: Option<Value>, variant: Option<usize>, params: Option<std::collections::BTreeMap<String, String>>, set: Option<std::collections::BTreeMap<String, String>>, confirm_stop: Option<Vec<String>>, confirm_all: Option<bool>, restore: Option<bool>, caller: Option<Value>], Some(route(HttpMethod::Post, "/api/v1/console/runs"))),
+            (ConsoleRunCancel, console_run_cancel, D, op_console_run_cancel, [run_id: String, caller: Option<Value>], Some(route(HttpMethod::Post, "/api/v1/console/runs/{run_id}/cancel"))),
+            (ConsoleRunOutput, console_run_output, R, op_console_run_output, [run_id: String, since: Option<u64>, wait_ms: Option<u64>, limit: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/console/runs/{run_id}/output"))),
+            (ConsoleRunResult, console_run_result, R, op_console_run_result, [run_id: String, full: Option<bool>], Some(route(HttpMethod::Get, "/api/v1/console/runs/{run_id}"))),
+            (ConsoleRunsList, console_runs_list, R, op_console_runs_list, [limit: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/console/runs"))),
+            (ConsoleRunExport, console_run_export, R, op_console_run_export, [run_id: String], Some(route(HttpMethod::Get, "/api/v1/console/runs/{run_id}/export"))),
+            (ConsoleExec, console_exec, R, op_console_exec, [line: String, session_id: Option<String>, caller: Option<Value>], Some(route(HttpMethod::Post, "/api/v1/console/exec"))),
+            (ConsoleBackendLogs, console_backend_logs, R, op_console_backend_logs, [id: String, prev: Option<bool>, grep: Option<String>, tail: Option<u64>, stream: Option<String>], Some(route(HttpMethod::Get, "/api/v1/console/backends/{id}/logs"))),
+            (ConsoleSettingsGet, console_settings_get, SConfig, op_console_settings_get, [], Some(route(HttpMethod::Get, "/api/v1/console/settings"))),
+            (ConsoleSettingsSet, console_settings_set, X, op_console_settings_set, [allow_remote_exec: Option<bool>, api_raw_shell: Option<bool>, exec_allowlist: Option<Vec<String>>, caller: Option<Value>], None),
+            (ConsoleShellOpen, console_shell_open, D, op_console_shell_open, [session_id: String, caller: Option<Value>], Some(route(HttpMethod::Post, "/api/v1/console/shell/{session_id}"))),
+            (ConsoleShellSend, console_shell_send, D, op_console_shell_send, [session_id: String, line: String, caller: Option<Value>], Some(route(HttpMethod::Post, "/api/v1/console/shell/{session_id}/input"))),
+            (ConsoleShellRead, console_shell_read, D, op_console_shell_read, [session_id: String, since: Option<u64>, wait_ms: Option<u64>, caller: Option<Value>], Some(route(HttpMethod::Get, "/api/v1/console/shell/{session_id}/output"))),
+            (ConsoleShellClose, console_shell_close, D, op_console_shell_close, [session_id: String, caller: Option<Value>], Some(route(HttpMethod::Delete, "/api/v1/console/shell/{session_id}")))
         }
     };
 }
@@ -518,7 +547,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 158);
+        assert_eq!(OP_SPECS.len(), 179);
     }
 
     #[test]

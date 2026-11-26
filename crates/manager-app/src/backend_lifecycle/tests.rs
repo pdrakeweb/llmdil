@@ -309,6 +309,8 @@ async fn stop_drain_does_not_hold_the_supervisor_lock() {
             workdir: None,
             port: None,
             low_priority: false,
+            stdout_log: None,
+            stderr_log: None,
         });
         sup.spawn_backend(id).await.unwrap();
     }

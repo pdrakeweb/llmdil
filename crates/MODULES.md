@@ -1,8 +1,9 @@
 # Crate map — implementation contract
 
-Rust workspace for LLMdil. Eighteen crates under `crates/` (workspace
+Rust workspace for LLMdil. Nineteen crates under `crates/` (workspace
 members, `members = ["crates/*"]`; `manager-cli` and
-`manager-logreceiver` also build binaries) plus the Tauri shell in
+`manager-logreceiver` also build binaries; `manager-app` builds the
+`diag-fake-tool` test fixture) plus the Tauri shell in
 `src-tauri/` (excluded from the workspace; path-deps to the crates).
 The UI shell is in `ui/` (Vite + plain TypeScript; framework-independent
 Tauri command boundary per spec).
@@ -157,6 +158,16 @@ log query over live scopes and retained `dead_rings`; heuristic
 `backend_test_request`: minimal `/v1/chat/completions` probe returning
 `TestResult`). Stopped/reaped processes retain their log rings in
 `dead_rings` until the id is spawned again.
+
+Persisted output (debug console design §1): `ProcessSpec.stdout_log` /
+`stderr_log` tee the captured lines to files (backends:
+`logs/backend-<id>.stdout/stderr.log`) through `CappedLog` — `.prev`
+rotation at spawn, `OUTPUT_LOG_CAP_BYTES` (32 MiB) segments rolled to
+`<file>.1` (`overflow_log_path`) so the tail is always kept.
+`SupervisedProcess::spawn_with_logs` / `OutputLogs` for direct spawns.
+An exited process's readers drain the pipe to EOF
+(`READER_DRAIN_GRACE`) instead of being aborted;
+`poll_exited_drained` awaits that.
 
 ---
 
@@ -486,3 +497,28 @@ leaf certificate SHA-256 must match the fingerprint the LLMdil UI
 shows; a mismatch aborts the connection, and only `https://` base URLs
 are accepted). Hard rules: no secret is ever a command-line argument
 (environment or stdin only); tokens live in memory only.
+
+## manager-diag — docs/debug-console.md
+
+Pure logic for the debug console; Tauri-free, tested on every
+platform. `recipe` (`Recipe`, `Step` exec|http|gguf, `Variant` flag
+overrides, `Requires`, `Expect` success|may_crash|may_fail,
+validation, `expand` to `PlannedStep`s), `argv` (flag grouping and
+`apply_overrides`), `template` (`TemplateContext`: `{name}`
+placeholders, list splicing into argv, `{env.X}`, parameters,
+backend-id aliasing), `paste` (PowerShell/cmd block → draft recipe:
+assignments, env, comments, continuations, quoting, executable
+resolution, path templating, variant folding — never a shell string),
+`command` (the console line grammar, `Command`, `HELP`), `parsers`
+(llama-bench JSON/markdown, llama-server timings, CUDA/ggml error
+blocks, stderr excerpts), `ntstatus` (exit-code decoding), `gpus`
+(GPU-need inference from argv/env), `gguf` (header metadata reader),
+`builtins` (shipped recipes; llama-server → llama-bench flag
+translation), `summary` (step analysis, verdicts, the results table).
+The stateful side is manager-app's `console` module: plan resolution
+against live state (allowlist, GPU conflicts), the one-at-a-time
+runner (drain/stop backends → steps as `SupervisedProcess`es with
+live output and telemetry → restore in a finally path), run
+persistence under `diagnostics/runs/`, built-in command dispatch,
+the opt-in raw shell, the loopback/role gates, and audit records in
+`logs/admin-api-audit.jsonl` (shared writer: `manager_app::audit`).

@@ -1339,6 +1339,7 @@ dependencies = [
  "chrono",
  "manager-bench",
  "manager-config",
+ "manager-diag",
  "manager-gateway",
  "manager-logship",
  "manager-mcp",
@@ -1397,6 +1398,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "zip",
+]
+
+[[package]]
+name = "manager-diag"
+version = "0.1.62"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
