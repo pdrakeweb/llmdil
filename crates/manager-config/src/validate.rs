@@ -360,6 +360,9 @@ pub fn validate(config: &AppConfig) -> Result<(), ConfigError> {
     validate_mcp_servers(&config.mcp, &mut errors);
     validate_searxng(&config.mcp.searxng, &mut errors);
 
+    // --- model storage tiers (structural only; no disk probes) ---
+    crate::validate_model_storage(&config.model_storage, &config.data_dir, &mut errors);
+
     // --- telemetry ---
     if config.telemetry.retention_secs == 0 {
         errors.push("telemetry.retention_secs must be > 0".to_string());

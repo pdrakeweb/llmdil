@@ -22,6 +22,7 @@ pub mod placement;
 mod registry;
 #[cfg(test)]
 mod test_fixtures;
+pub mod tier;
 
 pub use catalog::*;
 pub use download::*;

@@ -26,6 +26,7 @@ mod migrate;
 mod persist;
 mod serving;
 mod settings;
+mod storage;
 #[cfg(test)]
 mod test_fixtures;
 mod validate;
@@ -41,6 +42,7 @@ pub use migrate::*;
 pub use persist::*;
 pub use serving::*;
 pub use settings::*;
+pub use storage::*;
 pub use validate::*;
 
 /// Current config schema version.
@@ -114,6 +116,12 @@ pub struct AppConfig {
     /// feature existed.
     #[serde(default)]
     pub log_streaming: LogStreamingConfig,
+    /// Tiered model storage (docs/tiered-model-storage.md): cold tiers
+    /// and the promotion/demotion policy. Absent in configurations
+    /// written before the feature existed; the default has no cold
+    /// tiers, so every model resolves to the hot tier exactly as before.
+    #[serde(default)]
+    pub model_storage: ModelStorageConfig,
     /// Per-component pin / auto-update toggles.
     pub updates: UpdatePolicy,
     /// App self-update preferences (Settings → Updates & diagnostics):
@@ -310,6 +318,7 @@ impl AppConfig {
             supervision: SupervisionConfig::default(),
             admin_api: AdminApiConfig::default(),
             log_streaming: LogStreamingConfig::default(),
+            model_storage: ModelStorageConfig::default(),
             updates: UpdatePolicy {
                 components: HashMap::from([(
                     LITELLM_COMPONENT.to_string(),
@@ -332,6 +341,15 @@ impl AppConfig {
             // curated entries (see the field's documentation).
             mcp_curated_seeded: true,
         }
+    }
+}
+
+impl AppConfig {
+    /// Resolve a model's logical path against the storage tiers (see
+    /// [`resolve_model_path`]): the file every filesystem access to a
+    /// model must use.
+    pub fn resolve_model(&self, logical: &std::path::Path) -> ResolvedModel {
+        resolve_model_path(&self.data_dir, &self.model_storage, logical)
     }
 }
 
