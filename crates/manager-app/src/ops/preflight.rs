@@ -90,7 +90,10 @@ pub(crate) async fn backend_start_preflight_for(
         // DownloadModels step verifies the hash in-step but never
         // stamps verified_at, so their first start asks for a
         // Models > Verify pass — the remediation in the message.
-        if is_real_pin(&m.sha256) && m.verified_at.is_none() && resolved_model.exists() {
+        if is_real_pin(&m.sha256)
+            && m.verified_at.is_none()
+            && cfg.resolve_model(&m.gguf_path).path.exists()
+        {
             return Err(ApiError::InvalidInput(format!(
                 "model {} has not passed SHA-256 verification — open Models and run Verify.",
                 m.id
@@ -130,12 +133,23 @@ pub(crate) async fn backend_start_preflight_for(
             spec.program.display()
         )));
     }
-    let model_path = if b.model_file.is_absolute() {
-        b.model_file.clone()
-    } else {
-        cfg.data_dir.join(&b.model_file)
-    };
+    let resolved = cfg.resolve_model(&b.model_file);
+    let model_path = resolved.path.clone();
     if !model_path.exists() {
+        if resolved.cold_unavailable {
+            let missing: Vec<String> = cfg
+                .model_storage
+                .cold_tiers
+                .iter()
+                .filter(|c| !c.path.is_dir())
+                .map(|c| c.path.display().to_string())
+                .collect();
+            return Err(ApiError::InvalidInput(format!(
+                "model file {} is not in the hot tier, and cold tier {} is not available — reconnect the drive",
+                b.model_file.display(),
+                missing.join(", ")
+            )));
+        }
         return Err(ApiError::InvalidInput(format!(
             "model file is missing ({}) — download it in the Models view",
             model_path.display()

@@ -262,6 +262,7 @@ pub(super) async fn run_arm(
             .find(|s| s.id == temp_id)
             .and_then(|s| s.pid)
     };
+    crate::model_storage::note_process_start(state, &temp_id).await;
     if let Some(pid) = pid {
         let mut journal = load_journal(state);
         journal.set_active_pid(&temp_id, pid);

@@ -231,7 +231,7 @@ impl ConfigureTensorSplit {
     pub(crate) async fn model_bytes(&self, ctx: &WizardContext, backend: &BackendConfig) -> u64 {
         match self.model_for(ctx, backend) {
             Some(m) => {
-                let path = resolve_dest(&ctx.data_dir, &m.gguf_path);
+                let path = locate_model(ctx, &m.gguf_path).await.dest().to_path_buf();
                 match ctx.ops.file_len(&path).await {
                     Some(len) => len,
                     None => estimate_model_bytes(m.params_b as f64),

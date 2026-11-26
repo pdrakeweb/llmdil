@@ -66,6 +66,15 @@ dest_dir)` — writes `diagnostics-<ms>.zip` (config.json, logs/\<scope\>.log,
 telemetry.json, versions.txt); scope names sanitized against path traversal.
 Takes plain data so this crate does not depend on supervisor/telemetry.
 
+**`storage` module (docs/tiered-model-storage.md):** `ModelStorageConfig`
+(`AppConfig.model_storage`, serde-default: no cold tiers = pre-feature
+behavior), `Tier`, and the resolver `resolve_model_path(data_dir,
+storage, logical) -> ResolvedModel` (hot first, then each cold tier; a
+model's logical path `models\X.gguf` never changes when its file moves);
+`AppConfig::resolve_model` is the shorthand every model-file access uses.
+Load-time validation is structural only (a missing cold drive never stops
+the app loading).
+
 ---
 
 ## manager-mcp — spec §8
@@ -282,6 +291,17 @@ e.g. Qwen3-Coder-Next-80B on compute capability (6,0) is endpoints-only
 
 ---
 
+**`tier` module (docs/tiered-model-storage.md):** the crash-safe
+verified tier copy (`copy_verified`: `.partial` + source-stream hash +
+read-back hash against the pin or the source, atomic rename, Windows
+background I/O mode, throttle, pause/cancel via `CopyControl`),
+`sweep_partials`, the `model-storage.json` state file (`StorageState`:
+start history, cold archive records, move history), volume queries
+(`free_bytes`, `total_bytes`, `same_volume`), and the pure
+promotion/demotion policy `plan(PlanInputs) -> (moves, skipped)`.
+
+---
+
 ## manager-mxc — spec §11
 
 MXC sandbox policy: default-deny, tool execution only (inference stays on
@@ -383,6 +403,10 @@ explicit newer pin). `registry` holds the single operation
 declaration (`for_each_operation!`) from which the `Op` enum,
 `OP_SPECS`, `dispatch()`, the Tauri command adapters, and the REST
 router are all generated — see `docs/admin-api/PLAN.md` §3.1.
+`model_storage` orchestrates tiered model storage: inventory, pins,
+in-use detection, the single background mover and its reconcile loop
+(`startup` / `tick`, run by the shell), and the `model_storage_*` /
+`model_set_keep_hot` operations.
 Events leave through the `EventSink` trait (Tauri sink in the
 shell, broadcast sink in manager-api).
 

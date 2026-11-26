@@ -592,8 +592,8 @@ async fn run_arm(
     let model_id = inputs.model_id.clone();
     let model = cfg.models.iter().find(|m| m.id == model_id);
     let gguf_abs = model
-        .map(|m| crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path))
-        .unwrap_or_else(|| crate::resolve_under_data_dir(&cfg.data_dir, &backend.model_file));
+        .map(|m| cfg.resolve_model(&m.gguf_path).path)
+        .unwrap_or_else(|| cfg.resolve_model(&backend.model_file).path);
     let used_ports = crate::optimize_experiments::occupied_ports(cfg);
     let port = lowest_free_port(&used_ports, cfg.gateway.port, cfg.postgres.port);
     let temp = tuning_temp_backend_mapped(
@@ -657,6 +657,7 @@ async fn run_arm(
             let _ = journal.save(&state.data_dir.join("optimize-experiments.json"));
         }
     }
+    crate::model_storage::note_process_start(state, &temp_id).await;
     if let Err(e) = crate::optimize_experiments::wait_healthy(state, &temp_id, port).await {
         arm.detail = Some(e);
         return fail(&arm);

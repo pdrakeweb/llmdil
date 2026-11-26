@@ -99,8 +99,8 @@ pub(crate) fn fingerprint_inputs(
 ) -> MeasurementFingerprintInputs {
     let model = crate::model_for_backend(cfg, b);
     let file_size_bytes = model
-        .map(|m| crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path))
-        .or_else(|| Some(crate::resolve_under_data_dir(&cfg.data_dir, &b.model_file)))
+        .map(|m| cfg.resolve_model(&m.gguf_path).path)
+        .or_else(|| Some(cfg.resolve_model(&b.model_file).path))
         .and_then(|p| std::fs::metadata(p).ok())
         .filter(|m| m.is_file())
         .map(|m| m.len());
@@ -286,7 +286,7 @@ pub(crate) async fn gather(state: &AppState, cfg: &AppConfig) -> Gathered {
         );
     }
     for m in &cfg.models {
-        let path = crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path);
+        let path = cfg.resolve_model(&m.gguf_path).path;
         if let Ok(meta) = std::fs::metadata(&path) {
             if meta.is_file() {
                 measure.downloaded_models.insert(m.id.clone());

@@ -72,6 +72,7 @@ pub mod log_receiver;
 pub mod logging;
 pub mod logship;
 mod mcp_local;
+pub mod model_storage;
 pub mod notify;
 pub mod openrouter_spend;
 pub mod optimize;
@@ -97,6 +98,10 @@ pub use hf_forms::{op_model_hf_header, op_model_hf_lookup};
 pub use log_receiver::{
     op_log_receiver_deploy, op_log_receiver_flip_endpoint, op_log_receiver_remove,
     op_log_receiver_restart, op_log_receiver_start, op_log_receiver_status, op_log_receiver_stop,
+};
+pub use model_storage::{
+    op_model_set_keep_hot, op_model_storage_cancel, op_model_storage_demote,
+    op_model_storage_promote, op_model_storage_set, op_model_storage_status,
 };
 pub use optimize::{
     consult_replace_refusal, op_measurement_delete, op_measurement_lookup,

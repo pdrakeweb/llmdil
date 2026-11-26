@@ -426,7 +426,7 @@ fn offload_slider_converts_moe_layers_to_block_bounds() {
     // at the same bound when the file is present ...
     let model = cfg.models.last().unwrap().clone();
     assert_eq!(
-        model_default_raw_flags_at(&cfg.data_dir, &model).as_deref(),
+        model_default_raw_flags_at(&cfg, &model).as_deref(),
         Some("--n-cpu-moe 4")
     );
     // ... and as-is without a parsed layout (no file).

@@ -519,7 +519,7 @@ async fn run_experiment_inner(
         .iter()
         .map(|m| RegisteredModelFile {
             id: m.id.clone(),
-            path: crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path),
+            path: cfg.resolve_model(&m.gguf_path).path,
         })
         .collect();
     let catalog_ids: Vec<String> = manager_models::curated_models()
@@ -807,6 +807,7 @@ async fn run_experiment_inner(
             save_journal(state, &journal);
         }
     }
+    crate::model_storage::note_process_start(state, &temp_id).await;
 
     // -- Wait healthy on the existing probe.
     if let Err(e) = wait_healthy(state, &temp_id, port).await {

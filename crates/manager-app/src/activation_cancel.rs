@@ -100,6 +100,8 @@ pub const COMPARED_FIELDS: &[&str] = &[
     "app_update",
     "notifications",
     "optimize_purpose",
+    // Tiered model storage tiers and policy (docs/tiered-model-storage.md).
+    "model_storage",
 ];
 
 /// A configuration in its canonical JSON form: parsed into

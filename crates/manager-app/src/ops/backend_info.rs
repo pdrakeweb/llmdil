@@ -205,7 +205,7 @@ pub(crate) fn resolve_weight_layout(
     b: &manager_config::BackendConfig,
 ) -> Option<WeightLayout> {
     let model = model_for_backend(cfg, b)?;
-    let path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+    let path = cfg.resolve_model(&model.gguf_path).path;
     let layout = gguf_layout_cached(&path);
     let catalog = manager_models::curated_models()
         .into_iter()

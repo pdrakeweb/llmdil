@@ -245,11 +245,9 @@ pub(crate) fn backend_spec(
     } else {
         "llama-server"
     });
-    let model = if b.model_file.is_absolute() {
-        b.model_file.clone()
-    } else {
-        cfg.data_dir.join(&b.model_file)
-    };
+    // Wherever the file is right now — hot first, then a cold tier
+    // (docs/tiered-model-storage.md). A start never waits on a copy.
+    let model = cfg.resolve_model(&b.model_file).path;
     let mut args: Vec<String> = vec![
         "-m".into(),
         model.to_string_lossy().into_owned(),

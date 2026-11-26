@@ -557,8 +557,8 @@ pub async fn op_bench_run_start(
     let model_entry = crate::model_for_backend(&cfg, &target).cloned();
     let model_abs = model_entry
         .as_ref()
-        .map(|m| crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path))
-        .unwrap_or_else(|| crate::resolve_under_data_dir(&cfg.data_dir, &target.model_file));
+        .map(|m| cfg.resolve_model(&m.gguf_path).path)
+        .unwrap_or_else(|| cfg.resolve_model(&target.model_file).path);
     let (model_ctx_len, target_vocab) = gguf_header_facts(&model_abs);
     let draft_model_id = arms
         .iter()
@@ -569,7 +569,8 @@ pub async fn op_bench_run_start(
             let entry = cfg.models.iter().find(|m| &m.id == id).ok_or_else(|| {
                 ApiError::InvalidInput(format!("draft model '{id}' is not a registered model"))
             })?;
-            let abs = crate::resolve_under_data_dir(&cfg.data_dir, &entry.gguf_path);
+            // The draft wherever it lives now (hot or cold tier).
+            let abs = cfg.resolve_model(&entry.gguf_path).path;
             let (_, vocab) = gguf_header_facts(&abs);
             (Some(abs.to_string_lossy().into_owned()), vocab)
         }

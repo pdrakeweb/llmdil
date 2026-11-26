@@ -45,7 +45,8 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
         .models
         .iter()
         .map(|m| {
-            let path = resolve_under_data_dir(&cfg.data_dir, &m.gguf_path);
+            // The file wherever it lives (hot or a cold tier).
+            let path = cfg.resolve_model(&m.gguf_path).path;
             let meta = std::fs::metadata(&path).ok().filter(|md| md.is_file());
             // The downloaded file's own parsed geometry, for
             // the declaration editor's post-download
@@ -64,7 +65,9 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
                 catalog_moe_layers,
                 file_layout.as_ref().and_then(|l| l.moe_block_count),
             );
-            let partial_meta = std::fs::metadata(manager_models::partial_path(&path))
+            let partial_meta = std::fs::metadata(manager_models::partial_path(
+                &crate::model_storage::download_destination(&cfg, &m.gguf_path),
+            ))
                 .ok()
                 .filter(|md| md.is_file());
             let is_verifying = verifying.contains(&m.id);
@@ -103,6 +106,10 @@ pub async fn op_list_models(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -
                 "on_disk": meta.is_some(),
                 "size_bytes": meta.map(|md| md.len()),
                 "partial_bytes": partial_meta.map(|md| md.len()),
+                // Tier residency, pins and any move in flight
+                // (docs/tiered-model-storage.md); null for a path
+                // outside the tiered models directory.
+                "storage": crate::model_storage::model_row_storage(state, &cfg, m),
                 "downloading": downloads.contains_key(&m.id) || is_verifying,
                 "verifying": is_verifying,
                 "paused": downloads.get(&m.id).map(|h| h.is_paused()).unwrap_or(false),
@@ -199,7 +206,7 @@ pub async fn op_download_model(
     id: String,
 ) -> ApiResult {
     ensure_catalog_models(state).await;
-    let (spec, dest) = {
+    let (spec, dest, logical) = {
         let cfg = state.config.read().await;
         let spec = download_spec_for(&cfg, &id)?;
         // Download to the model's configured gguf_path (resolved under
@@ -210,8 +217,15 @@ pub async fn op_download_model(
             .iter()
             .find(|m| m.id == id)
             .ok_or_else(|| ApiError::NotFound(format!("model {id}")))?;
-        let dest = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
-        (spec, dest)
+        // Wherever a copy already is, else the configured download
+        // tier (docs/tiered-model-storage.md).
+        if crate::model_storage::move_pending_for(state, &model.gguf_path) {
+            return Err(ApiError::Busy(format!(
+                "a storage move is running or queued for model {id}"
+            )));
+        }
+        let dest = crate::model_storage::download_destination(&cfg, &model.gguf_path);
+        (spec, dest, model.gguf_path.clone())
     };
     // Hold the downloads lock across the check, the in-use guard, and
     // the insert: two concurrent invokes for the same model must not
@@ -239,8 +253,11 @@ pub async fn op_download_model(
             .map(|st| st.id)
             .collect();
         for b in &cfg.backends {
+            // Identity by logical path: a running backend serving this
+            // model holds one of its tier copies open.
             if running.contains(&b.id)
-                && resolve_under_data_dir(&cfg.data_dir, &b.model_file) == dest
+                && resolve_under_data_dir(&cfg.data_dir, &b.model_file)
+                    == resolve_under_data_dir(&cfg.data_dir, &logical)
             {
                 return Err(ApiError::InvalidInput(format!(
                     "model {id} is loaded by running backend {}; stop it before re-downloading",
@@ -602,10 +619,7 @@ pub async fn op_model_verify_checksum(
         if !is_real_pin(&m.sha256) {
             return Err(no_pin_error(&id));
         }
-        (
-            resolve_under_data_dir(&cfg.data_dir, &m.gguf_path),
-            m.sha256.clone(),
-        )
+        (cfg.resolve_model(&m.gguf_path).path, m.sha256.clone())
     };
     // Track the manual verify in the same set the download watcher
     // uses: list_models then reports the model as verifying (the
@@ -743,9 +757,30 @@ pub async fn op_model_delete(
     // Delete the file first: on failure the config entry is kept. The
     // file path is the model's gguf_path resolved under the data dir —
     // the same path download_model wrote and list_models probes.
-    let file_path = resolve_under_data_dir(&cfg.data_dir, &model.gguf_path);
+    if crate::model_storage::move_pending_for(state, &model.gguf_path) {
+        return Err(ApiError::Busy(format!(
+            "a storage move is running or queued for model {id}; cancel it before deleting"
+        )));
+    }
+    // Every tier's copy goes (the cold archive included): the
+    // resolved copy through the guarded delete, the rest after it.
+    let resolved = cfg.resolve_model(&model.gguf_path);
+    let file_path = resolved.path.clone();
     let report = manager_models::delete_model_file(&model, &cfg.backends, &file_path)
         .map_err(ApiError::from)?;
+    let mut other_bytes = 0u64;
+    if let Some(rel) = manager_config::tier_relative(&model.gguf_path) {
+        for t in manager_config::all_tiers(&cfg.model_storage) {
+            if let Some(p) = manager_config::tier_file(&cfg.data_dir, &cfg.model_storage, t, &rel) {
+                if p != file_path {
+                    other_bytes += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    let _ = std::fs::remove_file(&p);
+                }
+                let _ = std::fs::remove_file(manager_models::partial_path(&p));
+                let _ = std::fs::remove_file(manager_config::tier_partial_path(&p));
+            }
+        }
+    }
     cfg.models.remove(pos);
     // Persist the removal — without the save, the deleted model
     // reappears in the config (and the Models view) on the next launch.
@@ -757,7 +792,7 @@ pub async fn op_model_delete(
         "deleted": true,
         "path": report.path,
         "file_existed": report.file_existed,
-        "bytes_freed": report.bytes_freed,
+        "bytes_freed": report.bytes_freed + other_bytes,
     }))
 }
 
@@ -965,7 +1000,7 @@ pub async fn op_model_assign(
     // The model's default offload flags (catalog pin, or the
     // operator's declared default on the model record), resolved
     // before the mutable backend borrow below.
-    let default_flags = model_default_raw_flags_at(&cfg.data_dir, model);
+    let default_flags = model_default_raw_flags_at(&cfg, model);
     let took_default;
     let flags_untouched = {
         let backend = cfg

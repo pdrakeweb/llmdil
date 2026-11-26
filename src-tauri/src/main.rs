@@ -280,6 +280,27 @@ fn main() {
                 let state = handle.state::<Arc<AppState>>().inner().clone();
                 manager_app::bench::startup_sweep(&state).await;
             });
+            // Tiered model storage (docs/tiered-model-storage.md):
+            // crash recovery (interrupted moves, leftover .partial
+            // copies), then the reconcile loop that runs at most one
+            // background-priority copy at a time, parked while any
+            // backend is loading.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<Arc<AppState>>().inner().clone();
+                // Not dispatched through the registry, so its events
+                // are offered to the log shipper explicitly.
+                let sink: Arc<dyn EventSink> =
+                    manager_app::logship::tap_sink(&state, Arc::new(TauriSink(handle)));
+                manager_app::model_storage::startup(&state).await;
+                loop {
+                    manager_app::model_storage::tick(&state, &sink).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        manager_app::model_storage::TICK_SECS,
+                    ))
+                    .await;
+                }
+            });
             // Lifecycle monitor: first reconcile the registry with
             // what is already running (adopt orphaned backends, seed
             // intent, write "observed running at app start" markers),

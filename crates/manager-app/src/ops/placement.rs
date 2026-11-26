@@ -159,7 +159,7 @@ pub async fn op_placement_propose(
                         "model {model_id} is neither a catalog entry nor a configured model"
                     ))
                 })?;
-            let path = resolve_under_data_dir(&cfg.data_dir, &m.gguf_path);
+            let path = cfg.resolve_model(&m.gguf_path).path;
             let size_bytes = match std::fs::metadata(&path) {
                 Ok(md) if md.is_file() => md.len(),
                 _ if m.params_b > 0.0 => (m.params_b as f64 * 1e9 * 4.92 / 8.0 * 1.05) as u64,

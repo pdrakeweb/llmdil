@@ -536,7 +536,7 @@ pub(super) async fn resolve_lookup_backend(
             tensor_split,
             split_mode,
         },
-        raw_flags: crate::model_default_raw_flags_at(&cfg.data_dir, model),
+        raw_flags: crate::model_default_raw_flags_at(cfg, model),
         flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,

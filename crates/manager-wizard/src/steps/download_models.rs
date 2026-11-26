@@ -99,7 +99,17 @@ impl DownloadModels {
             }
         }
         for model in &targets {
-            let dest = resolve_dest(&ctx.data_dir, &model.gguf_path);
+            // Tier-aware: a model on a cold tier is present, not missing.
+            let loc = locate_model(ctx, &model.gguf_path).await;
+            let dest = loc.dest().to_path_buf();
+            if loc.found.is_none() && loc.cold_unavailable {
+                log.push(format!(
+                    "{}: not in the hot tier and a cold tier is unavailable; not downloading (reconnect the drive)",
+                    model.id
+                ));
+                unverified += 1;
+                continue;
+            }
             if model.source_url.is_empty() {
                 return Ok(StepOutcome::failed(
                     format!("no source URL configured for model '{}'", model.id),
@@ -446,7 +456,11 @@ impl DownloadModels {
             if !model.enabled || model.source_url.is_empty() {
                 continue; // disabled models are out of scope; the per-model loop reports a missing URL
             }
-            let dest = resolve_dest(&ctx.data_dir, &model.gguf_path);
+            let loc = locate_model(ctx, &model.gguf_path).await;
+            if loc.found.is_none() && loc.cold_unavailable {
+                continue; // may be on the unreachable cold tier; never re-downloaded
+            }
+            let dest = loc.dest().to_path_buf();
             let needs_download = if ctx.ops.file_exists(&dest).await {
                 // An unpinned model already on disk cannot be verified,
                 // so it counts as present — same rule as the run loop.

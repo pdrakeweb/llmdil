@@ -207,6 +207,7 @@ async fn spawn_inner(
                 pid.map(|p| format!(", pid {p}")).unwrap_or_default()
             );
             mark(state, id, "spawned", Some(&detail), origin);
+            crate::model_storage::note_process_start(state, id).await;
             Ok((detail, pid))
         }
         Route::Process => {
@@ -233,6 +234,7 @@ async fn spawn_inner(
                         None => "pid unknown".to_string(),
                     };
                     mark(state, id, "spawned", Some(&detail), origin);
+                    crate::model_storage::note_process_start(state, id).await;
                     Ok((detail, pid))
                 }
                 Err(e) => {

@@ -77,6 +77,59 @@ fn resolve_dest(data_dir: &Path, p: &Path) -> PathBuf {
     }
 }
 
+/// Where a model file is across the storage tiers
+/// (docs/tiered-model-storage.md), probed through `SystemOps` so the
+/// steps stay hermetic under test.
+pub(crate) struct ModelLocation {
+    /// The first tier copy found (hot first), if any.
+    pub(crate) found: Option<PathBuf>,
+    /// The hot-tier path: the download destination for a missing file.
+    pub(crate) hot: PathBuf,
+    /// A configured cold tier's root is unreachable, so a missing file
+    /// may be on it: never re-download in that case.
+    pub(crate) cold_unavailable: bool,
+}
+
+impl ModelLocation {
+    /// The path to verify or download to.
+    pub(crate) fn dest(&self) -> &Path {
+        self.found.as_deref().unwrap_or(&self.hot)
+    }
+}
+
+pub(crate) async fn locate_model(ctx: &WizardContext, logical: &Path) -> ModelLocation {
+    let hot = resolve_dest(&ctx.data_dir, logical);
+    if ctx.ops.file_exists(&hot).await {
+        return ModelLocation {
+            found: Some(hot.clone()),
+            hot,
+            cold_unavailable: false,
+        };
+    }
+    let mut cold_unavailable = false;
+    if let Some(rel) = manager_config::tier_relative(logical) {
+        for cold in &ctx.config.model_storage.cold_tiers {
+            if !ctx.ops.file_exists(&cold.path).await {
+                cold_unavailable = true;
+                continue;
+            }
+            let candidate = cold.path.join(&rel);
+            if ctx.ops.file_exists(&candidate).await {
+                return ModelLocation {
+                    found: Some(candidate),
+                    hot,
+                    cold_unavailable: false,
+                };
+            }
+        }
+    }
+    ModelLocation {
+        found: None,
+        hot,
+        cold_unavailable,
+    }
+}
+
 /// Serialize an already-JSON `serde_json::Value` without panicking.
 ///
 /// Serialization of a `Value` is infallible in practice (no user `Serialize`

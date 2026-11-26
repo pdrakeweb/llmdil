@@ -300,6 +300,17 @@ macro_rules! for_each_operation {
             // model_set_short_name, model_set_enabled and
             // model_set_offload_spec (rest-api.md §6.3); no 1:1 route.
             (ModelSetMtp, model_set_mtp, C, op_model_set_mtp, [id: String, mtp: Option<bool>], None),
+            // Tiered model storage (docs/tiered-model-storage.md).
+            // `target` is a model id or a logical path (models\X.gguf),
+            // so unregistered files can be moved too.
+            (ModelStorageStatus, model_storage_status, R, op_model_storage_status, [], Some(route(HttpMethod::Get, "/api/v1/model-storage"))),
+            (ModelStorageSet, model_storage_set, C, op_model_storage_set, [storage: Value], Some(route(HttpMethod::Put, "/api/v1/model-storage"))),
+            (ModelStoragePromote, model_storage_promote, L, op_model_storage_promote, [target: String], Some(route(HttpMethod::Post, "/api/v1/model-storage/promote"))),
+            (ModelStorageDemote, model_storage_demote, L, op_model_storage_demote, [target: String], Some(route(HttpMethod::Post, "/api/v1/model-storage/demote"))),
+            (ModelStorageCancel, model_storage_cancel, L, op_model_storage_cancel, [target: String], Some(route(HttpMethod::Post, "/api/v1/model-storage/cancel"))),
+            // PATCH /models/{id} composite candidate, like the other
+            // model setters; no 1:1 route.
+            (ModelSetKeepHot, model_set_keep_hot, C, op_model_set_keep_hot, [target: String, keep: bool], None),
             // Logs
             (GetLogs, get_logs, R, op_get_logs, [scope: String, level: Option<String>, search: Option<String>, query: Option<String>, since_ms: Option<i64>, until_ms: Option<i64>, order: Option<String>, offset: Option<u64>, limit: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/logs"))),
             // Gateway
@@ -682,7 +693,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 161);
+        assert_eq!(OP_SPECS.len(), 167);
     }
 
     #[test]

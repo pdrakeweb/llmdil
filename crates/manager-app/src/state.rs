@@ -171,6 +171,9 @@ pub struct AppState {
     /// The lifecycle monitor's counters between ticks (see
     /// [`lifecycle_monitor`]). std Mutex: synchronous updates only.
     pub(crate) lifecycle_monitor: std::sync::Mutex<lifecycle_monitor::MonitorState>,
+    /// Tiered model storage runtime: state file, the active move and
+    /// its queue (see [`crate::model_storage`]).
+    pub(crate) model_storage: crate::model_storage::StorageRuntime,
 }
 
 /// One running Estimate/Measure job's descriptor (tracker #69),
@@ -319,6 +322,7 @@ impl AppState {
             scm_cache: std::sync::Mutex::new(None),
             lifecycle_monitor: std::sync::Mutex::new(lifecycle_monitor::MonitorState::default()),
             activation: ActivationState::default(),
+            model_storage: crate::model_storage::StorageRuntime::default(),
         }
     }
 

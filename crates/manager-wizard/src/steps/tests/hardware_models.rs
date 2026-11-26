@@ -1123,3 +1123,59 @@ async fn download_models_audit_hashes_when_length_differs_or_stamp_missing() {
 }
 
 // --- StartGateway ---
+
+// --- DownloadModels: tiered model storage ---
+
+/// An install ctx whose only enabled model is qwen3-8b, with a cold
+/// tier at /cold (reachable when `cold_reachable`).
+fn install_ctx_with_cold_tier(ops: &Arc<FakeSystemOps>, cold_reachable: bool) -> WizardContext {
+    let mut config = test_config_with_models();
+    config.models[1].enabled = false;
+    config.model_storage.cold_tiers = vec![manager_config::ColdTier {
+        path: PathBuf::from("/cold"),
+        label: String::new(),
+    }];
+    if cold_reachable {
+        ops.with_file(PathBuf::from("/cold"), Vec::new());
+    }
+    WizardContext::new(
+        config,
+        PathBuf::from("/data"),
+        RunMode::Install,
+        ops.clone(),
+    )
+}
+
+#[tokio::test]
+async fn download_models_finds_a_cold_copy_instead_of_re_downloading() {
+    let ops = Arc::new(FakeSystemOps::new());
+    let ctx = install_ctx_with_cold_tier(&ops, true);
+    let rel = manager_config::tier_relative(&ctx.config.models[0].gguf_path).unwrap();
+    let cold_copy = PathBuf::from("/cold").join(rel);
+    ops.with_file(cold_copy.clone(), b"bytes".to_vec());
+    let _ = DownloadModels.run(&ctx).await.unwrap();
+    assert!(
+        ops.downloads_made().iter().all(|(_, dest)| dest
+            != &resolve_dest(&PathBuf::from("/data"), &ctx.config.models[0].gguf_path)),
+        "a model present on the cold tier must not be re-downloaded to hot: {:?}",
+        ops.downloads_made()
+    );
+}
+
+#[tokio::test]
+async fn download_models_never_re_downloads_while_the_cold_tier_is_unreachable() {
+    let ops = Arc::new(FakeSystemOps::new());
+    let ctx = install_ctx_with_cold_tier(&ops, false);
+    let out = DownloadModels.run(&ctx).await.unwrap();
+    assert!(
+        ops.downloads_made().is_empty(),
+        "{:?}",
+        ops.downloads_made()
+    );
+    assert!(
+        out.log_tail
+            .iter()
+            .any(|l| l.contains("cold tier is unavailable")),
+        "{out:?}"
+    );
+}

@@ -316,7 +316,7 @@ pub(crate) async fn propose_new_backend_split(
             .find(|m| resolve_under_data_dir(&snap.data_dir, &m.gguf_path) == target);
         match model {
             Some(m) => {
-                let path = resolve_under_data_dir(&snap.data_dir, &m.gguf_path);
+                let path = snap.resolve_model(&m.gguf_path).path;
                 match std::fs::metadata(&path) {
                     Ok(md) if md.is_file() => md.len(),
                     _ => manager_wizard::steps::estimate_model_bytes(m.params_b as f64),
@@ -745,7 +745,7 @@ pub async fn op_backend_add(
         // backend created for Nemotron starts at --n-cpu-moe 16
         // rather than with no offload at all. A position chosen
         // in the add form replaces it below.
-        raw_flags: model_default_raw_flags_at(&cfg.data_dir, &model),
+        raw_flags: model_default_raw_flags_at(&cfg, &model),
         // A created backend starts in structured flags mode; the
         // operator opts into advanced mode per backend afterward.
         flags_advanced: false,
@@ -890,7 +890,7 @@ pub async fn op_backend_add_preview(
             tensor_split: tensor_split.clone(),
             split_mode,
         },
-        raw_flags: model_default_raw_flags_at(&cfg.data_dir, &model),
+        raw_flags: model_default_raw_flags_at(&cfg, &model),
         flags_advanced: false,
         restart_policy: manager_config::RestartPolicy {
             max_retries: 5,
@@ -1121,10 +1121,10 @@ pub(crate) fn catalog_default_raw_flags_mapped(
 /// The MoE block map of `model`'s GGUF, when the file is present
 /// and its header parses with an expert tensor index.
 pub(crate) fn model_moe_block_map(
-    data_dir: &std::path::Path,
+    cfg: &AppConfig,
     model: &manager_config::ModelConfig,
 ) -> Option<manager_models::MoeBlockMap> {
-    let path = resolve_under_data_dir(data_dir, &model.gguf_path);
+    let path = cfg.resolve_model(&model.gguf_path).path;
     let layout = gguf_layout_cached(&path)?;
     manager_models::MoeBlockMap::from_tensors(&layout.expert_tensors)
 }
@@ -1134,10 +1134,10 @@ pub(crate) fn model_moe_block_map(
 /// at their block-index bound (see
 /// [`catalog_default_raw_flags_mapped`]).
 pub(crate) fn model_default_raw_flags_at(
-    data_dir: &std::path::Path,
+    cfg: &AppConfig,
     model: &manager_config::ModelConfig,
 ) -> Option<String> {
-    model_default_raw_flags_mapped(model, model_moe_block_map(data_dir, model).as_ref())
+    model_default_raw_flags_mapped(model, model_moe_block_map(cfg, model).as_ref())
 }
 
 /// The raw flags a backend serving `model` starts with, resolved
