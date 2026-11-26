@@ -47,6 +47,9 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 const MAX_SAMPLES: usize = 3600;
 /// Poll period of the step loop.
 const TICK: Duration = Duration::from_millis(100);
+/// How long a restore waits for a just-ended step's VRAM to show as
+/// free before giving up on restarting a backend.
+const RESTORE_VRAM_WAIT: Duration = Duration::from_secs(60);
 /// Leaf value the plan puts where the synthetic prompt goes.
 pub(crate) const SYNTHETIC_SENTINEL: &str = "\u{1}synthetic_prompt\u{1}";
 
@@ -700,13 +703,38 @@ async fn execute(
                 Some(Origin::Console),
             );
             out.console(None, format!("[console] restarting backend {id}…"));
-            let r = backend_lifecycle::start_backend(
-                &state,
-                &sink,
-                id,
-                BackendOpOpts::new(Origin::Console),
-            )
-            .await;
+            // The start gate judges free VRAM from the telemetry
+            // snapshot, which can still show a just-ended step's
+            // allocation (the driver frees it and the sampler sees it a
+            // few seconds after the exit). Wait that out rather than
+            // leave the backend down.
+            let deadline = Instant::now() + RESTORE_VRAM_WAIT;
+            let mut said = false;
+            let r = loop {
+                let r = backend_lifecycle::start_backend(
+                    &state,
+                    &sink,
+                    id,
+                    BackendOpOpts::new(Origin::Console),
+                )
+                .await;
+                match &r {
+                    Err(e)
+                        if e.to_string().contains("insufficient free memory")
+                            && Instant::now() < deadline =>
+                    {
+                        if !said {
+                            out.console(
+                                None,
+                                format!("[console] waiting for GPU memory to free before restarting {id}…"),
+                            );
+                            said = true;
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    _ => break r,
+                }
+            };
             match &r {
                 Ok(_) => out.console(None, format!("[console] backend {id} start requested (readiness is watched in the background)")),
                 Err(e) => out.console(None, format!("[console] restarting backend {id} FAILED: {e} — start it manually")),
@@ -830,8 +858,12 @@ fn finish_step(
     });
     if stopped_by_runner && !cancelled {
         // The runner ended a background server at the end of the
-        // recipe: that kill is not the server's failure.
+        // recipe: that kill is not the server's failure, and its exit
+        // code (1 from TerminateProcess) means nothing about it.
         analysis.verdict = Verdict::Ok;
+        if let Some(e) = analysis.exit.as_mut() {
+            e.meaning = "stopped by the runner after the last step (not a crash)".into();
+        }
     }
     let verdict = analysis.verdict;
     let line = format!(
