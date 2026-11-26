@@ -1439,13 +1439,35 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
+            return false;
+        }
+        // A zombie (exited, not yet reaped by its parent) still answers
+        // kill(pid, 0) but holds no port, memory or GPU context: it is
+        // gone for every purpose here. Without this an adopted process
+        // that happens to be our own child never reads as stopped.
+        !is_zombie(pid)
     }
     #[cfg(not(any(windows, unix)))]
     {
         let _ = pid;
         false
     }
+}
+
+/// Linux: whether `/proc/<pid>/stat` reports state `Z`. Elsewhere
+/// (no procfs): false, the previous behavior.
+#[cfg(unix)]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            // The state follows the parenthesized command name, which
+            // may itself contain spaces or parentheses.
+            s.rfind(')')
+                .and_then(|i| s[i + 1..].split_whitespace().next().map(|t| t == "Z"))
+        })
+        .unwrap_or(false)
 }
 
 /// Kill a process and (on Windows) its whole tree; best effort —
