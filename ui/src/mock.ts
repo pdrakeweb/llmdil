@@ -171,6 +171,11 @@ export function mockDashboard(): DashboardModel {
     gatewayUp: true,
     gatewayState: "running",
     gatewayStrategy: "least-busy",
+    groups: [
+      { name: "planner", members: ["planner"], strategy: "least-busy", fallbacks: ["coder"], purpose: "", enabled: true, enabled_members: 1 },
+      { name: "coder", members: ["coder-30b", "coder-7b"], strategy: "least-busy", fallbacks: [], purpose: "", enabled: true, enabled_members: 2 },
+      { name: "tool-runner", members: ["tool-runner"], strategy: "simple-shuffle", fallbacks: [], purpose: "", enabled: true, enabled_members: 1 },
+    ],
     stale: false,
     updatedAt: Date.now(),
   };

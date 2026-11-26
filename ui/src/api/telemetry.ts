@@ -412,6 +412,7 @@ export async function getDashboard(prefetched?: {
     gateway, backends, gpus: g.data.gpus, placement: placementFromConfig(cfg.data, g.data.gpus, backends),
     gatewayUp: !gw.error && gw.data.up,
     gatewayStrategy: gwCfg.data ? gwCfg.data.effective_strategy : null,
+    groups: gwCfg.data ? gwCfg.data.groups : null,
     gatewayState: gw.error ? null : gw.data.state,
     gatewayError: gw.error,
     openrouterSpend: gw.error ? null : gw.data.openrouter_spend ?? null,

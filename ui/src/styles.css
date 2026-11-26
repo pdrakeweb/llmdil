@@ -560,6 +560,9 @@ table.tbl tr:last-child td, table.dtab tr:last-child td, table.opt-table tr:last
 .map-dim { opacity: 0.45; }
 .map-edge.configured { stroke: #3a4350; stroke-dasharray: 2 4; }
 .map-edge-label { fill: #6d7686; font-size: 10px; font-family: var(--mono); }
+/* Topology: a model group is a container of its models. */
+.topo-group-box { fill: rgba(74, 158, 255, 0.04); stroke: #4a9eff; stroke-opacity: 0.45; }
+.topo-group.loose .topo-group-box { fill: none; stroke: #3a4350; stroke-opacity: 1; stroke-dasharray: 6 4; }
 .map-col-label { fill: #6d7686; font-size: 10px; letter-spacing: 0.08em; }
 
 /* A page's own status line: its room is reserved, so a message never

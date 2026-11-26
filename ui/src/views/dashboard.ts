@@ -1,7 +1,7 @@
 /* Dashboard view — fully functional.
    - Appliance: service cards, GPU strip, model placement, throughput chart.
    - Console: dense tables with sparklines/bars.
-   - Topology: mini cluster node map (SVG).
+   - Topology: gateway -> groups holding their models -> GPUs (SVG).
    Lifecycle state comes from the shared service store (lifecycle.ts):
    every store refresh repaints the cards with the effective state (a
    restart from any surface reads "restarting…"), and getDashboard() —
@@ -15,14 +15,15 @@
 import { getDashboard, getModels, openRouterSpendBannerHtml, systemVerdict } from "../api";
 import type { ModelRow, SystemVerdict } from "../api";
 import {
-  LIFECYCLE_COLORS, META, lifecycleChip, lifecycleColor, lifecycleDot, lifecycleEdge, lifecycleLabel,
+  META, lifecycleChip, lifecycleColor, lifecycleDot,
   renderLifecycleActions, runLifecycle, serviceStore, summarize, toStatus, wireLifecycleActions,
 } from "../lifecycle";
 import type { LifecycleState, ServiceSnapshot } from "../lifecycle";
 import { esc, keepFocus } from "../html";
-import { fitText, fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
+import { fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
 import { icon } from "../icons";
 import { modelDisplayName } from "./common";
+import { topologySvg } from "./topology";
 import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment, Status } from "../types";
 
 type ViewMode = "appliance" | "console" | "topology";
@@ -80,13 +81,8 @@ function gpuDot(s: Status): string {
   return `<span class="dot ${cls}"></span>`;
 }
 
-/** GPU health color for the topology nodes (same palette). */
-function gpuColor2(s: Status): string {
-  return s === "ok" ? LIFECYCLE_COLORS.green : s === "down" ? LIFECYCLE_COLORS.red : s === "idle" ? LIFECYCLE_COLORS.grey : LIFECYCLE_COLORS.amber;
-}
-
 /** A Status that means a live (or coming-up) process: placements and
- *  topology edges are drawn only for these. */
+ *  are drawn as live only for these. */
 function statusLive(s: Status | undefined): boolean {
   return s === "ok" || s === "starting" || s === "restarting" || s === "degraded";
 }
@@ -422,115 +418,14 @@ function consoleView(m: DashboardModel): string {
 }
 
 function topologyView(m: DashboardModel): string {
-  // Mini node map: LiteLLM -> backends -> GPUs -> models (SVG). No
-  // client nodes are drawn — the app has no data about which clients
-  // connect. Honest empty state when the backend reports nothing —
-  // never fake nodes.
+  // Gateway -> groups (containers of their models) -> GPUs. No client
+  // nodes: the app has no data about which clients connect. Honest
+  // empty state when the backend reports nothing — never fake nodes.
   if (!m.backends.length && !m.gpus.length && !m.gateway) {
     return `<div class="card"><div class="empty">No topology to draw — no backends or GPUs reported. Run the setup wizard to install and configure the stack.</div></div>`;
   }
-  const backs = m.backends;
-  const gpus = m.gpus;
-  const models = m.placement;
-  // The canvas grows with the tallest column, so nodes never overlap.
-  const nodeW = 210, nodeH = 52, rowH = 64;
-  const colX = [20, 300, 580, 860];
-  const rows = Math.max(1, backs.length, gpus.length);
-  const W = 1090, H = Math.max(320, 80 + rows * rowH);
-
-  /** Edge class follows the backend's lifecycle state (the shared
-   *  lifecycleEdge rule, as on the Service Map). */
-  const edgeCls = (s: LifecycleState): string => lifecycleEdge(s).cls;
-  /** A backend is linked in the topology only while it is live
-   *  (code-review 5.3): an edge asserts a live connection, and a
-   *  stopped or disabled backend has none. Its NODE still draws —
-   *  the map shows what is configured — but unconnected. */
-  const running = (s: Status | undefined): boolean => statusLive(s);
-
-  const cy = (i: number, n: number) => 44 + (H - 60) * ((i + 0.5) / Math.max(1, n));
-  let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:auto" role="img" aria-label="Cluster topology mini map">`;
-  const edge = (x1: number, y1: number, x2: number, y2: number, label: string, cls = "") => {
-    const mx = (x1 + x2) / 2;
-    svg += `<path class="map-edge ${cls}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
-    if (label) svg += `<text class="map-edge-label" x="${mx}" y="${(y1 + y2) / 2 - 4}" text-anchor="middle">${esc(label)}</text>`;
-  };
-  const node = (x: number, y: number, title: string, sub: string, dot: string) => {
-    svg += `<g><title>${esc(`${title}\n${sub}`)}</title><rect class="map-node" x="${x}" y="${y - nodeH / 2}" width="${nodeW}" height="${nodeH}" rx="8"/>
-      <circle cx="${x + 14}" cy="${y - 8}" r="4" fill="${dot}"/>
-      <text class="map-node-text" x="${x + 26}" y="${y - 2}">${esc(fitText(title, nodeW - 36, 12, 0.6))}</text>
-      <text class="map-node-sub" x="${x + 14}" y="${y + 16}">${esc(fitText(sub, nodeW - 24, 10))}</text></g>`;
-  };
-
-  node(colX[0], H / 2, "LiteLLM",
-    m.gateway
-      ? `:${m.gateway.port}${m.gateway.lifecycle !== "running" ? ` \u00b7 ${lifecycleLabel(m.gateway.lifecycle)}` : m.gatewayStrategy ? ` \u00b7 ${m.gatewayStrategy}` : ""}`
-      : "not reported",
-    m.gateway ? lifecycleColor(m.gateway.lifecycle) : LIFECYCLE_COLORS.grey);
-  backs.forEach((b, i) => {
-    const y = cy(i, backs.length);
-    const sub = b.lifecycle !== "running"
-      ? ` \u00b7 ${lifecycleLabel(b.lifecycle)}`
-      : b.throughput_toks !== undefined ? ` \u00b7 ${trim1(b.throughput_toks)} tok/s` : "";
-    node(colX[1], y, b.name, `:${b.port}${sub}`, lifecycleColor(b.lifecycle));
-    if (running(b.status)) {
-      edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.lifecycle));
-    }
-  });
-  gpus.forEach((g, i) => {
-    node(colX[2], cy(i, gpus.length), g.name, `${trim1(g.util_pct)}% util`, gpuColor2(g.status));
-  });
-  // Backend -> GPU connectivity comes from the configured tensor
-  // splits (the placement rows' segments), exactly like the full
-  // Service Map — never a positional full mesh asserting links the
-  // configuration does not have. A segment that cannot be matched to
-  // a drawn GPU node draws no edge.
-  const backendIdxById = new Map(backs.map((b, i) => [b.id, i] as const));
-  const rowStatus = (p: (typeof models)[number]): Status | undefined =>
-    p.backendStatus ?? (p.backendId ? backs.find((b) => b.id === p.backendId)?.status : undefined);
-  const segGpuIdx = (seg: PlacementSegment): number => {
-    if (seg.gpuIndex !== undefined && gpus[seg.gpuIndex]) return seg.gpuIndex;
-    return gpus.findIndex((g) => g.name === seg.gpu || g.id === seg.gpu);
-  };
-  // Placement edges assert a configured split actually loaded on
-  // the GPUs, so they draw only for rows that are real placements
-  // of live backends (code-review 5.3): a `defaulted` row's single
-  // 100% segment is the no-split fallback, not a configuration; a
-  // disabled backend's placement is eventual; a stopped backend
-  // holds nothing. The Appliance view keeps every row (grayed /
-  // ghosted per those flags) — the Topology filters to what is
-  // actually connected. Model nodes follow the same filter.
-  const linked = (p: (typeof models)[number]): boolean =>
-    !p.defaulted && p.backendEnabled !== false && running(rowStatus(p));
-  for (const p of models) {
-    if (!p.backendId || !linked(p)) continue;
-    const bi = backendIdxById.get(p.backendId);
-    if (bi === undefined) continue;
-    p.segments.forEach((seg) => {
-      const gj = segGpuIdx(seg);
-      if (gj < 0) return;
-      edge(colX[1] + nodeW, cy(bi, backs.length), colX[2], cy(gj, gpus.length), "", edgeCls(backs[bi].lifecycle));
-    });
-  }
-  // Model nodes key to their owning backend's measured state: the dot
-  // is the backend's status color, and the sublabel is the split
-  // summary — configuration alone never asserts a model is "loaded".
-  const linkedModels = models.filter(linked);
-  linkedModels.forEach((p, i) => {
-    const y = cy(i, linkedModels.length);
-    const owner = p.backendId ? backs.find((b) => b.id === p.backendId) : undefined;
-    const sub = p.segments.length ? p.segments.map((s) => `${s.pct}%`).join(" \u00b7 ") : "\u2014";
-    node(colX[3], y, p.model, sub, owner ? lifecycleColor(owner.lifecycle) : LIFECYCLE_COLORS.grey);
-    p.segments.forEach((seg) => {
-      const gj = segGpuIdx(seg);
-      if (gj < 0) return;
-      edge(colX[2] + nodeW, cy(gj, gpus.length), colX[3], y, "");
-    });
-  });
-  svg += `<text class="map-col-label" x="${colX[0]}" y="24">GATEWAY</text>
-    <text class="map-col-label" x="${colX[1]}" y="24">BACKENDS</text>
-    <text class="map-col-label" x="${colX[2]}" y="24">GPUS</text>
-    <text class="map-col-label" x="${colX[3]}" y="24">MODELS</text></svg>`;
-  return `<div class="card"><div class="sec-title">${icon("map")} Topology — same data, node view</div>
+  const svg = topologySvg(m);
+  return `<div class="card"><div class="sec-title">${icon("map")} Topology — groups and the models they route to</div>
     <div class="map-canvas" style="border:0;padding:0">${svg}</div>
     <div class="legend">${lifecycleLegend()}
     <a href="#/map" style="color:var(--accent)">Open full service map \u2192</a></div></div>`;

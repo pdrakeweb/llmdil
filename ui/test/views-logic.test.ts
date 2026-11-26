@@ -6,6 +6,8 @@ import {
 } from "../src/views/bench";
 import { startAllHtml, startAllTargets } from "../src/startAll";
 import { mcpIdError } from "../src/views/mcp";
+import { topologyGroups, topologySvg } from "../src/views/topology";
+import { mockDashboard } from "../src/mock";
 import { diffInputFields, placementShort } from "../src/views/optimize";
 
 function offload(over: Partial<BackendOffload> = {}): BackendOffload {
@@ -201,5 +203,30 @@ describe("Start All Services", () => {
     expect(failed).toContain("&lt;x&gt;");
     expect(failed).toContain("data-start-all-dismiss");
     expect(failed).not.toContain("Services running");
+  });
+});
+
+describe("Topology: groups contain their models", () => {
+  const b = (id: string, lifecycle: "running" | "stopped") =>
+    ({ id, name: id, port: 1, status: lifecycle === "running" ? "ok" : "idle", lifecycle, model: `${id}-model` }) as never;
+  const g = (name: string, members: string[]) =>
+    ({ name, members, strategy: "least-busy", fallbacks: [], purpose: "", enabled: true, enabled_members: members.length });
+  it("lists each group's members, then the backends no group routes to", () => {
+    const out = topologyGroups({ backends: [b("a", "running"), b("b", "stopped"), b("c", "running")], groups: [g("one", ["a", "b"]), g("ext", ["h:9"])] });
+    expect(out.map((x) => x.name)).toEqual(["one", "ext", null]);
+    expect(out[0].rows.map((r) => r.backend?.id)).toEqual(["a", "b"]);
+    expect(out[1].rows[0].backend).toBeUndefined();
+    expect(out[2].rows.map((r) => r.member)).toEqual(["c"]);
+  });
+  it("never invents a grouping when the groups are unknown", () => {
+    const out = topologyGroups({ backends: [b("a", "running")], groups: null });
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBeNull();
+  });
+  it("draws a container per group with its models and the deployed count", () => {
+    const svg = topologySvg(mockDashboard());
+    expect(svg.match(/class="topo-group-box"/g)).toHaveLength(3);
+    expect(svg).toContain("2 of 2 deployed");
+    expect(svg).toContain("Qwen3-Coder-30B");
   });
 });

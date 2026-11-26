@@ -43,7 +43,7 @@ every page while anything that should run is stopped.
 - **Dashboard** — health-at-a-glance: service cards (with gateway
   statistics), GPU strip, model placement and 24h throughput. The toolbar's *View*
   selector switches the same data between Appliance (default), Console
-  (dense tables), and Topology (node map) presentations; the choice
+  (dense tables), and Topology (gateway → groups, each holding its models and whether they are deployed → GPUs) presentations; the choice
   persists per window.
 - **Service Map** — the full cluster topology: clients → gateway → backends
   → GPUs → models, with the MXC sandbox boundary and a live event timeline.
