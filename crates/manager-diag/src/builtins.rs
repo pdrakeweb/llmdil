@@ -53,7 +53,7 @@ fn recipe(
 pub fn builtins() -> Vec<Recipe> {
     let mut bench = Step::exec(
         "llama-bench depth sweep",
-        "{llamacpp_bin}/llama-bench.exe",
+        "{llamacpp_bin}/llama-bench",
         &[
             "-m",
             "{backend.model_path}",
@@ -148,7 +148,7 @@ pub fn builtins() -> Vec<Recipe> {
 
     let mut server = Step::exec(
         "scratch llama-server (backend's exact flags)",
-        "{llamacpp_bin}/llama-server.exe",
+        "{llamacpp_bin}/llama-server",
         &["{backend.server_args}", "--port", "{scratch_port}"],
     );
     server.background = true;
