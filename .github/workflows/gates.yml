@@ -1,0 +1,187 @@
+name: Gates
+
+# The PR / push gate set (T-04). Windows-first: LLMdil is a Windows
+# desktop app, so the authoritative compile + lint + test of the
+# #[cfg(windows)] code and of src-tauri happens on windows-latest.
+# The Linux jobs are the cheap, fast front line (fmt, version drift,
+# UI build + smoke, and tests of the non-Windows cfg paths).
+#
+# Also callable (workflow_call): release.yml runs this whole gate set
+# and only builds the installer when every job here is green.
+#
+# prometheus-gates.yml stays as the manual, self-hosted variant of the
+# Windows job; install-test.yml stays as post-release verification.
+
+on:
+  push:
+    # Branches only: a v* tag push is gated through release.yml's
+    # workflow_call instead, so the gates do not run twice per release.
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per ref; a force-push supersedes the in-flight run. Release
+  # tag runs come in via workflow_call under the Release workflow's name,
+  # so they never share (or cancel) a group with branch runs.
+  group: gates-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-check:
+    name: Version drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Cargo manifests / Cargo.lock / tauri.conf.json / ui/package.json /
+      # package-lock / README must agree; on a tag build the tag must too.
+      - name: Assert versions agree
+        run: node tools/ci-check-version.mjs
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Workspace fmt
+        run: cargo fmt --all -- --check
+      # src-tauri is excluded from the root workspace (own [workspace]).
+      - name: src-tauri fmt
+        run: cargo fmt --all -- --check
+        working-directory: src-tauri
+
+  ui:
+    name: UI build + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: UI install
+        run: npm ci
+        working-directory: ui
+      - name: UI build (tsc + vite)
+        run: npm run build
+        working-directory: ui
+      - name: UI smoke
+        run: npm run smoke
+        working-directory: ui
+      # Unit tests of the UI's pure logic (vitest; ui/test/). The job
+      # name above is kept as-is so required-check names do not change.
+      - name: UI unit tests
+        run: npm test
+        working-directory: ui
+
+  linux:
+    name: Workspace (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace tests
+        run: cargo test --workspace
+      # Lints the non-Windows cfg paths; the windows job lints the rest.
+      - name: Workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  windows:
+    name: Windows (workspace + src-tauri + launch smoke)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri -> target
+
+      # UI first: src-tauri embeds ../ui/dist (custom-protocol is a
+      # default feature), so the UI build must exist before any
+      # src-tauri step (mirrors prometheus-gates.yml).
+      - name: UI install
+        run: npm ci
+        working-directory: ui
+
+      - name: UI build
+        run: npm run build
+        working-directory: ui
+
+      - name: Workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      # tauri.conf.json declares the service host and the log receiver
+      # as externalBin sidecars; src-tauri's build.rs validates the
+      # paths, so stage them with the target-triple suffix Tauri expects.
+      - name: Stage bundled sidecar binaries
+        run: |
+          cargo build -p manager-services --bin llm-service-host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p manager-logreceiver --bin llmdil-log-receiver
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item target/debug/llm-service-host.exe src-tauri/binaries/llm-service-host-x86_64-pc-windows-msvc.exe
+          Copy-Item target/debug/llmdil-log-receiver.exe src-tauri/binaries/llmdil-log-receiver-x86_64-pc-windows-msvc.exe
+
+      # src-tauri is excluded from the root workspace: run inside it.
+      - name: src-tauri clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: src-tauri
+
+      - name: src-tauri tests
+        run: cargo test
+        working-directory: src-tauri
+
+      - name: src-tauri build
+        run: cargo build
+        working-directory: src-tauri
+
+      # Pre-release launch smoke: the freshly built app must start and
+      # stay up. The admin REST API is opt-in (admin_api.enabled = false
+      # by default), so there is no HTTP endpoint to probe on a fresh
+      # profile; liveness is the check, as in release.yml's install test.
+      - name: Launch smoke
+        run: |
+          $exe = "src-tauri/target/debug/local-llm-service-manager.exe"
+          if (-not (Test-Path $exe)) { throw "app exe not built: $exe" }
+          $p = Start-Process -FilePath (Resolve-Path $exe) -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "app exited within 20s with code $($p.ExitCode)" }
+          Write-Host "App stayed alive for 20s (pid $($p.Id))"
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue

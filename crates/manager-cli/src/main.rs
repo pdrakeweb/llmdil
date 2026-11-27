@@ -3,7 +3,8 @@
 //! Secrets rule (hard): no secret is ever a command-line argument.
 //! Tokens arrive via `LLMDIL_API_TOKEN` / `LLMDIL_API_REFRESH_TOKEN`
 //! or `--token-stdin`; passwords via `LLMDIL_API_PASSWORD` or
-//! `--password-stdin`; enrollment codes via `LLMDIL_ENROLL_CODE` or
+//! `--password-stdin` (a new password for `auth password` via
+//! `LLMDIL_API_NEW_PASSWORD` or `--new-password-stdin`); enrollment codes via `LLMDIL_ENROLL_CODE` or
 //! `--code-stdin`; TOTP codes via `LLMDIL_TOTP_CODE` or
 //! `--totp-stdin`. Only one `--*-stdin` flag per invocation: stdin
 //! is read once, first line, newline trimmed. Tokens are held in
@@ -26,6 +27,10 @@ use serde_json::Value;
 const TOKEN_ENV: &str = "LLMDIL_API_TOKEN";
 const REFRESH_ENV: &str = "LLMDIL_API_REFRESH_TOKEN";
 const PASSWORD_ENV: &str = "LLMDIL_API_PASSWORD";
+const NEW_PASSWORD_ENV: &str = "LLMDIL_API_NEW_PASSWORD";
+/// Printed when the server answers PASSWORD_CHANGE_REQUIRED (SEC-03).
+const PASSWORD_CHANGE_HINT: &str =
+    "password change required: run `llmdil-cli auth password` (this account was reset by an admin)";
 const ENROLL_ENV: &str = "LLMDIL_ENROLL_CODE";
 const TOTP_ENV: &str = "LLMDIL_TOTP_CODE";
 /// The lifecycle origin the CLI names on lifecycle operations (it lands
@@ -65,9 +70,7 @@ enum Command {
     /// List backends
     Backends,
     /// Get one backend
-    Backend {
-        id: String,
-    },
+    Backend { id: String },
     /// Start a backend (202 operation, polled to completion)
     BackendStart {
         id: String,
@@ -144,15 +147,11 @@ enum Command {
     /// GPU telemetry
     Gpus,
     /// GPU telemetry history for a range (e.g. 1h, 24h)
-    TelemetryHistory {
-        range: String,
-    },
+    TelemetryHistory { range: String },
     /// List models
     Models,
     /// Get one model
-    Model {
-        id: String,
-    },
+    Model { id: String },
     /// Query logs
     Logs {
         /// Log scope (see logs-scopes)
@@ -173,17 +172,11 @@ enum Command {
     /// List operations
     Ops,
     /// Get one operation
-    Op {
-        id: String,
-    },
+    Op { id: String },
     /// Poll one operation to a terminal state
-    OpPoll {
-        id: String,
-    },
+    OpPoll { id: String },
     /// Abort one operation
-    OpAbort {
-        id: String,
-    },
+    OpAbort { id: String },
     /// Activation plan
     Activation,
     /// Apply the activation plan (202 operation, polled)
@@ -258,15 +251,28 @@ enum AuthCommand {
     /// List own sessions
     Sessions,
     /// Revoke one own session
-    SessionRevoke {
-        id: String,
-    },
+    SessionRevoke { id: String },
     /// Rotate a refresh token (prints the new pair as JSON)
     Refresh {
         /// Read the refresh token from stdin instead of
         /// LLMDIL_API_REFRESH_TOKEN
         #[arg(long)]
         token_stdin: bool,
+    },
+    /// Change the signed-in account's password (required after an
+    /// admin reset). Current password from LLMDIL_API_PASSWORD or
+    /// --password-stdin; new password from LLMDIL_API_NEW_PASSWORD or
+    /// --new-password-stdin. The session stays signed in; the
+    /// account's other sessions are revoked.
+    Password {
+        /// Read the current password from stdin instead of
+        /// LLMDIL_API_PASSWORD
+        #[arg(long)]
+        password_stdin: bool,
+        /// Read the new password from stdin instead of
+        /// LLMDIL_API_NEW_PASSWORD
+        #[arg(long)]
+        new_password_stdin: bool,
     },
 }
 
@@ -286,11 +292,7 @@ fn read_stdin_secret(what: &str) -> Result<String, ApiError> {
 
 /// Resolve a secret from exactly one source: a `--*-stdin` flag
 /// (stdin wins when set) or its environment variable.
-fn secret_from(
-    stdin_flag: bool,
-    env_name: &str,
-    what: &str,
-) -> Result<String, ApiError> {
+fn secret_from(stdin_flag: bool, env_name: &str, what: &str) -> Result<String, ApiError> {
     if stdin_flag {
         return read_stdin_secret(what);
     }
@@ -367,11 +369,7 @@ fn print_operation(op: &Operation) {
 /// Run a 202 operation command: print the accepted record, poll on
 /// the API cadence, print the terminal record. A failed operation
 /// exits non-zero.
-async fn run_operation(
-    client: &mut ApiClient,
-    path: &str,
-    body: Value,
-) -> Result<(), ApiError> {
+async fn run_operation(client: &mut ApiClient, path: &str, body: Value) -> Result<(), ApiError> {
     let op = client.post_operation(path, body).await?;
     eprintln!("operation {} ({}) running…", op.id, op.kind);
     let final_op = client
@@ -418,12 +416,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             if *allow_wddm_overcommit {
                 body["allow_wddm_overcommit"] = serde_json::json!(true);
             }
-            run_operation(
-                &mut client,
-                &format!("/api/v1/backends/{id}/start"),
-                body,
-            )
-            .await?;
+            run_operation(&mut client, &format!("/api/v1/backends/{id}/start"), body).await?;
         }
         Command::BackendStop { id, graceful, yes } => {
             confirm(&format!("stop backend {id}"), *yes)?;
@@ -435,11 +428,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             )
             .await?;
         }
-        Command::BackendRestart {
-            id,
-            graceful,
-            yes,
-        } => {
+        Command::BackendRestart { id, graceful, yes } => {
             confirm(&format!("restart backend {id}"), *yes)?;
             let mut client = authed_client(&cli)?;
             run_operation(
@@ -455,12 +444,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
         Command::GatewayStart => {
             let mut client = authed_client(&cli)?;
-            run_operation(
-                &mut client,
-                "/api/v1/gateway/start",
-                serde_json::json!({}),
-            )
-            .await?;
+            run_operation(&mut client, "/api/v1/gateway/start", serde_json::json!({})).await?;
         }
         Command::GatewayRestart { drain, yes } => {
             confirm("restart gateway", *yes)?;
@@ -604,7 +588,10 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             let mut client = authed_client(&cli)?;
             print_json(
                 &client
-                    .post(&format!("/api/v1/operations/{id}/abort"), serde_json::json!({}))
+                    .post(
+                        &format!("/api/v1/operations/{id}/abort"),
+                        serde_json::json!({}),
+                    )
                     .await?,
             );
         }
@@ -677,16 +664,15 @@ async fn run_auth(cli: &Cli, auth: &AuthCommand) -> Result<(), ApiError> {
         } => {
             let password = secret_from(*password_stdin, PASSWORD_ENV, "password")?;
             let mut client = public_client(cli)?;
-            match client.login(username, &password, Some(device_name)).await? {
-                LoginOutcome::Pair(pair) => {
-                    println!("{}", serde_json::to_string(&pair).unwrap());
-                }
+            let pair = match client.login(username, &password, Some(device_name)).await? {
+                LoginOutcome::Pair(pair) => pair,
                 LoginOutcome::TotpRequired { challenge_id } => {
                     let code = totp_code(*totp_stdin)?;
-                    let pair = client.totp(&challenge_id, &code).await?;
-                    println!("{}", serde_json::to_string(&pair).unwrap());
+                    client.totp(&challenge_id, &code).await?
                 }
-            }
+            };
+            println!("{}", serde_json::to_string(&pair).unwrap());
+            warn_if_must_change(&pair);
         }
         AuthCommand::Totp {
             challenge_id,
@@ -696,6 +682,19 @@ async fn run_auth(cli: &Cli, auth: &AuthCommand) -> Result<(), ApiError> {
             let mut client = public_client(cli)?;
             let pair = client.totp(challenge_id, &code).await?;
             println!("{}", serde_json::to_string(&pair).unwrap());
+            warn_if_must_change(&pair);
+        }
+        AuthCommand::Password {
+            password_stdin,
+            new_password_stdin,
+        } => {
+            let current = secret_from(*password_stdin, PASSWORD_ENV, "current password")?;
+            let new_password = secret_from(*new_password_stdin, NEW_PASSWORD_ENV, "new password")?;
+            let mut client = authed_client(cli)?;
+            client.change_password(&current, &new_password).await?;
+            eprintln!(
+                "password changed; this session stays signed in, other sessions were revoked"
+            );
         }
         AuthCommand::Me => {
             let mut client = authed_client(cli)?;
@@ -728,6 +727,14 @@ async fn run_auth(cli: &Cli, auth: &AuthCommand) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+/// After a login whose account is flagged must-change (SEC-03), say
+/// what to do next on stderr (stdout carries the token pair).
+fn warn_if_must_change(pair: &manager_cli::TokenPair) {
+    if pair.must_change_password {
+        eprintln!("{PASSWORD_CHANGE_HINT}");
+    }
 }
 
 /// TOTP code resolution for the login flow: stdin flag, env var,
@@ -764,11 +771,7 @@ fn totp_code(totp_stdin: bool) -> Result<String, ApiError> {
 /// Scripted verification (Stage 2 test client): enroll, then a full
 /// read sweep. Each step prints PASS/FAIL; the exit code is 0 only
 /// when every step passes. No TUI, no interaction.
-async fn run_verify(
-    cli: &Cli,
-    device_name: &str,
-    code_stdin: bool,
-) -> Result<(), ApiError> {
+async fn run_verify(cli: &Cli, device_name: &str, code_stdin: bool) -> Result<(), ApiError> {
     let code = secret_from(code_stdin, ENROLL_ENV, "enrollment code")?;
     let mut client = public_client(cli)?;
     let mut failures = 0usize;
@@ -809,10 +812,7 @@ async fn run_verify(
     let mut anon = public_client(cli)?;
     match anon.server().await {
         Ok(doc) => {
-            let api_version = doc
-                .get("api_version")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let api_version = doc.get("api_version").and_then(Value::as_str).unwrap_or("");
             if api_version == "1" {
                 println!("PASS server identity (api_version 1)");
             } else {
@@ -858,6 +858,10 @@ async fn main() {
             );
             std::process::exit(0);
         }
+        Err(ApiError::Api(body)) if body.code == "PASSWORD_CHANGE_REQUIRED" => {
+            eprintln!("error: {PASSWORD_CHANGE_HINT}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
@@ -877,6 +881,10 @@ fn stdin_secret_count(cli: &Cli) -> usize {
             } => usize::from(*password_stdin) + usize::from(*totp_stdin),
             AuthCommand::Totp { code_stdin, .. } => usize::from(*code_stdin),
             AuthCommand::Refresh { token_stdin } => usize::from(*token_stdin),
+            AuthCommand::Password {
+                password_stdin,
+                new_password_stdin,
+            } => usize::from(*password_stdin) + usize::from(*new_password_stdin),
             _ => 0,
         };
     }

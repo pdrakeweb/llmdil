@@ -53,6 +53,11 @@ pub struct TokenPair {
     pub refresh_token: String,
     #[serde(default = "default_token_type")]
     pub token_type: String,
+    /// Set when the account was reset by an admin and must change its
+    /// password before anything but `auth password` works (SEC-03).
+    /// Absent from older servers, hence the default.
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 fn default_token_type() -> String {
@@ -141,8 +146,7 @@ impl ApiClient {
                  certificate pinning only applies to TLS connections"
             )));
         }
-        let fp = parse_fingerprint(fingerprint_hex)
-            .map_err(ApiError::Input)?;
+        let fp = parse_fingerprint(fingerprint_hex).map_err(ApiError::Input)?;
         let config = pinned_client_config(fp);
         let http = Client::builder()
             .use_preconfigured_tls(config)
@@ -227,9 +231,8 @@ impl ApiClient {
         if let Some(body) = body {
             // See try_refresh: no reqwest `json` feature in this
             // workspace; serialize by hand.
-            let text = serde_json::to_string(body).map_err(|e| {
-                ApiError::Input(format!("could not serialize request body: {e}"))
-            })?;
+            let text = serde_json::to_string(body)
+                .map_err(|e| ApiError::Input(format!("could not serialize request body: {e}")))?;
             req = req
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(text);
@@ -255,12 +258,7 @@ impl ApiClient {
             if let Some(pair) = self.try_refresh().await {
                 self.set_tokens(pair);
                 let (status, value) = self
-                    .execute_once(self.build_request(
-                        &method,
-                        path,
-                        &body,
-                        authenticated,
-                    )?)
+                    .execute_once(self.build_request(&method, path, &body, authenticated)?)
                     .await?;
                 return Self::check(status, value);
             }
@@ -302,11 +300,7 @@ impl ApiClient {
             .await
     }
 
-    pub async fn post(
-        &mut self,
-        path: &str,
-        body: Value,
-    ) -> Result<Value, ApiError> {
+    pub async fn post(&mut self, path: &str, body: Value) -> Result<Value, ApiError> {
         self.request_json(reqwest::Method::POST, path, Some(body), true)
             .await
     }
@@ -317,15 +311,10 @@ impl ApiClient {
     }
 
     /// POST that returns a 202 operation record. The caller polls it.
-    pub async fn post_operation(
-        &mut self,
-        path: &str,
-        body: Value,
-    ) -> Result<Operation, ApiError> {
+    pub async fn post_operation(&mut self, path: &str, body: Value) -> Result<Operation, ApiError> {
         let value = self.post(path, body).await?;
-        serde_json::from_value::<Operation>(value).map_err(|e| {
-            ApiError::Input(format!("operation record did not parse: {e}"))
-        })
+        serde_json::from_value::<Operation>(value)
+            .map_err(|e| ApiError::Input(format!("operation record did not parse: {e}")))
     }
 
     /// Poll an operation to a terminal state, on the API cadence
@@ -339,9 +328,7 @@ impl ApiClient {
         loop {
             let value = self.get(&format!("/api/v1/operations/{op_id}")).await?;
             let op: Operation = serde_json::from_value::<Operation>(value)
-                .map_err(|e| {
-                    ApiError::Input(format!("operation record did not parse: {e}"))
-                })?;
+                .map_err(|e| ApiError::Input(format!("operation record did not parse: {e}")))?;
             on_tick(&op);
             if op.is_terminal() {
                 return Ok(op);
@@ -381,17 +368,12 @@ impl ApiClient {
                 .to_string();
             return Ok(LoginOutcome::TotpRequired { challenge_id });
         }
-        let pair: TokenPair = serde_json::from_value(value).map_err(|e| {
-            ApiError::Input(format!("login response did not parse: {e}"))
-        })?;
+        let pair: TokenPair = serde_json::from_value(value)
+            .map_err(|e| ApiError::Input(format!("login response did not parse: {e}")))?;
         Ok(LoginOutcome::Pair(pair))
     }
 
-    pub async fn totp(
-        &mut self,
-        challenge_id: &str,
-        code: &str,
-    ) -> Result<TokenPair, ApiError> {
+    pub async fn totp(&mut self, challenge_id: &str, code: &str) -> Result<TokenPair, ApiError> {
         let value = self
             .request_json(
                 reqwest::Method::POST,
@@ -403,9 +385,8 @@ impl ApiClient {
                 false,
             )
             .await?;
-        serde_json::from_value(value).map_err(|e| {
-            ApiError::Input(format!("totp response did not parse: {e}"))
-        })
+        serde_json::from_value(value)
+            .map_err(|e| ApiError::Input(format!("totp response did not parse: {e}")))
     }
 
     pub async fn enroll(
@@ -418,16 +399,29 @@ impl ApiClient {
             body["device_name"] = serde_json::json!(device);
         }
         let value = self
-            .request_json(
-                reqwest::Method::POST,
-                "/api/v1/enroll",
-                Some(body),
-                false,
-            )
+            .request_json(reqwest::Method::POST, "/api/v1/enroll", Some(body), false)
             .await?;
-        serde_json::from_value(value).map_err(|e| {
-            ApiError::Input(format!("enroll response did not parse: {e}"))
-        })
+        serde_json::from_value(value)
+            .map_err(|e| ApiError::Input(format!("enroll response did not parse: {e}")))
+    }
+
+    /// `POST /api/v1/auth/password`: change the signed-in account's
+    /// password (session tokens only; the server refuses API tokens).
+    /// The current session stays valid and the must-change flag clears.
+    pub async fn change_password(
+        &mut self,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), ApiError> {
+        self.post(
+            "/api/v1/auth/password",
+            serde_json::json!({
+                "current_password": current_password,
+                "new_password": new_password,
+            }),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn refresh(&mut self, refresh_token: &str) -> Result<TokenPair, ApiError> {
@@ -439,9 +433,8 @@ impl ApiClient {
                 false,
             )
             .await?;
-        serde_json::from_value(value).map_err(|e| {
-            ApiError::Input(format!("refresh response did not parse: {e}"))
-        })
+        serde_json::from_value(value)
+            .map_err(|e| ApiError::Input(format!("refresh response did not parse: {e}")))
     }
 }
 
@@ -522,6 +515,7 @@ mod tests {
             access_token: "secret-access".into(),
             refresh_token: "secret-refresh".into(),
             token_type: "Bearer".into(),
+            must_change_password: false,
         };
         let redacted = pair.debug_redacted();
         assert!(!redacted.contains("secret-access"));

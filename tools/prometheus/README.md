@@ -140,7 +140,36 @@ llama.cpp specifics (gateway group names, speculative-decoding flag
 names, timing field names) that change when the app and its pinned
 llama.cpp change; keeping them in the same repo keeps them in step.
 
-Noted future step, not implemented: bundle `tools/` into the Tauri
-installer as resources, so the scripts are installed alongside the
-LLMdil executable and Pete does not need a repo checkout on the
-workstation to run them.
+## Installed copies
+
+The installer bundles the operator scripts as Tauri resources
+(`bundle.resources` in `src-tauri/tauri.conf.json`), so Pete does not
+need a repo checkout on the workstation to run them. They install
+beside the LLMdil executable, under the install directory (per-user,
+default `%LOCALAPPDATA%\LLMdil`):
+
+| Installed path | Source |
+|---|---|
+| `tools\prometheus\Invoke-ModelBaseline.ps1` | this directory |
+| `tools\prometheus\Get-SystemSnapshot.ps1` | this directory |
+| `tools\prometheus\prompts\*.txt` | `prompts/` |
+| `tools\prometheus\README.md` | this file |
+
+`Invoke-ModelBaseline.ps1` finds its prompt set through
+`$PSScriptRoot`, so the installed copy works from any working
+directory. Results still land under the current directory
+(`.\baseline-results` by default; `-OutDir` overrides), so run it
+from a writable folder of your choice, for example:
+
+```powershell
+cd $env:USERPROFILE\Documents
+& "$env:LOCALAPPDATA\LLMdil\tools\prometheus\Invoke-ModelBaseline.ps1" -Target Planner -Label base-file
+```
+
+Not bundled: `Install-BuildToolchain.ps1` (build-machine setup, not an
+operator tool), `Deploy-LogReceiver.ps1` (retired: the receiver
+deploys from Settings → Supervision → Log receiver) and
+`log-receiver-checklist.md` (published as a release asset instead).
+The installed copies are replaced on upgrade and removed on uninstall
+like the rest of the app files; keep result files outside the install
+directory.

@@ -12,14 +12,15 @@
    fabricated: with no backends configured the canvas shows an empty state,
    and in the browser (live=false) a sample-mode banner says so. */
 
-import { getAppConfig, getGpuTelemetry, systemVerdict } from "../api";
-import type { BackendRow, GatewayStatusData } from "../api";
-import { fmtGb, gaugeRing, trim1 } from "../charts";
+import { getAppConfig, getGpuTelemetry, getModels, getStatus, systemVerdict } from "../api";
+import type { BackendRow, GatewayStatusData, ModelRow } from "../api";
+import { fitText, fmtGb, gaugeRing, trim1 } from "../charts";
 import { icon } from "../icons";
-import { esc } from "../html";
+import { esc, setHtml } from "../html";
 import { LIFECYCLE_COLORS, META, lifecycleColor, lifecycleEdge, lifecycleLabel, serviceStore } from "../lifecycle";
 import type { LifecycleState, ServiceSnapshot } from "../lifecycle";
 import type { GpuInfo } from "../types";
+import { modelDisplayName } from "./common";
 
 const C = { green: LIFECYCLE_COLORS.green, amber: LIFECYCLE_COLORS.amber, red: LIFECYCLE_COLORS.red, blue: "#4a9eff", grey: LIFECYCLE_COLORS.grey };
 
@@ -50,7 +51,7 @@ function gpuDot(g: GpuInfo): string {
   }
 }
 
-function fmtUptime(secs: number): string {
+export function fmtUptime(secs: number): string {
   if (secs < 60) return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m`;
   const h = Math.floor(secs / 3600);
@@ -66,6 +67,8 @@ interface MapData {
   gatewayState: LifecycleState | null;
   postgresState: LifecycleState | null;
   gpus: GpuInfo[];
+  /** Registered models (display names). */
+  models: ModelRow[];
   stale: boolean;
   gateway: GatewayStatusData;
   /** True when the gateway_status call itself failed — the gateway's
@@ -105,42 +108,52 @@ interface MapData {
  *  "context only" with. */
 const RESIDENCY_MIN_MIB = 1024;
 
-const W = 1200, H = 640;
-const NW = 170, NH = 62;
-const COL = { gateway: 110, backends: 470, gpus: 830 };
+const W = 1200;
+const NW = 280, NH = 72, ROW = 84;
+/** Space above the first node: column labels, then the MXC frame's own
+ *  label inside its top edge. */
+const TOP = 66;
+const COL = { gateway: 20, backends: 420, gpus: 880 };
 
-/** Even vertical spread for a column of n nodes on the canvas. */
-function spreadY(i: number, n: number): number {
-  if (n <= 1) return H / 2;
-  const top = 110, bottom = 570;
-  return top + (i * (bottom - top)) / (n - 1);
+/** The canvas height: the tallest column's nodes never overlap. */
+function mapHeight(rows: number): number {
+  return Math.max(440, TOP + rows * ROW + 30);
+}
+
+/** Even vertical spread for a column of n nodes on a canvas H high. */
+function spreadY(i: number, n: number, H: number): number {
+  return TOP + (H - TOP - 30) * ((i + 0.5) / Math.max(1, n));
 }
 
 function topologySvg(d: MapData): string {
   const { backends, gpus, gateway } = d;
-  let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%" role="img" aria-label="Full cluster service map">`;
+  const H = mapHeight(Math.max(backends.length, gpus.length));
+  let s = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:auto" role="img" aria-label="Full cluster service map">`;
 
   // MXC dashed boundary around the backends column. The label states
   // the configured mode; "POLICY-CHECKED" is claimed only when the
   // sandbox is not disabled.
-  const ys = backends.map((_, i) => spreadY(i, backends.length));
-  const rectY = Math.max(36, Math.min(...ys) - NH / 2 - 44);
-  const rectH = Math.max(...ys) + NH / 2 + 44 - rectY;
+  const ys = backends.map((_, i) => spreadY(i, backends.length, H));
+  const rectY = Math.min(...ys) - NH / 2 - 26;
+  const rectH = Math.max(...ys) + NH / 2 + 14 - rectY;
   const mxcLabel = d.mxcMode ? `MXC \u00b7 ${d.mxcMode.toUpperCase()}` : "MXC";
-  s += `<rect x="${COL.backends - 40}" y="${rectY}" width="${NW + 80}" height="${rectH}" rx="10" fill="none" stroke="#4a9eff" stroke-width="1" stroke-dasharray="7 5" opacity="0.55"/>
-        <text x="${COL.backends + NW / 2}" y="${rectY - 8}" text-anchor="middle" fill="#4a9eff" font-size="10" letter-spacing="1">${esc(mxcLabel)}</text>`;
+  s += `<rect x="${COL.backends - 24}" y="${rectY}" width="${NW + 48}" height="${rectH}" rx="10" fill="none" stroke="#4a9eff" stroke-width="1" stroke-dasharray="7 5" opacity="0.55"/>
+        <text x="${COL.backends + NW / 2}" y="${rectY + 16}" text-anchor="middle" fill="#4a9eff" font-size="10" letter-spacing="1">${esc(mxcLabel)}</text>`;
 
   const edge = (x1: number, y1: number, x2: number, y2: number, cls = "", stroke = "") => {
     const mx = (x1 + x2) / 2;
     s += `<path class="map-edge ${cls}"${stroke ? ` style="stroke:${stroke}"` : ""} d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
   };
-  const node = (x: number, y: number, title: string, sub: string, dot: string, stroke = "", ring?: { pct: number; color: string; label: string }, href?: string) => {
-    const g = `<g>
+  // Text is cut to the node's width (the full text in the tooltip); a
+  // ring takes its own room at the right.
+  const node = (x: number, y: number, title: string, sub: string[], dot: string, stroke = "", ring?: { pct: number; color: string; label: string }, href?: string, dim = false) => {
+    const room = NW - (ring ? 48 : 0);
+    const g = `<g${dim ? ` class="map-dim"` : ""}><title>${esc([title, ...sub].join("\n"))}</title>
       <rect class="map-node" x="${x}" y="${y - NH / 2}" width="${NW}" height="${NH}" rx="8"${stroke ? ` stroke="${stroke}" stroke-width="1.5"` : ""}/>
-      <circle cx="${x + 16}" cy="${y - 10}" r="4" fill="${dot}"/>
-      <text class="map-node-text" x="${x + 28}" y="${y - 4}">${esc(title)}</text>
-      <text class="map-node-sub" x="${x + 16}" y="${y + 16}">${esc(sub)}</text>
-      ${ring ? `<g transform="translate(${x + NW - 26},${y - 12})"><circle r="13" fill="none" stroke="#2b313b" stroke-width="4"/><circle r="13" fill="none" stroke="${ring.color}" stroke-width="4" stroke-linecap="round" stroke-dasharray="${(2 * Math.PI * 13).toFixed(1)}" stroke-dashoffset="${(2 * Math.PI * 13 * (1 - ring.pct / 100)).toFixed(1)}" transform="rotate(-90)"/><text y="4" text-anchor="middle" fill="#e8ebf0" font-size="9" font-weight="700">${esc(ring.label)}</text></g>` : ""}
+      <circle cx="${x + 16}" cy="${y - 18}" r="4" fill="${dot}"/>
+      <text class="map-node-text" x="${x + 28}" y="${y - 13}">${esc(fitText(title, room - 40, 12, 0.6))}</text>
+      ${sub.map((l, i) => `<text class="map-node-sub" x="${x + 16}" y="${y + 6 + i * 16}">${esc(fitText(l, room - 28, 10))}</text>`).join("")}
+      ${ring ? `<g transform="translate(${x + NW - 30},${y})"><circle r="15" fill="none" stroke="#2b313b" stroke-width="4"/><circle r="15" fill="none" stroke="${ring.color}" stroke-width="4" stroke-linecap="round" stroke-dasharray="${(2 * Math.PI * 15).toFixed(1)}" stroke-dashoffset="${(2 * Math.PI * 15 * (1 - ring.pct / 100)).toFixed(1)}" transform="rotate(-90)"/><text y="3" text-anchor="middle" fill="#e8ebf0" font-size="9" font-weight="700">${esc(ring.label)}</text></g>` : ""}
     </g>`;
     // Nodes are actionable: backend nodes link to the Backends view,
     // the gateway node to the Gateway view (SVG <a> elements).
@@ -165,14 +178,16 @@ function topologySvg(d: MapData): string {
   const stOf = (b: BackendRow): LifecycleState => d.states.get(b.id) ?? "unknown";
   backends.forEach((b, i) => {
     const e = lifecycleEdge(stOf(b));
-    edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls, e.stroke);
+    // A disabled backend gets no traffic: its lines are dimmed.
+    const dimCls = b.enabled === false ? " dim" : "";
+    edge(COL.gateway + NW, H / 2, COL.backends, ys[i], e.cls + dimCls, e.stroke);
     const measured = d.residency.get(b.id);
     const resident = measured
       ? [...measured.entries()].filter((e): e is [number, number] => e[1] !== null && e[1] >= RESIDENCY_MIN_MIB)
       : [];
     if (resident.length) {
       for (const [j] of resident) {
-        if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), e.cls, e.stroke);
+        if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length, H), e.cls, e.stroke);
       }
     } else if (META[stOf(b)].isLive) {
       const split = d.splits.get(b.id);
@@ -181,10 +196,10 @@ function topologySvg(d: MapData): string {
         : [];
       if (targets.length) {
         for (const j of targets) {
-          if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length), "configured", "");
+          if (gpus[j]) edge(COL.backends + NW, ys[i], COL.gpus, spreadY(j, gpus.length, H), "configured", "");
         }
       } else if (gpus.length) {
-        edge(COL.backends + NW, ys[i], COL.gpus, spreadY(0, gpus.length), "configured", "");
+        edge(COL.backends + NW, ys[i], COL.gpus, spreadY(0, gpus.length, H), "configured", "");
       }
     }
   });
@@ -193,45 +208,49 @@ function topologySvg(d: MapData): string {
   // payload — render the measured-nothing state ("status unknown",
   // neutral dot) rather than a fabricated ":0 · 0 groups · down".
   if (d.gatewayError) {
-    node(COL.gateway, H / 2, "LiteLLM", "status unknown", C.grey, "", undefined, "#/gateway");
+    node(COL.gateway, H / 2, "LiteLLM", ["status unknown"], C.grey, "", undefined, "#/gateway");
   } else {
     // The gateway node names its lifecycle state when it is not simply
     // running ("restarting… (activation, 12 s)", "stopped", …) and the
     // PostgreSQL state when the database is not running.
     const gs = d.live ? d.gatewayState : null;
-    const gwTxt = gs && gs !== "running" ? ` \u00b7 ${lifecycleLabel(gs, serviceStore.transitionOf("gateway", gateway.transition))}` : "";
+    const gwTxt = gs && gs !== "running" ? lifecycleLabel(gs, serviceStore.transitionOf("gateway", gateway.transition)) : "";
     const pg = d.live ? d.postgresState : null;
-    const pgTxt = pg && pg !== "running" && pg !== "not_installed" ? ` \u00b7 db ${lifecycleLabel(pg)}` : "";
+    const pgTxt = pg && pg !== "running" && pg !== "not_installed" ? `db ${lifecycleLabel(pg)}` : "";
+    const gp = gateway.running_port ?? gateway.port;
     node(COL.gateway, H / 2, "LiteLLM",
-      `:${gateway.port} \u00b7 ${gateway.groups} enabled groups \u00b7 ${gateway.routing_rules} rules${gwTxt}${pgTxt}`,
+      [`:${gp}${gp !== gateway.port ? ` (saved :${gateway.port})` : ""} \u00b7 ${gateway.groups} enabled groups \u00b7 ${gateway.routing_rules} rules`, [gwTxt, pgTxt].filter(Boolean).join(" \u00b7 ")].filter(Boolean),
       gs ? lifecycleColor(gs) : C.grey, gs ? lifecycleStroke(gs) || C.blue : C.blue, undefined, "#/gateway");
   }
 
   backends.forEach((b, i) => {
     const st = stOf(b);
     const up = st === "running" && b.uptime_secs != null ? ` \u00b7 up ${fmtUptime(b.uptime_secs)}` : "";
-    const model = b.model_file ? ` \u00b7 ${b.model_file.split(/[\\/]/).pop()}` : "";
+    const model = b.model_file ? modelDisplayName(b.model_file, d.models) : "";
     const res = d.residency.get(b.id);
     const resident = res ? [...res.entries()].filter((e): e is [number, number] => e[1] !== null && e[1] >= RESIDENCY_MIN_MIB) : [];
     const anyMeasured = res ? [...res.values()].some((v) => v !== null) : false;
     const resTxt = resident.length
-      ? ` \u00b7 ${resident.map(([j, mib]) => `GPU${j} ${fmtGb(mib / 1024)}G`).join(" ")}`
+      ? resident.map(([j, mib]) => `GPU${j} ${fmtGb(mib / 1024)} GiB`).join(" ")
       : res && res.size
-        ? anyMeasured ? " \u00b7 context only" : " \u00b7 residency not measured"
+        ? anyMeasured ? "context only" : "residency not measured"
         : "";
-    node(COL.backends, ys[i], b.id, `:${b.port} \u00b7 ${lifecycleLabel(st, serviceStore.transitionOf(`backend:${b.id}`, b.transition ?? null))}${up}${model}${resTxt}`, lifecycleColor(st), lifecycleStroke(st), undefined, "#/backends");
+    node(COL.backends, ys[i], b.id, [
+      `:${b.port} \u00b7 ${b.enabled === false ? "disabled" : lifecycleLabel(st, serviceStore.transitionOf(`backend:${b.id}`, b.transition ?? null))}${up}${resTxt ? ` \u00b7 ${resTxt}` : ""}`,
+      model,
+    ].filter(Boolean), lifecycleColor(st), lifecycleStroke(st), undefined, "#/backends", b.enabled === false);
   });
 
   gpus.forEach((g, j) => {
     const pct = g.vram_total_gb > 0 ? Math.round((g.vram_used_gb / g.vram_total_gb) * 100) : 0;
-    node(COL.gpus, spreadY(j, gpus.length), g.name,
-      `${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GB VRAM`,
+    node(COL.gpus, spreadY(j, gpus.length, H), g.name,
+      [`${fmtGb(g.vram_used_gb)} / ${fmtGb(g.vram_total_gb)} GiB VRAM`],
       gpuDot(g), "", { pct, color: pct >= 80 ? C.amber : C.green, label: `${pct}%` });
   });
 
-  s += `<text class="map-col-label" x="${COL.gateway}" y="48">GATEWAY</text>
-    <text class="map-col-label" x="${COL.backends}" y="48">${d.mxcMode === "learning" || d.mxcMode === "enforced" ? "BACKENDS \u00b7 POLICY-CHECKED" : "BACKENDS"}</text>
-    ${gpus.length ? `<text class="map-col-label" x="${COL.gpus}" y="48">GPUS</text>` : ""}</svg>`;
+  s += `<text class="map-col-label" x="${COL.gateway}" y="22">GATEWAY</text>
+    <text class="map-col-label" x="${COL.backends}" y="22">${d.mxcMode === "learning" || d.mxcMode === "enforced" ? "BACKENDS \u00b7 POLICY-CHECKED" : "BACKENDS"}</text>
+    ${gpus.length ? `<text class="map-col-label" x="${COL.gpus}" y="22">GPUS</text>` : ""}</svg>`;
   return s;
 }
 
@@ -269,7 +288,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
 
   const updated = root.querySelector("#mapUpdated");
   if (updated) {
-    updated.textContent = `${d.live ? "live data" : "sample data"} \u00b7 updated ${new Date(d.updatedAt).toLocaleTimeString("en-GB")}` + (d.stale ? " \u00b7 telemetry stale" : "");
+    updated.textContent = `${d.live ? "live data" : "sample data"} \u00b7 updated ${new Date(d.updatedAt).toLocaleTimeString()}` + (d.stale ? " \u00b7 telemetry stale" : "");
   }
 
   const canvas = root.querySelector("#mapCanvas");
@@ -283,18 +302,18 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
         : d.live
           ? "No backends configured — run the setup wizard to install and configure the stack."
           : "No backend data in sample mode — open the installed app to see this machine's topology.";
-      canvas.innerHTML = `<div class="empty" style="padding:24px">${emptyText}</div>`;
+      setHtml(canvas, `<div class="empty" style="padding:24px">${emptyText}</div>`);
     } else {
-      canvas.innerHTML = `${topologySvg(d)}
+      setHtml(canvas, `${topologySvg(d)}
         <div class="legend" style="margin-top:8px">
           ${mapLegend()}
           <span><span class="dot ok"></span>GPU ok</span>
           <span><span class="dot warn"></span>GPU degraded</span>
           <span><span class="dot err"></span>GPU down</span>
           <span style="border:1px dashed #4a9eff;border-radius:3px;padding:0 5px">MXC boundary</span>
-          <span style="color:var(--text3)">Solid GPU edges: measured residency of 1 GiB or more. Dotted edges: configured placement for a live backend with no measured residency (its tensor split, or the main GPU when no split is set). A process holding under 1 GiB on a GPU holds only a CUDA context there — it is listed under GPU residency, not drawn as placement.</span>
+          <span title="Solid GPU edges: measured residency of 1 GiB or more. Dotted edges: configured placement for a live backend with no measured residency (its tensor split, or the main GPU when no split is set). A process holding under 1 GiB on a GPU holds only a CUDA context there — it is listed under GPU residency, not drawn as placement.">Edges: solid measured, dotted configured ${icon("info")}</span>
           <span><a href="#/backends" style="color:var(--accent)">Backends</a> \u00b7 <a href="#/gateway" style="color:var(--accent)">Gateway</a></span>
-        </div>`;
+        </div>`);
     }
   }
 
@@ -302,11 +321,11 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
   const vramTotal = d.gpus.reduce((a, g) => a + g.vram_total_gb, 0);
   const summary: [string, string][] = [
     ["Backends", `${counts.backendsRunning} / ${counts.backendsTotal} running`],
-    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.port} \u00b7 ${d.gateway.groups} enabled groups${d.live && d.gatewayState && d.gatewayState !== "running" ? ` \u00b7 ${lifecycleLabel(d.gatewayState)}` : ""}`],
+    ["Gateway", d.gatewayError ? "status unknown" : `:${d.gateway.running_port ?? d.gateway.port} \u00b7 ${d.gateway.groups} enabled groups${d.live && d.gatewayState && d.gatewayState !== "running" ? ` \u00b7 ${lifecycleLabel(d.gatewayState)}` : ""}`],
     ...(d.live && d.postgresState ? [["PostgreSQL", lifecycleLabel(d.postgresState)] as [string, string]] : []),
     ["Routing rules", String(d.gateway.routing_rules)],
     ["GPUs", `${d.gpus.length} detected`],
-    ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GB` : "—"],
+    ["VRAM used (all processes)", d.gpus.length ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} GiB` : "—"],
   ];
   const summaryEl = root.querySelector("#mapSummary");
   if (summaryEl) {
@@ -334,7 +353,7 @@ function paintServiceMap(root: HTMLElement, d: MapData): void {
   const gpuLoad = root.querySelector("#mapGpuLoad");
   if (gpuLoad) {
     gpuLoad.innerHTML = d.gpus.length
-      ? d.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;width:70px">${esc(g.name.replace("Tesla ", ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, trim1(g.util_pct), "%")}</div>`).join("")
+      ? d.gpus.map((g) => `<div style="display:flex;align-items:center;gap:10px;margin:8px 0"><span style="font-size:12px;flex:1;min-width:0;overflow-wrap:anywhere">GPU ${esc(g.id)} \u00b7 ${esc(g.name.replace(/^(NVIDIA|Tesla) /, ""))}</span>${gaugeRing(g.util_pct, 44, g.util_pct > 60 ? C.amber : C.green, trim1(g.util_pct), "%")}</div>`).join("")
       : `<div class="empty">no GPUs reported</div>`;
   }
 }
@@ -401,6 +420,9 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
    *  each paint comes from the shared store's latest snapshot. */
   let lastTele: Awaited<ReturnType<typeof getGpuTelemetry>> | null = null;
   let lastCfg: Awaited<ReturnType<typeof getAppConfig>> | null = null;
+  let lastModels: ModelRow[] = [];
+  /** False only when the app says the MXC runtime is not installed. */
+  let mxcInstalled = true;
   let lastLoadAt = 0;
 
   const paint = (snap: ServiceSnapshot): void => {
@@ -442,11 +464,12 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
       gatewayState: serviceStore.gatewayState(),
       postgresState: serviceStore.postgresState(),
       gpus: g.data.gpus,
+      models: lastModels,
       stale: g.data.stale,
       gateway,
       gatewayError: snap.live && !snap.gateway,
       backendsError: snap.backendsError,
-      mxcMode: typeof mxc?.mode === "string" ? mxc.mode : null,
+      mxcMode: !mxcInstalled ? "not installed" : typeof mxc?.mode === "string" ? mxc.mode : null,
       splits: splitsFromConfig(cfg.data),
       residency,
       live,
@@ -462,8 +485,10 @@ export async function wireServiceMap(root: HTMLElement): Promise<() => void> {
     loading = true;
     lastLoadAt = Date.now();
     try {
-      const [g, cfg] = await Promise.all([getGpuTelemetry(), getAppConfig()]);
+      const [g, cfg, mr, st] = await Promise.all([getGpuTelemetry(), getAppConfig(), getModels(), getStatus()]);
       if (disposed) return;
+      if (!mr.error) lastModels = mr.data;
+      mxcInstalled = st.data.mxc_runtime_installed !== false;
       lastTele = g;
       lastCfg = cfg;
       paint(serviceStore.get());

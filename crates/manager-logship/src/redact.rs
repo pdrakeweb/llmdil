@@ -137,9 +137,7 @@ fn redact_jwts(line: &str, hits: &mut u64) -> String {
             let mut ok = true;
             while segments < 3 {
                 let start = j;
-                while j < b.len()
-                    && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'-' | b'_'))
-                {
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'-' | b'_')) {
                     j += 1;
                 }
                 if j - start < 4 {
@@ -323,7 +321,10 @@ fn key_is_secret(key: &str) -> bool {
     // Compound key names with separators removed (master_key,
     // api-key, private key shapes). `apikey` anywhere in the
     // squashed name counts (BRAVE_API_KEY, api[_-]?key per §5.2).
-    let squashed: String = lk.chars().filter(|c| !matches!(c, '_' | '-' | '.')).collect();
+    let squashed: String = lk
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-' | '.'))
+        .collect();
     if squashed.contains("apikey")
         || matches!(
             squashed.as_str(),
@@ -506,12 +507,18 @@ mod tests {
             r("authorization: Basic dXNlcjpwYXNz"),
             format!("authorization: Basic {REDACTED}")
         );
-        assert_eq!(r("send Bearer xyz12345 now"), format!("send Bearer {REDACTED} now"));
+        assert_eq!(
+            r("send Bearer xyz12345 now"),
+            format!("send Bearer {REDACTED} now")
+        );
     }
 
     #[test]
     fn sk_keys_redact_body() {
-        assert_eq!(r("key sk-abcdefgh12345678 end"), format!("key sk-{REDACTED} end"));
+        assert_eq!(
+            r("key sk-abcdefgh12345678 end"),
+            format!("key sk-{REDACTED} end")
+        );
         // Too short to be a key: untouched.
         assert_eq!(r("sk-abc is fine"), "sk-abc is fine");
     }
@@ -584,8 +591,14 @@ mod tests {
 
     #[test]
     fn innocent_lines_untouched() {
-        assert_eq!(r("the author wrote a token bucket note"), "the author wrote a token bucket note");
-        assert_eq!(r("step start-gateway (install): started"), "step start-gateway (install): started");
+        assert_eq!(
+            r("the author wrote a token bucket note"),
+            "the author wrote a token bucket note"
+        );
+        assert_eq!(
+            r("step start-gateway (install): started"),
+            "step start-gateway (install): started"
+        );
         assert_eq!(r("monkey business as usual"), "monkey business as usual");
     }
 }

@@ -39,6 +39,19 @@ correctness of the software**.
 | T-05 | `T-05-logging-pipeline.md` | One logging pipeline: init `tracing`, `task_id` spans, feed the diagnostics export | structural | 5.6 | M |
 | T-06 | `T-06-platform-seams.md` | Platform seams: `SecretStore` / `ServiceManager` / `TelemetrySource` / `ProcessRuntime` | structural | 5.10 | L |
 
+## Status (2026-11-12)
+
+| Task | Status |
+|------|--------|
+| T-01 | Done for request envelopes: typed request structs, generated TS types and per-op JSON Schema. Responses are still `serde_json::Value`. |
+| T-02a, T-02b, T-02d, T-02e, T-02f, T-02g, T-02h | Done. |
+| T-02c | Open: `crates/manager-supervisor/src/lib.rs` (4,601 lines) and `crates/manager-app/src/lifecycle.rs` (2,224 lines) are left to the service-lifecycle owner. |
+| T-02 (umbrella) | One further file is over 2,000 lines: `ui/src/views/backends.ts` (2,199 lines), which is a single function, `wireBackends`. |
+| T-03 | In progress. |
+| T-04 | Done: `.github/workflows/gates.yml`. |
+| T-05 | Done: `crates/manager-app/src/logging.rs`. |
+| T-06 | Not started. Platform seams overlap the service-lifecycle area. |
+
 ## Dependencies & recommended ordering
 
 The tasks are designed to be **independently dispatchable**. Where two tasks touch the same
@@ -77,7 +90,7 @@ Measured on a clean checkout (2026-10-22):
 | Rust files / lines | 75 `.rs` / 90,671 lines |
 | UI (TypeScript) lines | 18,714 |
 | Tests (`#[test]`/`#[tokio::test]`) | 1,027 total |
-| `OP_SPECS.len()` | 130 |
+| `OP_SPECS.len()` | 130 at measurement (159 as of 2026-11-12; the `assert_eq!` in `registry.rs` is authoritative) |
 | `AppState` fields | 32 |
 | `std::fs::` vs `tokio::fs::` | 418 vs 30 |
 | `unwrap()` / `.expect(` / `panic!` / `unsafe` | 1,357 / 368 / 36 / 85 |
@@ -109,7 +122,7 @@ require **no** decomposition task.
   Tauri via `window.__TAURI__.core.invoke`; removing it silently degrades every view to mock data.
 - The operation registry is the single source of truth. Any change must keep
   `OP_SPECS.len()` at its current asserted value (130 when these tasks were
-  written; 152 at v0.1.60 — the `assert_eq!` in `registry.rs` is authoritative)
+  written; 152 at v0.1.60; 159 as of 2026-11-12 — the `assert_eq!` in `registry.rs` is authoritative)
   (until a task explicitly adds/removes ops) and keep every existing
   `name`, argument, route, and `CapClass` unchanged.
 - The registry's drift tests in `crates/manager-app/src/registry.rs`

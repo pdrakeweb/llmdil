@@ -192,14 +192,14 @@ fn sample_progress() -> ApplyProgress {
 }
 
 fn set_progress(state: &AppState, p: Option<ApplyProgress>) {
-    *state.activation_progress.lock().unwrap() = p;
+    *state.activation.progress.lock().unwrap() = p;
 }
 
 #[tokio::test]
 async fn a_second_apply_while_one_runs_is_busy() {
     let (state, dir) = apply_state("busy");
     let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
-    let held = state.activation_apply_lock.lock().await;
+    let held = state.activation.apply_lock.lock().await;
     set_progress(&state, Some(sample_progress()));
     let err = op_activation_apply(&state, &sink, None, Some("desktop".to_string()))
         .await
@@ -235,7 +235,7 @@ async fn an_apply_with_nothing_pending_runs_nothing_and_records_nothing() {
     assert!(activation_history::load_history(&dir).executions.is_empty());
     // Progress cleared, lock released.
     assert!(current_progress(&state).is_none());
-    assert!(state.activation_apply_lock.try_lock().is_ok());
+    assert!(state.activation.apply_lock.try_lock().is_ok());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -340,4 +340,62 @@ async fn monitor_does_not_fire_applied_while_applying() {
         Some(false)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A9: a timed-out drain is named in the gateway items' detail.
+#[test]
+fn drain_timeout_is_recorded_on_gateway_items() {
+    let item = |scope: &str| crate::activation_history::ActivationExecutionItem {
+        ts: String::new(),
+        kind: "gateway_config".to_string(),
+        summary: "x".to_string(),
+        scope: scope.to_string(),
+        targets: Vec::new(),
+        activation: "gateway_restart".to_string(),
+        outcome: "applied".to_string(),
+        detail: None,
+    };
+    let mut items = vec![item("gateway"), item("backend")];
+    note_drain_timeout(
+        &mut items,
+        Some(&json!({"drained": true, "timed_out": false})),
+    );
+    assert!(items[0].detail.is_none());
+    let q = json!({"drained": false, "in_flight": 2.0, "timed_out": true});
+    note_drain_timeout(&mut items, Some(&q));
+    let detail = items[0].detail.as_deref().unwrap();
+    assert!(detail.contains("timed out with 2 request(s)"), "{detail}");
+    assert!(items[1].detail.is_none());
+}
+
+/// The start-gateway step succeeds with a warning when the Windows
+/// approval is declined: the apply says so.
+#[test]
+fn a_gateway_start_warning_is_part_of_the_result() {
+    assert_eq!(
+        gateway_step_warning("LiteLLM gateway running on :4001 — database active"),
+        None
+    );
+    let w = gateway_step_warning(
+        "LiteLLM gateway running on :4001 — warning: the Windows firewall was not changed — warning: x",
+    )
+    .unwrap();
+    assert_eq!(w, "the Windows firewall was not changed; x");
+    let mut items = vec![crate::activation_history::ActivationExecutionItem {
+        ts: String::new(),
+        kind: "gateway_config".to_string(),
+        summary: "x".to_string(),
+        scope: "gateway".to_string(),
+        targets: Vec::new(),
+        activation: "gateway_restart".to_string(),
+        outcome: "applied".to_string(),
+        detail: None,
+    }];
+    note_gateway_warning(&mut items, &w);
+    assert!(items[0]
+        .detail
+        .as_deref()
+        .unwrap()
+        .starts_with("Warning: the Windows"));
+    assert_eq!(items[0].outcome, "applied");
 }

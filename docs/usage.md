@@ -37,11 +37,13 @@ it never reinstalls unprompted.
 
 ## Main windows
 
+The sidebar shows *Services running: N of M* with *Start All Services* on
+every page while anything that should run is stopped.
+
 - **Dashboard** — health-at-a-glance: service cards (with gateway
-  statistics), GPU strip, model placement, 24h throughput, and a
-  *Start All Services* bar when anything is stopped. The toolbar's *View*
+  statistics), GPU strip, model placement and 24h throughput. The toolbar's *View*
   selector switches the same data between Appliance (default), Console
-  (dense tables), and Topology (node map) presentations; the choice
+  (dense tables), and Topology (gateway → groups, each holding its models and whether they are deployed → GPUs) presentations; the choice
   persists per window.
 - **Service Map** — the full cluster topology: clients → gateway → backends
   → GPUs → models, with the MXC sandbox boundary and a live event timeline.
@@ -80,7 +82,7 @@ it never reinstalls unprompted.
   log (Logs scope `optimize`).
 - **Activation Plan** (`#/activation-plan`) — saved-but-not-live changes
   collected as one plan (pending changes count, drain & apply, apply now,
-  cancel changes). A banner at the top of the main column carries the
+  cancel changes). A bar docked under every view carries the
   same plan summary on every view.
 - **Settings** — tabbed: General, Updates & diagnostics, Notifications
   (Windows toast categories: Operations, Failures, Activation),

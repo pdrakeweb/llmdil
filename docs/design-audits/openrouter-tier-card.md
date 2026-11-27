@@ -240,6 +240,7 @@ Model allowlist: 3 models  [▾ names as chips, collapsed]
   spent-vs-cap bar in the metric-strip style the summary card uses for
   gateway stats (`static.ts:2900-2906`) — proposed here only as the
   designated slot, not built on data that doesn't exist.
+  - Status (2026-11-12): `gateway_status.openrouter_spend` now exists; the slot is filled with a Spent today row + spent/cap meter (IMPLEMENTATION.md).
 - **Unchanged:** the toggle button and its wiring (`gwOrToggle`), the
   probe semantics (presence only, value never sent to the UI), and the
   card's position in the Gateway view.

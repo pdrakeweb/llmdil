@@ -43,7 +43,12 @@ construction), `tasks_list`, `placement_propose` (a dry-run
 calculation), `gateway_preview_yaml`, `gateway_test_routing`,
 `gateway_activation_plan`, `backend_preview_diff`,
 `setup_status` and the other setup reads, `winml_status`,
-`mxc_get_activity_report`, `updates_check_all`, `mcp_list`.
+`mxc_get_activity_report`, `updates_check_all`, `mcp_list`,
+`mcp_start_preflight`, `services_list`, `log_receiver_status`
+(both without local paths over the API), `backend_add_preview`,
+`backend_cache_preview`, `model_hf_lookup`, `model_hf_header`,
+`optimize_get_state`, `optimize_tuning_preview`,
+`bench_prompts_list`, `bench_results_list`.
 
 ### Class S — sensitive reads (credential-adjacent)
 
@@ -77,7 +82,13 @@ routeless — server bookkeeping, never a client call) / plan apply
 (executes already-saved changes), `download_model`, `model_pause_download`,
 `model_resume_download`, `cancel_download`, `task_abort`,
 `model_verify_checksum`, `telemetry_reset_peaks`,
-`telemetry_save_snapshot`.
+`telemetry_save_snapshot`, `backend_test_tool_call`,
+`notifications_send_test`, and the Optimize and Bench work that
+loads, stops or starts backends (consult, discover, measure,
+estimate, baseline, experiments, tuning run, prompt generation,
+bench runs) with its cancels. A bench arm's `offload_expr` ends up
+on a command line, so it may hold expert-offload flags only;
+anything else needs Class C's raw flags.
 
 ### Class C — configuration edits
 
@@ -89,7 +100,11 @@ registry class C, routed), `model_add`, `model_assign`,
 `model_set_enabled`, `model_set_short_name`, `placement_apply`,
 `gateway_set_bind_host`, `telemetry_set_interval`,
 `updates_pin`, `updates_set_auto`, `setup_mark_complete` and the
-other setup state marks.
+other setup state marks, `settings_set_supervision`,
+`notifications_set_config`, `bench_prompt_save`, and the Optimize
+plan's decisions (`optimize_save_purpose`, `optimize_set_item_state`,
+`optimize_set_item_outcome`, `optimize_set_experiment_state`,
+`optimize_validate_plan`, `optimize_tuning_adopt`).
 
 ### Class D — destructive and install-level operations
 
@@ -97,6 +112,9 @@ Irreversible, expensive, or code-changing operations:
 `backend_delete`, `model_delete` (deletes a downloaded GGUF —
 tens of GiB), `gateway_activation_cancel` (restores a prior
 configuration snapshot, discarding the pending one),
+`optimize_apply_plan` (its items can delete backends and groups),
+`optimize_discard_plan`, `bench_prompt_delete`,
+`bench_result_delete`,
 `updates_apply` (replaces installed component binaries),
 `run_wizard_step` / `setup_retry_step` (installs software: venv,
 Postgres, Prisma — long-running, machine-changing),
@@ -300,7 +318,15 @@ any user exists. Rules:
 - **Reset by admin**: an admin sets a temporary password for a
   user; the account is flagged must-change, all sessions revoked,
   and the temporary password works only to reach the change-
-  password endpoint. Audited.
+  password endpoint. Audited. As built (SEC-03): the reset also
+  revokes the user's API tokens, in the same store write; a
+  flagged login (TOTP step included) gets a 15-minute session;
+  every route except `POST /auth/password`, `POST /auth/logout`
+  and `GET /auth/me` answers 403 `PASSWORD_CHANGE_REQUIRED` for
+  the flagged user's sessions and API tokens, refresh is refused,
+  and each refusal is audited. The desktop's local admin commands
+  (Tauri IPC, not HTTP) are not gated — the desktop is the local
+  admin, and it has no self-service password or TOTP commands.
 - **Local reset**: if every admin is locked out, the desktop app
   (local access = physical access = already root on this machine)
   offers password reset for any account. This is the recovery path
@@ -312,7 +338,10 @@ any user exists. Rules:
 ### 3.7 TOTP (optional second factor)
 
 Recommendation: **implement TOTP as an optional per-user second
-factor in v1, not required.** Enrollment: user scans a QR (secret
+factor in v1, not required.** Enrollment (as built: from a signed-in
+session, never an API token, with the account password as step-up
+for first enrollment and re-enrollment alike — SEC-04; failures count
+toward the lockout): user scans a QR (secret
 generated server-side and stored in the OS credential store —
 never in the user store file, as built; see §4), 8 single-use
 recovery codes shown once and stored hashed. When enabled for a
@@ -420,12 +449,27 @@ result (success / denied / error), and request id. Passwords,
 tokens, and the master key are never written — actions are logged
 by name, payloads by target id only.
 
-- Reads are not audited except Class S disclosure endpoints
-  (master key reveal, bundle export, launch command) — those three
-  are audited like mutations.
+- Reads are not audited except Class S disclosure endpoints (bundle
+  export and bundle content, launch command; the master key has no
+  route) — those are audited like mutations.
+- A request the role may not make (403) is audited with result `403`,
+  reads included. A 401 is not: there is no actor to name.
 - The log is append-only from the API's perspective: no endpoint
   truncates or edits it; rotation is by file size with dated
   rollovers, matching the app's existing log handling.
+- Desktop admin actions (SEC-13, as built) land in the same file,
+  format and rotation, whether or not the API is running: actor
+  `desktop`, auth type `local`, source IP `local`, result `ok` /
+  `error`. Audited: create / update / delete user, reset password
+  and create enrollment code (action strings identical to the API
+  routes, e.g. `DELETE /api/v1/admin/users/{id}`, target the user
+  id, or the username on create), and the desktop-only
+  `admin_api_enable` / `admin_api_disable`, `firewall_rule_apply` /
+  `firewall_rule_remove` and `tls_cert_regenerate`. Reads (status,
+  user list, pairing payload, audit view) are not. The entry carries
+  the outcome only — never the password, temporary password,
+  enrollment code or key. Written by `manager_api::audit::record_local`;
+  every writer in the process shares one `AuditLog::shared` instance.
 - Exposed read-only at `GET /api/v1/admin/audit` (admin only),
   newest first, paginated — same shape the Logs view already uses.
 
@@ -433,7 +477,9 @@ by name, payloads by target id only.
 
 - **Opt-in, off by default.** The admin API does not listen until
   Pete enables it in the desktop app (Remote Access page). Enabling
-  requires at least one admin user to exist (§3.5). The desktop UI
+  was to require at least one admin user (§3.5); as built the switch
+  starts the listener without that check (nobody can sign in until a
+  user exists). The desktop UI
   shows the listening state, bind address, port (proposed default
   **47821**, unassigned range, distinct from the gateway's 4000),
   and cert fingerprint persistently while enabled — a listening
@@ -446,12 +492,37 @@ by name, payloads by target id only.
   scoped firewall rule for the gateway, so this follows existing
   precedent; or a single specified interface address for stricter
   setups.
+  As built (Nov 2026): `admin_api.bind_mode` = `loopback` | `all` |
+  `interface` (+ `admin_api.bind_ip`), chosen on the Remote Access
+  card from this machine's current addresses. The field is additive
+  and defaults to `all`, so every configuration written before it
+  keeps exactly its listening surface. A configured interface address
+  that is not assigned to the machine when the listener starts falls
+  back to **loopback**, never wider, and the reason shows in the
+  status (`bind_fallback`); a wildcard is refused as an interface
+  address. The firewall rule (same remote scope) is reconciled for
+  `all` and `interface`; a loopback listener needs none, so none is
+  created and the status reports it as not needed. The bind is
+  desktop-only configuration: the raw config patch has no REST route
+  (rest-api decision 11), so a remote client cannot widen it.
 - **TLS — decision with a recommendation.** Options:
   1. **Self-signed certificate + client pinning (recommended).**
      At enable time the server generates a self-signed cert
      (SANs: machine hostname, LAN IP, Tailscale IP, `prometheus`
      mDNS-style alias where available; 2-year validity, regenerated
-     on demand from the desktop UI). The desktop Remote Access page
+     on demand from the desktop UI). As built (SEC-08): later starts
+     load the stored key and certificate; a new one is generated only
+     when the material is missing, unreadable/corrupt (including
+     `sans.txt`), mismatched (key vs. certificate), or expired /
+     within 30 days of expiry — each branch logged and reported as
+     `cert_source` in the Remote Access status. A changed LAN or
+     Tailscale address never regenerates (pinned clients do not check
+     names); it shows as informational `san_drift` beside the
+     Regenerate button, the only path that changes the key or SANs.
+     rcgen's default validity (to year 4096) is used, not 2 years.
+     The private key (SEC-N3) is held in Windows Credential Manager
+     for the desktop user, not as a plaintext file; status reports
+     `key_storage`. The desktop Remote Access page
      shows the cert fingerprint and a QR code encoding
      `{ base_url, cert_sha256 }`; the Android app scans it at
      pairing and pins the fingerprint (TOFU with an out-of-band
@@ -513,8 +584,8 @@ integrity. Attacker positions and the controls that answer them:
   credential leaked. Controls: deny-by-default route classification
   with the role check in middleware before any handler code, 403s
   audited with actor identity, and no capability discovery via
-  error differences (a denied route and an unknown route are
-  indistinguishable in shape). The matrix is the control: viewer
+  error differences (the route table is public; as built a denied
+  route is 403 and an unknown one 404). The matrix is the control: viewer
   holds no mutation class at all.
 - **Token leakage** (token pasted into a log, a screenshot, a
   backup). Controls: hashes-only storage server-side (a leaked

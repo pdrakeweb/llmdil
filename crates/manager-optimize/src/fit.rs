@@ -37,6 +37,35 @@ pub struct LayoutFacts {
     /// Rated maximum context (catalog `ctx_max`); 0 = unknown.
     pub ctx_max: u32,
     pub params_b: f32,
+    /// The model's MoE block map, when the facts came from a GGUF
+    /// parse with an expert tensor index (code review v0.1.60
+    /// item 11): the offload unit everywhere in the plan model is
+    /// MoE layers, while `--n-cpu-moe` takes a block-index bound;
+    /// [`LayoutFacts::offload_for`] and
+    /// [`LayoutFacts::offloaded_layers`] convert through it.
+    /// `None` (catalog or estimate facts) is the identity.
+    pub moe_block_map: Option<manager_models::MoeBlockMap>,
+}
+
+impl LayoutFacts {
+    /// The offload a position of `layers` MoE layers writes
+    /// (`--n-cpu-moe` at its block-index bound; the endpoints as
+    /// no offload / all experts). `None` when the MoE layer count
+    /// is unknown.
+    pub fn offload_for(&self, layers: u32) -> Option<ExpertOffload> {
+        let moe = self.moe_layers?;
+        Some(manager_models::offload_for_moe_layers(
+            layers,
+            moe,
+            self.moe_block_map.as_ref(),
+        ))
+    }
+
+    /// MoE layers on system RAM under `offload` (a `--n-cpu-moe`
+    /// bound reads back as the MoE blocks below it).
+    pub fn offloaded_layers(&self, offload: ExpertOffload) -> u32 {
+        offload.moe_layers_offloaded(self.moe_layers.unwrap_or(0), self.moe_block_map.as_ref())
+    }
 }
 
 /// A backend's memory requirement from layout facts — the same
@@ -51,6 +80,11 @@ pub struct LayoutFacts {
 /// decoded expert-cache size (0 when unset): it rides the
 /// requirement as its own term, with the offload position and
 /// MoE layer count the per-GPU distribution needs.
+///
+/// `--n-cpu-moe B` is priced through the facts' own
+/// [`LayoutFacts::moe_block_map`] (see [`layout_requirement_mapped`]);
+/// without one, as the first B MoE blocks — exact only when the
+/// model's MoE blocks are blocks `0..`.
 pub fn layout_requirement(
     facts: &LayoutFacts,
     offload: ExpertOffload,
@@ -59,6 +93,42 @@ pub fn layout_requirement(
     n_seq: u32,
     moe_cache_mib: u32,
 ) -> MemoryRequirement {
+    layout_requirement_mapped(
+        facts,
+        facts.moe_block_map.as_ref(),
+        offload,
+        cache,
+        n_ctx,
+        n_seq,
+        moe_cache_mib,
+    )
+}
+
+/// [`layout_requirement`] with the model's MoE block map (from a
+/// GGUF layout with an expert tensor index). llama.cpp reads
+/// `--n-cpu-moe B` as a BLOCK-INDEX bound — the experts of blocks
+/// with index `< B`, leading or interleaved dense blocks counting
+/// toward `B` (code review v0.1.60 item 11) — so with a map the
+/// bound is converted to the MoE layers it really moves
+/// ([`manager_models::MoeBlockMap::layers_for_bound`]) before the
+/// per-MoE-block pricing, and the expert-cache term's offload
+/// position is that same count. `None` (catalog-only facts) keeps
+/// the first-N-MoE-blocks approximation.
+pub fn layout_requirement_mapped(
+    facts: &LayoutFacts,
+    block_map: Option<&manager_models::MoeBlockMap>,
+    offload: ExpertOffload,
+    cache: manager_models::CacheSelection,
+    n_ctx: u32,
+    n_seq: u32,
+    moe_cache_mib: u32,
+) -> MemoryRequirement {
+    let moe_layers = facts.moe_layers.unwrap_or(0);
+    let offloaded = offload.moe_layers_offloaded(moe_layers, block_map);
+    let offload = match (offload, block_map) {
+        (ExpertOffload::CpuMoeLayers(_), Some(_)) => ExpertOffload::CpuMoeLayers(offloaded),
+        (offload, _) => offload,
+    };
     let kv_per_token = match facts.kv_geometry {
         Some(geo) => Some(geo.bytes_per_token_typed(cache.k, cache.v)),
         None => facts.kv_per_token,
@@ -76,8 +146,8 @@ pub fn layout_requirement(
         n_seq,
     );
     req.moe_cache_mib = moe_cache_mib as u64;
-    req.moe_cache_offload_layers = offload.layers(facts.moe_layers.unwrap_or(0));
-    req.moe_cache_moe_layers = facts.moe_layers.unwrap_or(0);
+    req.moe_cache_offload_layers = offloaded;
+    req.moe_cache_moe_layers = moe_layers;
     req
 }
 
@@ -220,7 +290,11 @@ pub fn evaluate_fit(
         fit_verdict(total, &adj_running),
         manager_models::FitVerdict::TooLarge { .. }
     );
-    let adj_all = sub(free_vram_mib_per_gpu, others_running, Some(others_accounted));
+    let adj_all = sub(
+        free_vram_mib_per_gpu,
+        others_running,
+        Some(others_accounted),
+    );
     let fits_with_all = !matches!(
         fit_verdict(total, &adj_all),
         manager_models::FitVerdict::TooLarge { .. }
@@ -248,6 +322,21 @@ pub fn others_residency(
     exclude_id: &str,
     n_gpus: usize,
 ) -> (Vec<u64>, Vec<u64>) {
+    others_residency_mapped(cfg, layouts, &HashMap::new(), running, exclude_id, n_gpus)
+}
+
+/// [`others_residency`] with per-model MoE block maps (keyed by
+/// model id, as `layouts` is): each backend's `--n-cpu-moe` bound
+/// is priced by block index where its model has a map (see
+/// [`layout_requirement_mapped`]).
+pub fn others_residency_mapped(
+    cfg: &AppConfig,
+    layouts: &HashMap<String, LayoutFacts>,
+    block_maps: &HashMap<String, manager_models::MoeBlockMap>,
+    running: &HashMap<String, bool>,
+    exclude_id: &str,
+    n_gpus: usize,
+) -> (Vec<u64>, Vec<u64>) {
     let mut running_res = vec![0u64; n_gpus];
     let mut accounted_res = vec![0u64; n_gpus];
     for b in &cfg.backends {
@@ -261,8 +350,9 @@ pub fn others_residency(
             continue;
         };
         let offload = manager_models::expert_offload(b.raw_flags.as_deref());
-        let req = layout_requirement(
+        let req = layout_requirement_mapped(
             facts,
+            block_maps.get(&model.id).or(facts.moe_block_map.as_ref()),
             offload,
             manager_models::cache_selection(b.raw_flags.as_deref()),
             b.flags.n_ctx,
@@ -298,12 +388,20 @@ mod tests {
             basis: MemoryBasis::Estimate,
             ctx_max: 0,
             params_b: 12.0,
+            moe_block_map: None,
         }
     }
 
     #[test]
     fn residency_empty_split_is_first_gpu() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
+        let req = layout_requirement(
+            &facts(),
+            ExpertOffload::None,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
         assert_eq!(residency_per_gpu(&req, &[], 2), vec![12 * 1024, 0]);
         assert_eq!(
             residency_per_gpu(&req, &[0.5, 0.5], 2),
@@ -325,7 +423,96 @@ mod tests {
             basis: MemoryBasis::Estimate,
             ctx_max: 0,
             params_b: 12.0,
+            moe_block_map: None,
         }
+    }
+
+    #[test]
+    fn n_cpu_moe_is_priced_by_block_index_when_a_block_map_is_known() {
+        // 2 leading dense blocks + 4 MoE blocks (2..=5), 1 GiB of
+        // experts each.
+        const GIB: u64 = 1024 * manager_models::MIB;
+        let facts = LayoutFacts {
+            total_bytes: 8 * GIB,
+            expert_bytes: Some(4 * GIB),
+            expert_bytes_by_block: Some(vec![GIB; 4]),
+            moe_layers: Some(4),
+            kv_per_token: None,
+            kv_geometry: None,
+            rs_bytes_per_seq: None,
+            basis: MemoryBasis::Exact,
+            ctx_max: 0,
+            params_b: 8.0,
+            moe_block_map: None,
+        };
+        let map = manager_models::MoeBlockMap::from_block_indices([2, 3, 4, 5]).unwrap();
+        let price = |map: Option<&manager_models::MoeBlockMap>, bound: u32| {
+            layout_requirement_mapped(
+                &facts,
+                map,
+                ExpertOffload::CpuMoeLayers(bound),
+                manager_models::CacheSelection::default(),
+                0,
+                1,
+                1024,
+            )
+        };
+        // `--n-cpu-moe 4` moves blocks 2 and 3: 2 MoE layers.
+        let r = price(Some(&map), 4);
+        assert_eq!(r.sys_weights_mib, 2 * 1024);
+        assert_eq!(r.moe_cache_offload_layers, 2);
+        // A bound inside the dense prefix moves nothing.
+        assert_eq!(price(Some(&map), 2).sys_weights_mib, 0);
+        // Without a map (catalog-only facts) the first-N
+        // approximation stands, unchanged.
+        let legacy = price(None, 4);
+        assert_eq!(legacy.sys_weights_mib, 4 * 1024);
+        assert_eq!(
+            legacy,
+            layout_requirement(
+                &facts,
+                ExpertOffload::CpuMoeLayers(4),
+                manager_models::CacheSelection::default(),
+                0,
+                1,
+                1024,
+            )
+        );
+        // An interleaved model: MoE blocks 1, 3, 5, 7.
+        let map = manager_models::MoeBlockMap::from_block_indices([1, 3, 5, 7]).unwrap();
+        assert_eq!(price(Some(&map), 4).sys_weights_mib, 2 * 1024);
+        assert_eq!(price(Some(&map), 7).sys_weights_mib, 3 * 1024);
+    }
+
+    #[test]
+    fn layout_facts_carry_their_block_map() {
+        // 2 dense + 4 MoE blocks, the map on the facts themselves.
+        const GIB: u64 = 1024 * manager_models::MIB;
+        let mut facts = moe_facts();
+        facts.moe_layers = Some(4);
+        facts.expert_bytes = Some(4 * GIB);
+        facts.expert_bytes_by_block = Some(vec![GIB; 4]);
+        facts.moe_block_map = manager_models::MoeBlockMap::from_block_indices([2, 3, 4, 5]);
+        assert_eq!(facts.offload_for(2), Some(ExpertOffload::CpuMoeLayers(4)));
+        assert_eq!(facts.offload_for(4), Some(ExpertOffload::AllExperts));
+        assert_eq!(facts.offloaded_layers(ExpertOffload::CpuMoeLayers(4)), 2);
+        // layout_requirement (and so others_residency) prices
+        // through the facts' map without being handed one.
+        let r = layout_requirement(
+            &facts,
+            ExpertOffload::CpuMoeLayers(4),
+            manager_models::CacheSelection::default(),
+            0,
+            1,
+            0,
+        );
+        assert_eq!(r.sys_weights_mib, 2 * 1024);
+        // No map: identity, unchanged.
+        facts.moe_block_map = None;
+        assert_eq!(facts.offload_for(2), Some(ExpertOffload::CpuMoeLayers(2)));
+        assert_eq!(facts.offloaded_layers(ExpertOffload::CpuMoeLayers(4)), 4);
+        facts.moe_layers = None;
+        assert_eq!(facts.offload_for(2), None);
     }
 
     #[test]
@@ -357,10 +544,7 @@ mod tests {
             vec![3072 + 2048, 3072 + 2048]
         );
         // Unsplit: the whole cache lands on the one GPU.
-        assert_eq!(
-            residency_per_gpu(&cached, &[], 1),
-            vec![6144 + 4096]
-        );
+        assert_eq!(residency_per_gpu(&cached, &[], 1), vec![6144 + 4096]);
     }
 
     #[test]
@@ -394,7 +578,14 @@ mod tests {
 
     #[test]
     fn fit_fails_when_free_vram_is_taken_by_a_running_backend() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
+        let req = layout_requirement(
+            &facts(),
+            ExpertOffload::None,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
         // 16 GiB free on GPU 0, but a running backend holds 8 GiB:
         // the 12 GiB model cannot be placed.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[8 * 1024, 0], &[0, 0]);
@@ -407,7 +598,14 @@ mod tests {
 
     #[test]
     fn fit_warns_when_it_only_fits_by_moving_accounted_residency() {
-        let req = layout_requirement(&facts(), ExpertOffload::None, manager_models::CacheSelection::default(), 32768, 4, 0);
+        let req = layout_requirement(
+            &facts(),
+            ExpertOffload::None,
+            manager_models::CacheSelection::default(),
+            32768,
+            4,
+            0,
+        );
         // 16 GiB free; a STOPPED backend accounts 8 GiB. The model
         // fits now but not alongside the stopped backend.
         let out = evaluate_fit(&req, &[], &[16 * 1024, 0], &[0, 0], &[8 * 1024, 0]);

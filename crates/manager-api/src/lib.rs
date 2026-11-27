@@ -19,12 +19,18 @@ use manager_app::{AppState, EventSink};
 use crate::operations::OperationStore;
 
 pub mod audit;
-pub mod firewall;
-pub mod auth_routes;
-pub mod composites;
-pub mod operations;
 pub mod auth;
+pub mod auth_routes;
+pub mod bind;
+pub mod composites;
+pub mod firewall;
+pub mod guards;
 pub mod http;
+pub mod operations;
+pub mod pairing;
+/// The `SecretStore` platform seam (T-06), owned by `manager-wizard`
+/// (which holds the Credential Manager FFI) and re-exported here.
+pub use manager_wizard::secrets;
 pub mod tls;
 pub mod users;
 
@@ -35,8 +41,16 @@ pub use http::{build_router, RouteRecord, DERIVED_ROUTES};
 pub use tls::TlsMaterial;
 pub use users::UserStore;
 
-/// One event emitted by an operation, as published to API
-/// subscribers (the phase-4 SSE stream consumes this channel).
+/// The origin every API-dispatched operation is tagged with on the
+/// app event bus (`manager_app::event_bus`).
+pub const API_ORIGIN: manager_app::event_bus::EventOrigin =
+    manager_app::event_bus::EventOrigin::Api;
+
+/// One event emitted by an API-dispatched operation. The SSE stream
+/// no longer reads this channel: it subscribes to the app-level bus
+/// (`manager_app::event_bus`), which carries the same events plus
+/// desktop-originated and background ones. Kept for in-process
+/// consumers of [`ApiCtx::events`].
 #[derive(Debug, Clone)]
 pub struct EventEnvelope {
     pub event: String,
@@ -84,7 +98,8 @@ pub struct ApiCtx {
     pub app: Arc<AppState>,
     /// The sink handed to operations (trait-object view of `events`).
     pub sink: Arc<dyn EventSink>,
-    /// The broadcast channel behind `sink` (SSE subscribes here).
+    /// The broadcast channel behind `sink` (API-dispatched events
+    /// only; `GET /events` streams the app event bus instead).
     pub events: Arc<BroadcastSink>,
     pub deployment_id: String,
     pub data_dir: PathBuf,
@@ -138,7 +153,11 @@ impl ApiCtx {
             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let events = Arc::new(BroadcastSink::new());
         let sink: Arc<dyn EventSink> = events.clone();
-        let audit = Arc::new(AuditLog::new(&data_dir));
+        // The process-wide instance: desktop actions (SEC-13) append
+        // to the same file under the same lock.
+        let audit = AuditLog::shared(&data_dir);
+        // Lockout events happen inside the auth service (SEC-13).
+        auth.attach_audit(audit.clone());
         Arc::new(Self {
             app,
             sink,
@@ -195,9 +214,9 @@ pub enum ApiStartError {
 #[derive(Debug, Clone, Copy)]
 pub struct PeerAddr(pub SocketAddr);
 
-impl axum::extract::connect_info::Connected<
-    axum::serve::IncomingStream<'_, tokio::net::TcpListener>,
-> for PeerAddr
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for PeerAddr
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         PeerAddr(*stream.remote_addr())
@@ -237,10 +256,7 @@ impl ApiServer {
 
     /// Start from a prepared context (shared user store with the
     /// desktop shell).
-    pub async fn start_ctx(
-        ctx: Arc<ApiCtx>,
-        options: ApiOptions,
-    ) -> Result<Self, ApiStartError> {
+    pub async fn start_ctx(ctx: Arc<ApiCtx>, options: ApiOptions) -> Result<Self, ApiStartError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         if options.tls.is_none() && !options.bind.is_loopback() {
             return Err(ApiStartError::PlaintextNotLoopback(options.bind));
@@ -258,12 +274,13 @@ impl ApiServer {
                 let config = tls::server_config(material)?;
                 let listener = tls::TlsListener::new(tcp, config);
                 tokio::spawn(async move {
-                    let _ = axum::serve(
+                    let end = axum::serve(
                         listener,
                         router.into_make_service_with_connect_info::<PeerAddr>(),
                     )
                     .with_graceful_shutdown(shutdown_fut)
                     .await;
+                    tracing::info!("admin api: stopped listening on {addr}: {end:?}");
                 })
             }
             None => tokio::spawn(async move {
@@ -275,6 +292,7 @@ impl ApiServer {
                 .await;
             }),
         };
+        tracing::info!("admin api: listening on {addr}");
         Ok(Self {
             addr,
             shutdown: Some(tx),

@@ -211,6 +211,9 @@ pub enum Origin {
     /// The debug console (a recipe run's stop/restore, or a console
     /// `start`/`stop`/`restart` command).
     Console,
+    /// The automatic restart of a crashed backend (`restart_policy`).
+    #[serde(rename = "restart-policy")]
+    RestartPolicy,
 }
 
 impl Origin {
@@ -229,6 +232,7 @@ impl Origin {
             Origin::Startup => "startup",
             Origin::Scm => "scm",
             Origin::Console => "console",
+            Origin::RestartPolicy => "restart-policy",
         }
     }
 
@@ -250,6 +254,7 @@ impl Origin {
             "startup" => Origin::Startup,
             "scm" | "service" => Origin::Scm,
             "console" | "diagnostics" => Origin::Console,
+            "restart-policy" => Origin::RestartPolicy,
             _ => return None,
         })
     }
@@ -541,6 +546,8 @@ mod tests {
             Origin::Monitor,
             Origin::Startup,
             Origin::Scm,
+            Origin::RestartPolicy,
+            Origin::Console,
         ] {
             assert_eq!(
                 serde_json::to_string(&o).unwrap(),
@@ -657,7 +664,10 @@ mod tests {
         std::fs::write(&path, "old\n").unwrap();
         rotate_log(&path).unwrap();
         assert!(!path.exists());
-        assert_eq!(std::fs::read_to_string(prev_log_path(&path)).unwrap(), "old\n");
+        assert_eq!(
+            std::fs::read_to_string(prev_log_path(&path)).unwrap(),
+            "old\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

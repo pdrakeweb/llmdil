@@ -42,10 +42,18 @@ pub mod lifecycle;
 /// (spec §2.2: 30 s, then kill).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upper bound for reaping a child after the kill in `drain()`. If the
-/// child is still alive past this, `drain()` returns `DrainTimeout`
-/// instead of blocking the supervisor forever.
-pub const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for a killed process to leave the process table. Windows
+/// tears down a killed llama-server that mapped a large model (tens of
+/// GB) over many seconds. A process still alive past this is reported as
+/// `DrainTimeout` instead of being waited on forever.
+pub const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a start waits for a port held by another program.
+const PORT_WAIT: Duration = Duration::from_millis(2500);
+
+/// How long a start waits for a port this backend's own previous process
+/// may still be releasing.
+const OWN_PORT_WAIT: Duration = Duration::from_secs(10);
 
 /// How long the output readers of an exited process may keep draining
 /// its pipes before they are aborted.
@@ -953,23 +961,8 @@ impl SupervisedProcess {
                     }
                     if pid_alive(pid) {
                         kill_pid_tree(pid);
-                        // Confirm the exit before reporting the stop:
-                        // the process holds its listening port until
-                        // it is actually gone. The kill can fail
-                        // outright (a backend another, elevated LLMdil
-                        // started refuses taskkill with access denied):
-                        // then the stop did not happen, so say so.
-                        if !wait_pid_gone(pid, KILL_REAP_TIMEOUT).await {
-                            self.adopted_pid = None;
-                            self.state = ProcessState::Failed;
-                            self.abort_readers();
-                            return Err(SupervisorError::DrainTimeout(self.id.clone()));
-                        }
                     }
-                    self.adopted_pid = None;
-                    self.state = ProcessState::Stopped;
-                    self.abort_readers();
-                    return Ok(());
+                    return self.adopted_killed(pid).await;
                 }
                 self.state = ProcessState::Stopped;
                 return Ok(());
@@ -1016,25 +1009,43 @@ impl SupervisedProcess {
                 // awaits the exit with no bound, which would defeat the
                 // bounded reap below (finding PL-m3).
                 let _ = child.start_kill();
-                // The kill is best-effort: if the child still will not die,
-                // report DrainTimeout instead of hanging the supervisor on
-                // wait() forever.
-                match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
-                    Ok(Ok(status)) => {
-                        self.record_exit(status, ProcessState::Stopped);
-                        self.abort_readers();
-                        Ok(())
-                    }
-                    _ => {
-                        self.record_exit_unknown();
-                        self.abort_readers();
-                        // `child` drops here; kill_on_drop makes one last
-                        // best-effort attempt. The process is still alive,
-                        // which is the pathological case DrainTimeout exists for.
-                        Err(SupervisorError::DrainTimeout(self.id.clone()))
-                    }
-                }
+                self.reap_killed(child).await
             }
+        }
+    }
+
+    /// Confirm the exit of a killed child, bounded by
+    /// [`KILL_REAP_TIMEOUT`] (finding PL-m3, docs/code-review-v0.1.60.md):
+    /// a process stuck in a driver call may not die on TerminateProcess.
+    /// Only a process that is still there is an error; `child` then drops,
+    /// and kill_on_drop makes one last best-effort attempt.
+    async fn reap_killed(&mut self, mut child: Child) -> Result<(), SupervisorError> {
+        let pid = child.id();
+        let reaped = tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await;
+        self.abort_readers();
+        if let Ok(Ok(status)) = reaped {
+            self.record_exit(status, ProcessState::Stopped);
+            return Ok(());
+        }
+        self.record_exit_unknown();
+        if pid.is_some_and(pid_alive) {
+            return Err(SupervisorError::DrainTimeout(self.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::reap_killed`] for an adopted process. It holds its
+    /// listening port until it is actually gone, so the exit is confirmed
+    /// before the stop is reported.
+    async fn adopted_killed(&mut self, pid: u32) -> Result<(), SupervisorError> {
+        let gone = wait_pid_gone(pid, KILL_REAP_TIMEOUT).await;
+        self.adopted_pid = None;
+        self.state = ProcessState::Stopped;
+        self.abort_readers();
+        if gone {
+            Ok(())
+        } else {
+            Err(SupervisorError::DrainTimeout(self.id.clone()))
         }
     }
 
@@ -1042,14 +1053,9 @@ impl SupervisedProcess {
     pub async fn kill(&mut self) -> Result<(), SupervisorError> {
         let mut child = match self.child.take() {
             None => {
-                if let Some(pid) = self.adopted_pid.take() {
+                if let Some(pid) = self.adopted_pid {
                     kill_pid_tree(pid);
-                    if !wait_pid_gone(pid, KILL_REAP_TIMEOUT).await {
-                        // Same as drain(): an unconfirmed kill is not a stop.
-                        self.state = ProcessState::Failed;
-                        self.abort_readers();
-                        return Err(SupervisorError::DrainTimeout(self.id.clone()));
-                    }
+                    return self.adopted_killed(pid).await;
                 }
                 self.state = ProcessState::Stopped;
                 self.abort_readers();
@@ -1058,23 +1064,9 @@ impl SupervisedProcess {
             Some(c) => c,
         };
         // May already be dead; ignore the error and reap regardless.
-        // The reap is bounded like `drain`'s (finding PL-m3,
-        // docs/code-review-v0.1.60.md): a process stuck in a driver call
-        // (a GPU TDR, say) may not die on TerminateProcess, and an
-        // unbounded wait here held the whole Supervisor lock — freezing
-        // list_backends, start/stop and the notify monitor. `stop()`
-        // marks the id failed on DrainTimeout.
+        // `stop()` marks the id failed on DrainTimeout.
         let _ = child.start_kill();
-        match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => self.record_exit(status, ProcessState::Stopped),
-            Ok(Err(_)) => self.record_exit_unknown(),
-            Err(_) => {
-                self.record_exit_unknown();
-                self.abort_readers();
-                return Err(SupervisorError::DrainTimeout(self.id.clone()));
-            }
-        }
-        self.abort_readers();
+        self.reap_killed(child).await?;
         tracing::info!(process = self.id, "killed");
         Ok(())
     }
@@ -1304,7 +1296,7 @@ pub async fn stop_process(
 }
 
 /// Spawn `id` from `spec` without any supervisor borrow: the bounded
-/// port-free wait (10 s) and the spawn itself. Pair with
+/// port-free wait and the spawn itself. Pair with
 /// [`Supervisor::prepare_spawn`] before and [`Supervisor::commit_spawn`]
 /// (or [`Supervisor::record_spawn_failure`]) after.
 pub async fn spawn_process(
@@ -1314,11 +1306,13 @@ pub async fn spawn_process(
     if let Some(port) = spec.port {
         // Bounded wait, not a single probe: a just-stopped
         // process (above all an adopted one) may still be
-        // releasing this port. A port held by something that is
-        // not going away fails after the wait, with the same
-        // PortInUse error as before.
-        if !wait_port_free(port, Duration::from_secs(10)).await {
-            return Err(SupervisorError::PortInUse(port));
+        // releasing this port. A port held by something else
+        // fails after a short wait, naming the holder.
+        if !wait_port_free(port, PORT_WAIT).await {
+            let own = holder_may_be_dying(port_owner_pid(port), &spec.program);
+            if !own || !wait_port_free(port, OWN_PORT_WAIT - PORT_WAIT).await {
+                return Err(SupervisorError::PortInUse(port, port_holder(port)));
+            }
         }
     }
     let ring = Arc::new(Mutex::new(RingBuffer::new(DEFAULT_LOG_RING_CAPACITY)));
@@ -1337,6 +1331,28 @@ pub async fn spawn_process(
         },
     )
     .await
+}
+
+/// Whether the process holding a port may be the backend's own previous
+/// process on its way out: it is already gone (the socket is being torn
+/// down) or it runs the backend's own `program`.
+fn holder_may_be_dying(holder: Option<u32>, program: &Path) -> bool {
+    holder.is_some_and(|pid| {
+        !pid_alive(pid) || process_image_path(pid).is_some_and(|image| image == program)
+    })
+}
+
+/// " by <program> (pid N)" for the process listening on `port`, or ""
+/// when it cannot be resolved.
+fn port_holder(port: u16) -> String {
+    let Some(pid) = port_owner_pid(port) else {
+        return String::new();
+    };
+    let image = process_image_path(pid);
+    match image.as_deref().and_then(Path::file_name) {
+        Some(name) => format!(" by {} (pid {pid})", name.to_string_lossy()),
+        None => format!(" by another program (pid {pid})"),
+    }
 }
 
 fn port_free(port: u16) -> bool {
@@ -1420,7 +1436,8 @@ fn lower_memory_priority(pid: u32, id: &str) {
     }
 }
 
-/// Whether a process with `pid` currently exists.
+/// Whether a process with `pid` is running. A zombie (exited, not yet
+/// reaped by its parent) is not: it holds no port and no memory.
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
@@ -1439,14 +1456,8 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err() {
-            return false;
-        }
-        // A zombie (exited, not yet reaped by its parent) still answers
-        // kill(pid, 0) but holds no port, memory or GPU context: it is
-        // gone for every purpose here. Without this an adopted process
-        // that happens to be our own child never reads as stopped.
-        !is_zombie(pid)
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            && !is_zombie(pid)
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -1455,19 +1466,14 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Linux: whether `/proc/<pid>/stat` reports state `Z`. Elsewhere
-/// (no procfs): false, the previous behavior.
+/// The state field of `/proc/<pid>/stat` ("pid (name) S …"; the name may
+/// hold spaces and parentheses). Without /proc, no process reads as one.
 #[cfg(unix)]
 fn is_zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            // The state follows the parenthesized command name, which
-            // may itself contain spaces or parentheses.
-            s.rfind(')')
-                .and_then(|i| s[i + 1..].split_whitespace().next().map(|t| t == "Z"))
-        })
-        .unwrap_or(false)
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| matches!(rest.trim_start().chars().next(), Some('Z' | 'X')))
+    })
 }
 
 /// Kill a process and (on Windows) its whole tree; best effort —
@@ -1566,6 +1572,15 @@ fn windows_port_owner_pid(port: u16) -> Option<u32> {
 /// (case-insensitive) — the guard against adopting whatever
 /// unrelated program happens to sit on a backend's port.
 pub fn process_image_is(pid: u32, name: &str) -> bool {
+    process_image_path(pid)
+        .as_deref()
+        .and_then(Path::file_name)
+        .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name))
+}
+
+/// The executable path of `pid` (Windows; `None` elsewhere, or when the
+/// process cannot be opened).
+fn process_image_path(pid: u32) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Threading::{
@@ -1573,25 +1588,18 @@ pub fn process_image_is(pid: u32, name: &str) -> bool {
         };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
-            return false;
+            return None;
         }
         let mut buf = vec![0u16; 1024];
         let mut len = buf.len() as u32;
         let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
         unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-        if ok == 0 {
-            return false;
-        }
-        let path = String::from_utf16_lossy(&buf[..len as usize]);
-        path.rsplit(['\\', '/'])
-            .next()
-            .map(|f| f.eq_ignore_ascii_case(name))
-            .unwrap_or(false)
+        (ok != 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
     }
     #[cfg(not(windows))]
     {
-        let _ = (pid, name);
-        false
+        let _ = pid;
+        None
     }
 }
 
@@ -1732,9 +1740,14 @@ impl Supervisor {
 
     /// Record a spawn that failed (e.g. after [`spawn_process`] returned an
     /// error): `status()` then reads `Failed` with `reason`, instead of an
-    /// idle `Stopped`. A later successful spawn clears both.
+    /// idle `Stopped`. A later successful spawn clears both. The failed
+    /// start has no output, so the previous run's retained ring is archived
+    /// and never reads as this start's.
     pub fn record_spawn_failure(&mut self, id: &str, reason: String) {
         tracing::warn!(process = id, %reason, "spawn failed");
+        if let Some(previous) = self.dead_rings.remove(id) {
+            self.archived_rings.insert(id.to_string(), previous);
+        }
         self.failed_ids.insert(id.to_string());
         self.failure_reasons.insert(id.to_string(), reason);
     }
@@ -2264,18 +2277,36 @@ impl LogLevelFilter {
 pub struct TestResult {
     pub status: u16,
     pub content: Option<String>,
+    /// The model's reasoning text, when the server splits it out.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub latency_ms: u64,
 }
 
+impl TestResult {
+    /// Whether the backend really generated something: a 2xx status and
+    /// answer or reasoning text. Reasoning counts because a model that
+    /// ignores the no-thinking request can spend the short token budget
+    /// before its answer.
+    pub fn answered(&self) -> bool {
+        let text = |t: &Option<String>| t.as_deref().is_some_and(|t| !t.trim().is_empty());
+        (200..300).contains(&self.status) && (text(&self.content) || text(&self.reasoning_content))
+    }
+}
+
 /// Minimal inference test request: HTTP POST to
 /// `{base_url}/v1/chat/completions` with a tiny prompt, returning the first
-/// choice's content plus usage when the server reports it.
+/// choice's content plus usage when the server reports it. Thinking is
+/// turned off (templates that do not know the switch ignore it): with 16
+/// tokens a thinking model would never reach its answer. Temperature is 0
+/// because a sampled reply can end at once, making a healthy backend fail.
 ///
 /// `base_url` is e.g. `http://127.0.0.1:8081`. Non-2xx responses are not
 /// errors here — the status is reported and content is `None` — but
-/// transport failures and unparseable bodies are.
+/// transport failures and unparseable bodies are. `Ok` is therefore not
+/// proof of a working backend: use [`TestResult::answered`].
 pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, SupervisorError> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -2283,6 +2314,8 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 16,
         "stream": false,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": false},
     });
     // NOTE: built without reqwest's `json` feature (workspace keeps reqwest
     // minimal); body serialization and response parsing go through
@@ -2309,10 +2342,13 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
         .map_err(|e| SupervisorError::Http(e.to_string()))?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
-    let content = json
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let text_at = |path: &str| {
+        json.pointer(path)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let content = text_at("/choices/0/message/content");
+    let reasoning_content = text_at("/choices/0/message/reasoning_content");
     let prompt_tokens = json
         .pointer("/usage/prompt_tokens")
         .and_then(|v| v.as_u64())
@@ -2324,6 +2360,7 @@ pub async fn test_request(base_url: &str, prompt: &str) -> Result<TestResult, Su
     Ok(TestResult {
         status,
         content,
+        reasoning_content,
         prompt_tokens,
         completion_tokens,
         latency_ms,
@@ -2631,6 +2668,11 @@ pub async fn test_tool_call(base_url: &str) -> Result<ToolCallProbeResult, Super
     ))
 }
 
+// Streaming, structured-output consultation transport (Optimize
+// Phase 3): a sibling of `chat_completion` in its own module.
+mod chat_stream;
+pub use chat_stream::{consult_completion, ConsultCompletion, StreamProgress};
+
 /// One chat message for [`chat_completion`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -2699,9 +2741,7 @@ fn interpret_chat_completion(
         .map_err(|e| SupervisorError::Http(format!("unparseable response body: {e}")))?;
     let message = json
         .pointer("/choices/0/message")
-        .ok_or_else(|| {
-            SupervisorError::Http("response has no first-choice message".to_string())
-        })?;
+        .ok_or_else(|| SupervisorError::Http("response has no first-choice message".to_string()))?;
     let content = message_text(message, "content");
     let reasoning = message_text(message, "reasoning_content");
     let finish_reason = json
@@ -2921,8 +2961,16 @@ pub async fn benchmark_completion(
     max_tokens: u32,
     timeout: Duration,
 ) -> Result<BenchmarkSample, SupervisorError> {
-    benchmark_completion_seeded(base_url, model, messages, temperature, max_tokens, None, timeout)
-        .await
+    benchmark_completion_seeded(
+        base_url,
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        None,
+        timeout,
+    )
+    .await
 }
 
 /// [`benchmark_completion`] with a fixed sampling seed (Bench
@@ -3069,9 +3117,10 @@ pub enum SupervisorError {
     NotFound(String),
     #[error("process already running: {0}")]
     AlreadyRunning(String),
-    #[error("port {0} is already in use")]
-    PortInUse(u16),
-    #[error("drain timed out for {0}")]
+    /// The port and who holds it (" by <program> (pid N)", or empty).
+    #[error("port {0} is already in use{1}")]
+    PortInUse(u16, String),
+    #[error("{0} did not exit within {secs} s of being killed", secs = KILL_REAP_TIMEOUT.as_secs())]
     DrainTimeout(String),
     #[error("health probe failed for {0}: {1}")]
     ProbeFailed(String, String),
@@ -3700,9 +3749,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let err_log = dir.join("backend-t.stderr.log");
         let (program, args) = if cfg!(windows) {
-            ("cmd", vec!["/C".to_string(), "echo to-stderr 1>&2".to_string()])
+            (
+                "cmd",
+                vec!["/C".to_string(), "echo to-stderr 1>&2".to_string()],
+            )
         } else {
-            ("/bin/sh", vec!["-c".to_string(), "echo to-stderr >&2".to_string()])
+            (
+                "/bin/sh",
+                vec!["-c".to_string(), "echo to-stderr >&2".to_string()],
+            )
         };
         let ring = test_ring();
         let mut proc = SupervisedProcess::spawn_with_logs(
@@ -4128,7 +4183,7 @@ mod tests {
         sup.register_spec(spec);
 
         let err = sup.spawn_backend("web").await.unwrap_err();
-        assert!(matches!(err, SupervisorError::PortInUse(p) if p == port));
+        assert!(matches!(err, SupervisorError::PortInUse(p, _) if p == port));
         // Nothing was spawned, and the failed start reads as failed
         // with its reason rather than an idle "stopped".
         let st = &sup.status()[0];
@@ -4459,6 +4514,110 @@ mod tests {
         assert_eq!(page.records[1].line, "b-two");
     }
 
+    /// B21: a start that fails before a process exists leaves no output
+    /// of its own, so every retained line is the previous run's.
+    #[tokio::test]
+    async fn a_failed_spawn_archives_the_previous_runs_lines() {
+        let mut sup = Supervisor::new(test_policy());
+        sup.register_spec(ext_spec("a"));
+        sup.spawn_backend("a").await.unwrap();
+        sup.live["a"].note(LogStream::Stderr, "previous run".to_string());
+        sup.stop("a", false).await.unwrap();
+        assert!(sup
+            .logs_query("a", None, None, 10)
+            .records
+            .iter()
+            .all(|r| !r.archived));
+        let mut spec = ext_spec("a");
+        spec.program = PathBuf::from("nonexistent-binary-xyz");
+        sup.register_spec(spec);
+        for _ in 0..2 {
+            sup.spawn_backend("a").await.unwrap_err();
+            let logs = sup.logs_query("a", None, None, 10);
+            assert!(logs.records.iter().any(|r| r.line == "previous run"));
+            assert!(logs.records.iter().all(|r| r.archived), "{logs:?}");
+        }
+    }
+
+    /// B21: a port held by another program fails the start quickly and
+    /// names the holder.
+    #[tokio::test]
+    async fn port_in_use_fails_fast_and_names_the_holder() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let mut sup = Supervisor::new(test_policy());
+        let mut spec = ext_spec("web");
+        spec.port = Some(port);
+        sup.register_spec(spec);
+        let started = Instant::now();
+        let err = sup.spawn_backend("web").await.unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+        assert!(
+            err.starts_with(&format!("port {port} is already in use")),
+            "{err}"
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                err.contains(&format!("(pid {})", std::process::id())),
+                "{err}"
+            );
+            assert!(err.contains(".exe"), "{err}");
+        }
+    }
+
+    /// B21: the same program still exiting (or a pid already gone) may
+    /// be this backend's own dying process; anything else is not.
+    #[test]
+    fn only_the_backends_own_dying_process_is_waited_out() {
+        let own = std::env::current_exe().unwrap();
+        let me = std::process::id();
+        assert!(!holder_may_be_dying(None, &own));
+        assert!(!holder_may_be_dying(Some(me), Path::new("other-program")));
+        #[cfg(windows)]
+        assert!(holder_may_be_dying(Some(me), &own));
+        assert!(holder_may_be_dying(
+            Some(dead_pid()),
+            Path::new("other-program")
+        ));
+    }
+
+    /// An adopted process is the child of somebody who may never reap
+    /// it: its exit counts, not its removal from the process table.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_zombie_is_not_alive() {
+        let mut child = ext_sleeper();
+        let pid = child.id();
+        assert!(pid_alive(pid));
+        child.kill().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pid_alive(pid), "not reaped, but exited");
+        child.wait().unwrap();
+    }
+
+    fn dead_pid() -> u32 {
+        let mut child = ext_sleeper();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A15: a killed process that mapped a large model takes many
+    /// seconds to leave the process table.
+    #[test]
+    fn a_killed_process_gets_half_a_minute_to_exit() {
+        assert_eq!(KILL_REAP_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(
+            SupervisorError::DrainTimeout("a".into()).to_string(),
+            "a did not exit within 30 s of being killed"
+        );
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn logs_survive_respawn_as_one_archived_generation() {
@@ -4705,7 +4864,9 @@ mod tests {
         assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
         assert!(r.chat_template_tool_use);
         assert_eq!(
-            r.chat_template_caps.as_ref().and_then(|c| c["supports_tools"].as_bool()),
+            r.chat_template_caps
+                .as_ref()
+                .and_then(|c| c["supports_tools"].as_bool()),
             Some(true)
         );
         assert!(r.detail.contains("probe_get_weather"), "{}", r.detail);
@@ -4798,7 +4959,10 @@ mod tests {
         let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking at length about the plan"},"finish_reason":"length"}],"usage":{"prompt_tokens":4500,"completion_tokens":4096}}"#;
         let err = interpret_chat_completion(200, body, 200_000, 4096).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("spent the full 4096-token budget on reasoning"), "{msg}");
+        assert!(
+            msg.contains("spent the full 4096-token budget on reasoning"),
+            "{msg}"
+        );
         assert!(msg.contains("finish_reason length"), "{msg}");
         assert!(msg.contains("completion_tokens 4096"), "{msg}");
     }
@@ -4850,6 +5014,41 @@ mod tests {
         assert_eq!(r.status, 200);
         assert_eq!(r.content.as_deref(), Some("ok"));
         assert_eq!(r.prompt_tokens, None);
+    }
+
+    /// Field failure on real hardware: a thinking model spent the test's
+    /// 16 tokens on reasoning, so a healthy backend looked broken. The
+    /// request asks for no thinking; when a template ignores that, the
+    /// reasoning text is reported.
+    #[tokio::test]
+    async fn test_request_disables_thinking_and_reports_reasoning() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let req = read_http_request(&mut sock).await;
+            let _ = tx.send(String::from_utf8_lossy(&req).to_string());
+            let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"The user wants"},"finish_reason":"length"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let r = test_request(&format!("http://127.0.0.1:{port}"), "hi")
+            .await
+            .unwrap();
+        let req = rx.await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(v["max_tokens"], 16);
+        // Sampled, the field model ended its reply at once in 5 of 40 tests.
+        assert_eq!(v["temperature"], 0);
+        let out = serde_json::to_value(&r).unwrap();
+        assert_eq!(out["reasoning_content"], "The user wants");
     }
 
     #[tokio::test]

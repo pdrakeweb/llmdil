@@ -39,6 +39,16 @@ use serde_json::{json, Value};
 
 use crate::{ApiError, AppState, TaskStatus};
 
+mod arms;
+mod generate;
+mod sweep;
+
+use arms::*;
+// The debug console judges GPU conflicts with the same placement.
+pub(crate) use arms::{bench_placement, BenchPlacement};
+pub use generate::*;
+use sweep::*;
+
 // ---------------------------------------------------------------------------
 // Shared job state (AppState fields)
 // ---------------------------------------------------------------------------
@@ -89,7 +99,7 @@ fn load_prompts(state: &AppState) -> mb::PromptLibrary {
     let mut lib = mb::PromptLibrary::load(&prompts_path(state)).unwrap_or_default();
     if lib.materialize_shipped() {
         if let Err(e) = lib.save(&prompts_path(state)) {
-            eprintln!("bench: prompt library save failed: {e}");
+            tracing::warn!("bench: prompt library save failed: {e}");
         }
     }
     lib
@@ -101,7 +111,7 @@ fn load_results(state: &AppState) -> mb::BenchResults {
 
 fn save_results(state: &AppState, results: &mb::BenchResults) {
     if let Err(e) = results.save(&results_path(state)) {
-        eprintln!("bench: results save failed: {e}");
+        tracing::warn!("bench: results save failed: {e}");
     }
 }
 
@@ -111,7 +121,8 @@ fn prompts_payload(lib: &mb::PromptLibrary) -> Value {
 
 fn results_payload(state: &AppState, results: &mb::BenchResults) -> Value {
     let job = state
-        .bench_job
+        .bench
+        .job
         .try_lock()
         .ok()
         .and_then(|guard| (*guard).clone());
@@ -120,6 +131,9 @@ fn results_payload(state: &AppState, results: &mb::BenchResults) -> Value {
         .iter()
         .map(|s| {
             let mut v = serde_json::to_value(s).unwrap_or(Value::Null);
+            // Per-condition generation winners; `clear: false` is
+            // "no clear winner".
+            v["winners"] = json!(mb::condition_winners(s));
             if let (Some(job), Some(obj)) = (&job, v.as_object_mut()) {
                 if obj.get("id").and_then(|i| i.as_str()) == Some(job.sweep_id.as_str())
                     && obj.get("status").and_then(|s| s.as_str()) == Some("running")
@@ -194,7 +208,7 @@ fn load_journal(state: &AppState) -> BenchJournal {
 
 fn save_journal(state: &AppState, journal: &BenchJournal) {
     if let Err(e) = journal.save(&journal_path(state)) {
-        eprintln!("bench: journal save failed: {e}");
+        tracing::warn!("bench: journal save failed: {e}");
     }
 }
 
@@ -237,7 +251,7 @@ pub async fn startup_sweep(state: &AppState) {
             }
             if manager_config::save(&new_cfg, &state.config_path).is_ok() {
                 *live = new_cfg;
-                eprintln!(
+                tracing::info!(
                     "bench: startup sweep removed leftover temp backends from config: {}",
                     removed.join(", ")
                 );
@@ -253,11 +267,11 @@ pub async fn startup_sweep(state: &AppState) {
                 || manager_supervisor::process_image_is(pid, "llama-server");
             if alive && image {
                 match manager_wizard::ops::kill_process(pid) {
-                    Ok(()) => eprintln!(
+                    Ok(()) => tracing::info!(
                         "bench: startup sweep terminated leftover {} (pid {pid})",
                         record.temp_id
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => tracing::warn!(
                         "bench: startup sweep could not terminate {} (pid {pid}): {e}",
                         record.temp_id
                     ),
@@ -287,8 +301,7 @@ pub async fn startup_sweep(state: &AppState) {
                 if arm.status == mb::ArmStatus::Running || arm.status == mb::ArmStatus::Pending {
                     arm.status = mb::ArmStatus::Cancelled;
                     arm.detail = Some(
-                        "sweep interrupted by an app restart; this arm never completed"
-                            .to_string(),
+                        "sweep interrupted by an app restart; this arm never completed".to_string(),
                     );
                 }
             }
@@ -315,8 +328,21 @@ pub async fn op_bench_prompts_list(
 pub async fn op_bench_prompt_save(
     state: &Arc<AppState>,
     _sink: &Arc<dyn crate::EventSink>,
-    entry: Value,
+    mut entry: Value,
 ) -> crate::ApiResult {
+    // The fields this op sets itself may be absent (an API client has
+    // no reason to know them).
+    if let Some(obj) = entry.as_object_mut() {
+        for (key, value) in [
+            ("id", json!("")),
+            ("sha256", json!("")),
+            ("origin", json!(mb::PromptOrigin::User)),
+            ("version", json!(1)),
+            ("updated_ms", json!(0)),
+        ] {
+            obj.entry(key).or_insert(value);
+        }
+    }
     let mut entry: mb::PromptEntry = serde_json::from_value(entry)
         .map_err(|e| ApiError::InvalidInput(format!("invalid prompt entry: {e}")))?;
     if entry.name.trim().is_empty() {
@@ -342,10 +368,13 @@ pub async fn op_bench_prompt_save(
     }
     entry.sha256 = mb::prompt_sha256(&entry.body);
     entry.updated_ms = now_ms();
+    let id = entry.id.clone();
     lib.upsert(entry);
     lib.save(&prompts_path(state))
         .map_err(|e| ApiError::InvalidInput(format!("prompt save failed: {e}")))?;
-    Ok(prompts_payload(&lib))
+    let mut payload = prompts_payload(&lib);
+    payload["id"] = json!(id);
+    Ok(payload)
 }
 
 pub async fn op_bench_prompt_delete(
@@ -375,7 +404,11 @@ fn unique_prompt_id(lib: &mb::PromptLibrary, name: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("-");
-    let base = if slug.is_empty() { "prompt".to_string() } else { slug };
+    let base = if slug.is_empty() {
+        "prompt".to_string()
+    } else {
+        slug
+    };
     if lib.entries.iter().all(|e| e.id != base) {
         return base;
     }
@@ -389,1197 +422,67 @@ fn unique_prompt_id(lib: &mb::PromptLibrary, name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt generation (§4.3): the consultation transport aimed at
-// the best running backend; the draft lands UNSAVED in the
-// editor. Never starts a backend; never auto-promotes.
-// ---------------------------------------------------------------------------
-
-const GENERATE_TEMPERATURE: f32 = 0.7;
-const GENERATE_TIMEOUT: Duration = Duration::from_secs(900);
-
-pub async fn op_bench_prompt_generate(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn crate::EventSink>,
-    purpose: String,
-    description: String,
-    size: String,
-    backend_id: Option<String>,
-) -> crate::ApiResult {
-    let (target_tokens, max_tokens) = match size.as_str() {
-        "short" => (500u32, 1_200u32),
-        "standard" => (4_000u32, 7_000u32),
-        other => {
-            return Err(ApiError::InvalidInput(format!(
-                "unknown prompt size '{other}' (short | standard)"
-            )))
-        }
-    };
-    if description.trim().is_empty() {
-        return Err(ApiError::InvalidInput(
-            "describe the prompt to generate".to_string(),
-        ));
-    }
-    let cfg = state.config.read().await.clone();
-    // Running set from the shared liveness view, exactly as the interlock
-    // reads it.
-    // The running set is the shared liveness view (supervisor and
-    // SCM alike): a service-managed backend holding the GPU counts
-    // exactly like a supervised one.
-    let running: HashSet<String> = crate::lifecycle::backend_liveness(state)
-        .await
-        .into_values()
-        .filter(|l| l.state.is_live())
-        .map(|l| l.id)
-        .collect();
-    let backend = match &backend_id {
-        Some(id) => {
-            let b = cfg
-                .backends
-                .iter()
-                .find(|b| &b.id == id)
-                .ok_or_else(|| ApiError::NotFound(format!("no backend '{id}'")))?;
-            if !running.contains(id) {
-                return Err(ApiError::InvalidInput(format!(
-                    "backend '{id}' is not running; generation never starts a backend"
-                )));
-            }
-            b.clone()
-        }
-        None => {
-            // Best running backend by rated context (the
-            // consultation's pick, §4.3).
-            let mut candidates: Vec<&BackendConfig> = cfg
-                .backends
-                .iter()
-                .filter(|b| running.contains(&b.id))
-                .collect();
-            candidates.sort_by_key(|b| std::cmp::Reverse(b.flags.n_ctx));
-            candidates
-                .first()
-                .copied()
-                .cloned()
-                .ok_or_else(|| {
-                    ApiError::InvalidInput(
-                        "no backend is running; generation never starts a backend".to_string(),
-                    )
-                })?
-        }
-    };
-    let task_id = state
-        .record_task(
-            "bench-prompt-generate",
-            json!({ "backend": backend.id, "purpose": purpose, "size": size }),
-        )
-        .await;
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    {
-        let mut slot = state.bench_generate_abort.lock().await;
-        if slot.is_some() {
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "error": "a prompt generation is already running" }),
-                )
-                .await;
-            return Err(ApiError::InvalidInput(
-                "a prompt generation is already running".to_string(),
-            ));
-        }
-        *slot = Some(tx);
-    }
-    let model_name = crate::model_for_backend(&cfg, &backend)
-        .map(|m| m.id.clone())
-        .unwrap_or_else(|| backend.id.clone());
-    let system_prompt = format!(
-        "You write benchmark prompts for a local LLM benchmarking tool. \
-         Output ONLY the prompt text itself — no commentary, no preamble, no markdown fences. \
-         The prompt must be fully self-contained: every piece of material the model needs \
-         (code, documents, data) is inside the prompt itself. \
-         Purpose tag: {purpose}. Target length: about {target_tokens} tokens. \
-         For a coder prompt, include real, coherent code with consistent identifiers and an \
-         edit-or-continue task that deliberately reuses those identifiers. \
-         For a planner prompt, state a constrained problem with explicit constraints and a \
-         concrete deliverable. \
-         For a tool-runner prompt, describe a scenario that calls for structured, tool-style \
-         steps over concrete data included in the prompt. \
-         For a general prompt, include substantive source text and a question over it."
-    );
-    let messages = vec![
-        manager_supervisor::ChatMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-        },
-        manager_supervisor::ChatMessage {
-            role: "user".to_string(),
-            content: description.trim().to_string(),
-        },
-    ];
-    let base_url = format!("http://127.0.0.1:{}", backend.port);
-    let completion = manager_supervisor::chat_completion(
-        &base_url,
-        &model_name,
-        &messages,
-        GENERATE_TEMPERATURE,
-        max_tokens,
-        GENERATE_TIMEOUT,
-    );
-    let outcome = tokio::select! {
-        res = completion => Some(res),
-        _ = rx => None,
-    };
-    {
-        let mut slot = state.bench_generate_abort.lock().await;
-        *slot = None;
-    }
-    match outcome {
-        None => {
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Aborted,
-                    json!({ "backend": backend.id }),
-                )
-                .await;
-            Err(ApiError::InvalidInput(
-                "prompt generation cancelled".to_string(),
-            ))
-        }
-        Some(Err(e)) => {
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Failed,
-                    json!({ "error": e.to_string() }),
-                )
-                .await;
-            Err(ApiError::InvalidInput(format!(
-                "prompt generation failed: {e}"
-            )))
-        }
-        Some(Ok(result)) => {
-            if result.content.trim().is_empty() {
-                state
-                    .finish_task(
-                        &task_id,
-                        TaskStatus::Failed,
-                        json!({ "error": "the backend returned an empty draft" }),
-                    )
-                    .await;
-                return Err(ApiError::InvalidInput(format!(
-                    "backend '{}' returned an empty draft ({} transport bytes, {} reasoning bytes)",
-                    backend.id, result.response_bytes, result.reasoning_bytes
-                )));
-            }
-            state
-                .finish_task(
-                    &task_id,
-                    TaskStatus::Done,
-                    json!({ "backend": backend.id, "chars": result.content.len() }),
-                )
-                .await;
-            Ok(json!({
-                "text": result.content,
-                "backend_id": backend.id,
-                "model": model_name,
-            }))
-        }
-    }
-}
-
-pub async fn op_bench_prompt_generate_cancel(
-    state: &Arc<AppState>,
-    _sink: &Arc<dyn crate::EventSink>,
-) -> crate::ApiResult {
-    let sender = {
-        let mut slot = state.bench_generate_abort.lock().await;
-        slot.take()
-    };
-    match sender {
-        Some(tx) => {
-            let _ = tx.send(());
-            Ok(json!({ "cancelled": true }))
-        }
-        None => Ok(json!({ "cancelled": false })),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GGUF header facts for validation pruning (§3.2): the model's
-// trained context length and the tokenizer's vocabulary size,
-// read from the file's metadata. The app's layout parser does
-// not carry these two keys, so this is a minimal metadata walk
-// (integers and the tokens array's element count only).
-// ---------------------------------------------------------------------------
-
-fn gguf_header_facts(path: &PathBuf) -> (Option<u32>, Option<u32>) {
-    use std::io::Read;
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (None, None),
-    };
-    // Headers with a full token array run to a few MB; cap the
-    // walk so a hostile file cannot make it read unboundedly.
-    let mut buf = Vec::new();
-    let _ = file
-        .by_ref()
-        .take(64 * 1024 * 1024)
-        .read_to_end(&mut buf);
-    parse_gguf_facts(&buf)
-}
-
-fn parse_gguf_facts(buf: &[u8]) -> (Option<u32>, Option<u32>) {
-    walk_gguf_facts(buf).unwrap_or((None, None))
-}
-
-fn walk_gguf_facts(buf: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
-    struct R<'a> {
-        b: &'a [u8],
-        p: usize,
-    }
-    impl<'a> R<'a> {
-        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-            let end = self.p.checked_add(n)?;
-            let s = self.b.get(self.p..end)?;
-            self.p = end;
-            Some(s)
-        }
-        fn u32(&mut self) -> Option<u32> {
-            Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-        }
-        fn u64(&mut self) -> Option<u64> {
-            Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
-        }
-        fn string(&mut self) -> Option<String> {
-            let n = self.u64()? as usize;
-            Some(String::from_utf8_lossy(self.take(n)?).into_owned())
-        }
-        /// Skip one metadata value of the given GGUF type,
-        /// reporting the tokens-array element count when the
-        /// value is an array (the caller wants exactly one).
-        fn skip_value(&mut self, ty: u32) -> Option<Option<u64>> {
-            match ty {
-                0 | 1 | 7 => {
-                    self.take(1)?;
-                    Some(None)
-                }
-                2 | 3 => {
-                    self.take(2)?;
-                    Some(None)
-                }
-                4..=6 => {
-                    self.take(4)?;
-                    Some(None)
-                }
-                8 => {
-                    let n = self.u64()? as usize;
-                    self.take(n)?;
-                    Some(None)
-                }
-                9 => {
-                    let elem_ty = self.u32()?;
-                    let count = self.u64()?;
-                    for _ in 0..count {
-                        self.skip_value(elem_ty)?;
-                    }
-                    Some(Some(count))
-                }
-                10..=12 => {
-                    self.take(8)?;
-                    Some(None)
-                }
-                _ => None,
-            }
-        }
-        fn int_value(&mut self, ty: u32) -> Option<u64> {
-            match ty {
-                0 => Some(self.take(1)?[0] as u64),
-                2 => Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?) as u64),
-                4 => Some(self.u32()? as u64),
-                5 => Some(self.take(4).map(|b| {
-                    i32::from_le_bytes(b.try_into().unwrap()) as u64
-                })?),
-                10 => self.u64(),
-                11 => Some(self.u64()?),
-                _ => {
-                    self.skip_value(ty)?;
-                    None
-                }
-            }
-        }
-    }
-    let mut r = R { b: buf, p: 0 };
-    if r.take(4)? != b"GGUF" {
-        return None;
-    }
-    let _version = r.u32();
-    let _tensor_count = r.u64()?;
-    let kv_count = r.u64()?;
-    let mut arch: Option<String> = None;
-    let mut ctx_len: Option<u32> = None;
-    let mut vocab: Option<u32> = None;
-    for _ in 0..kv_count {
-        let key = match r.string() {
-            Some(k) => k,
-            None => break,
-        };
-        let ty = match r.u32() {
-            Some(t) => t,
-            None => break,
-        };
-        if key == "general.architecture" && ty == 8 {
-            arch = r.string();
-            let _ = &arch;
-            continue;
-        }
-        if key == "tokenizer.ggml.tokens" && ty == 9 {
-            // Read the array header, record the count, then
-            // skip the elements.
-            let elem_ty = match r.u32() {
-                Some(t) => t,
-                None => break,
-            };
-            let count = match r.u64() {
-                Some(c) => c,
-                None => break,
-            };
-            vocab = Some(count as u32);
-            let mut ok = true;
-            for _ in 0..count {
-                if r.skip_value(elem_ty).is_none() {
-                    ok = false;
-                    break;
-                }
-            }
-            if !ok {
-                break;
-            }
-            continue;
-        }
-        if ty != 9 && key.ends_with(".context_length") {
-            if let Some(v) = r.int_value(ty) {
-                ctx_len = Some(v as u32);
-            }
-            continue;
-        }
-        if r.skip_value(ty).is_none() {
-            break;
-        }
-    }
-    let _ = arch;
-    Some((ctx_len, vocab))
-}
-
-// ---------------------------------------------------------------------------
-// Sweep request, interlock, preflight (design §3, §6.1–§6.3)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SweepRequest {
-    backend_id: String,
-    prompt_id: String,
-    #[serde(default)]
-    temperature: f32,
-    #[serde(default)]
-    confirm_at_06: bool,
-    #[serde(default)]
-    correctness_control: bool,
-    #[serde(default)]
-    stop_backend_ids: Vec<String>,
-    #[serde(default)]
-    preset: Option<String>,
-    #[serde(default)]
-    dimensions: Option<Vec<Vec<mb::ArmVariant>>>,
-    #[serde(default)]
-    draft_model_id: Option<String>,
-    #[serde(default)]
-    baseline_arm_index: usize,
-}
-
-/// The target backend's current axes, read from its saved
-/// configuration: the base every sweep variant merges over.
-fn base_arm_spec(target: &BackendConfig) -> mb::ArmSpec {
-    let raw = target.raw_flags.as_deref().unwrap_or("");
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
-    let mut cache_k = mb::CacheType::F16;
-    let mut cache_v = mb::CacheType::F16;
-    let mut flash = mb::FlashAttn::Auto;
-    let mut i = 0;
-    while i < tokens.len() {
-        let t = tokens[i];
-        let (flag, inline_val) = match t.split_once('=') {
-            Some((f, v)) => (f, Some(v.to_string())),
-            None => (t, None),
-        };
-        let val = |i: &mut usize| -> Option<String> {
-            if let Some(v) = &inline_val {
-                return Some(v.clone());
-            }
-            *i += 1;
-            tokens.get(*i).map(|s| s.to_string())
-        };
-        match flag {
-            "--cache-type-k" | "-ctk" => {
-                if let Some(v) = val(&mut i) {
-                    cache_k = parse_cache_type(&v).unwrap_or(cache_k);
-                }
-            }
-            "--cache-type-v" | "-ctv" => {
-                if let Some(v) = val(&mut i) {
-                    cache_v = parse_cache_type(&v).unwrap_or(cache_v);
-                }
-            }
-            "--flash-attn" => {
-                if let Some(v) = val(&mut i) {
-                    flash = match v.as_str() {
-                        "on" => mb::FlashAttn::On,
-                        "off" => mb::FlashAttn::Off,
-                        _ => mb::FlashAttn::Auto,
-                    };
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    // The target's effective expert offload, decoded from its
-    // raw flags and re-spelled in the canonical form the app
-    // itself writes: an MoE backend's arms record the position
-    // they run at (the arm label names it), and the offload
-    // dimension sweeps positions from this base. The launch
-    // rewrite strips the base's expert tokens and appends this
-    // expression, so the launched position is the same one —
-    // only its spelling is canonical. `None` when the backend
-    // offloads nothing: its arms carry no offload expression
-    // and the base tokens pass through untouched.
-    let offload_expr = manager_models::offload_flag_string(manager_models::expert_offload(
-        target.raw_flags.as_deref(),
-    ));
-    mb::ArmSpec {
-        cache_k,
-        cache_v,
-        flash_attn: flash,
-        depth: 0,
-        n_ctx: target.flags.n_ctx,
-        spec: mb::SpecKind::None,
-        ngram_n_min: None,
-        draft_model_id: None,
-        draft_n_max: None,
-        draft_device: mb::DraftDevice::TargetGpu,
-        draft_cache_k: mb::CacheType::Q8_0,
-        draft_cache_v: mb::CacheType::Q8_0,
-        offload_expr,
-    }
-}
-
-fn parse_cache_type(s: &str) -> Option<mb::CacheType> {
-    match s {
-        "f16" => Some(mb::CacheType::F16),
-        "q8_0" => Some(mb::CacheType::Q8_0),
-        "q4_0" => Some(mb::CacheType::Q4_0),
-        _ => None,
-    }
-}
-
-/// Does this backend run layers on the CPU (experts or all
-/// layers)? The CPU-offload contention class of §6.2.
-fn cpu_offload(b: &BackendConfig) -> bool {
-    !matches!(
-        manager_models::expert_offload(b.raw_flags.as_deref()),
-        manager_models::ExpertOffload::None
-    ) || matches!(crate::backend_gpu_visibility(b), crate::GpuVisibility::CpuOnly)
-}
-
-/// A backend's GPU placement as the interlock judges it (§6.1).
-///
-/// This is deliberately NOT `crate::backend_gpu_visibility`:
-/// that function reports `Undetermined` for any backend whose
-/// device selection lives in raw flags and is not exactly
-/// {GPU 0}, because the LAUNCH path will not remap a raw
-/// selection it does not model (code-review 4.4) and launches it
-/// unrestricted instead. For conflict purposes a parsed raw
-/// selection is determinate evidence of where the backend runs:
-/// a backend raw-pinned to GPU 1 (`--tensor-split 0,1`,
-/// `--device CUDA1`, `--main-gpu 1`) shares no GPU with a GPU-0
-/// target, and judging it Undetermined made it conflict with
-/// every sweep on the machine. Only a selection that does not
-/// parse stays Undetermined here, and an Undetermined placement
-/// still conflicts with everything (conservative: a sweep that
-/// cannot prove isolation does not run).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum BenchPlacement {
-    CpuOnly,
-    Gpus(std::collections::BTreeSet<u32>),
-    Undetermined,
-}
-
-pub(crate) fn bench_placement(b: &BackendConfig) -> BenchPlacement {
-    if crate::raw_flags_pin_cpu_only(b.raw_flags.as_deref()) {
-        return BenchPlacement::CpuOnly;
-    }
-    if !b.flags.tensor_split.is_empty() {
-        // A structured split remains the source of truth and a
-        // raw selection yields to it, as in the launch path.
-        let placed: std::collections::BTreeSet<u32> = b
-            .flags
-            .tensor_split
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| **f > 0.0)
-            .map(|(i, _)| i as u32)
-            .collect();
-        return if placed.is_empty() {
-            BenchPlacement::Undetermined
-        } else {
-            BenchPlacement::Gpus(placed)
-        };
-    }
-    match crate::raw_device_selection(b.raw_flags.as_deref()) {
-        crate::RawDeviceSelection::Set(set) => BenchPlacement::Gpus(set),
-        // Unsplit with no raw selection: llama.cpp's main GPU.
-        crate::RawDeviceSelection::None => {
-            BenchPlacement::Gpus(std::collections::BTreeSet::from([0]))
-        }
-        crate::RawDeviceSelection::Unparseable => BenchPlacement::Undetermined,
-    }
-}
-
-/// The running backends that conflict with a sweep against
-/// `target` (§6.1/§6.2): any backend sharing a GPU with the
-/// target's placement, the target itself, and — when the TARGET
-/// runs layers on the CPU — any other CPU-offload backend (the
-/// CPU is shared by every MoE backend's experts, §3.4/§6.2; the
-/// rule binds on the target's offload, not on any running
-/// backend's). An undetermined placement conflicts with
-/// everything (conservative: a sweep that cannot prove isolation
-/// does not run).
-fn interlock_conflicts(
-    cfg: &AppConfig,
-    running: &HashSet<String>,
-    target: &BackendConfig,
-) -> Vec<String> {
-    let target_place = bench_placement(target);
-    let target_cpu = cpu_offload(target);
-    let mut out: Vec<String> = Vec::new();
-    for b in &cfg.backends {
-        if !running.contains(&b.id) {
-            continue;
-        }
-        if b.id == target.id {
-            out.push(b.id.clone());
-            continue;
-        }
-        let place = bench_placement(b);
-        let gpu_conflict = match (&target_place, &place) {
-            (BenchPlacement::Gpus(a), BenchPlacement::Gpus(bset)) => {
-                a.iter().any(|g| bset.contains(g))
-            }
-            (BenchPlacement::CpuOnly, _) | (_, BenchPlacement::CpuOnly) => false,
-            _ => true, // Undetermined on either side
-        };
-        let cpu_conflict = target_cpu && cpu_offload(b);
-        if gpu_conflict || cpu_conflict {
-            out.push(b.id.clone());
-        }
-    }
-    out
-}
-
-/// Guaranteed cleanup for one bench temp backend, on the
-/// experiment pattern: stop it when live, unregister its spec,
-/// remove its journal record. Runs outside the arm future, so
-/// neither cancellation nor failure can skip it.
-async fn cleanup_bench_temp(state: &AppState, temp_id: &str) {
-    {
-        let mut sup = state.supervisor().await.lock().await;
-        sup.reap_exited();
-        let live = sup
-            .status()
-            .iter()
-            .any(|s| s.id == temp_id && s.pid.is_some());
-        if live {
-            let _ = sup.stop(temp_id, false).await;
-        }
-        sup.unregister_spec(temp_id);
-    }
-    let mut journal = load_journal(state);
-    if journal.remove_active(temp_id) {
-        save_journal(state, &journal);
-    }
-}
-
-/// POST /tokenize against a bench backend: the measured token
-/// count of a text. None when the endpoint does not answer
-/// (older builds) — callers fall back to a character estimate.
-async fn tokenize_count(base_url: &str, text: &str) -> Option<u32> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .ok()?;
-    let resp = client
-        .post(format!("{base_url}/tokenize"))
-        .header("content-type", "application/json")
-        .body(serde_json::to_string(&json!({ "content": text })).ok()?)
-        .send()
-        .await
-        .ok()?;
-    let text_body = resp.text().await.ok()?;
-    let body: Value = serde_json::from_str(&text_body).ok()?;
-    body.get("tokens")
-        .and_then(|t| t.as_array())
-        .map(|a| a.len() as u32)
-}
-
-/// Word-set overlap of a candidate output against the baseline
-/// output (the correctness control's divergence measure, §2.1):
-/// the share of the baseline's distinct words that also appear
-/// in the candidate. Identical greedy outputs score 1.0.
-fn word_overlap(baseline: &str, candidate: &str) -> f64 {
-    let base: HashSet<&str> = baseline.split_whitespace().collect();
-    if base.is_empty() {
-        return 1.0;
-    }
-    let cand: HashSet<&str> = candidate.split_whitespace().collect();
-    let shared = base.intersection(&cand).count();
-    shared as f64 / base.len() as f64
-}
-
-// ---------------------------------------------------------------------------
-// One arm's run (§2.1 protocol): temp backend, preflight,
-// tokenized depth padding, warm-up + measured runs, spec log
-// collection, VRAM peak sampling.
-// ---------------------------------------------------------------------------
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(900);
-const FIXED_SEED: u32 = 42;
-
-struct ArmOutcomeData {
-    status: mb::ArmStatus,
-    detail: Option<String>,
-    runs: Vec<mb::RunRow>,
-    peak_vram_mib: Option<u64>,
-    /// First measured run's output text (correctness control).
-    first_output: Option<String>,
-    /// The sweep's llama build, learned from this arm's server.
-    llama_build: Option<String>,
-    /// The library prompt's tokenized count, learned per sweep.
-    prompt_tokens: Option<u32>,
-}
-
-/// The log lines a request added to the temp backend's ring,
-/// reduced to the newest window after `before` (the ring's
-/// newest record before the request). Records come back
-/// newest-first; matching the pre-request newest record inside
-/// the post-request page bounds the new window.
-fn new_log_lines(
-    sup: &manager_supervisor::Supervisor,
-    temp_id: &str,
-    before_newest: Option<&manager_supervisor::LogRecord>,
-) -> Vec<String> {
-    let result = sup.logs_query(temp_id, None, None, 4000);
-    let mut lines: Vec<String> = Vec::new();
-    for rec in &result.records {
-        if let Some(b) = before_newest {
-            if rec.ts == b.ts && rec.line == b.line {
-                break;
-            }
-        }
-        lines.push(rec.line.clone());
-    }
-    lines.reverse(); // chronological
-    lines
-}
-
-fn newest_log_record(
-    sup: &manager_supervisor::Supervisor,
-    temp_id: &str,
-) -> Option<manager_supervisor::LogRecord> {
-    sup.logs_query(temp_id, None, None, 1).records.into_iter().next()
-}
-
-/// Parse one request window's lines into a run row.
-fn run_row_from(
-    sample: &manager_supervisor::BenchmarkSample,
-    lines: &[String],
-    warmup: bool,
-    prompt_tokens: Option<u32>,
-) -> mb::RunRow {
-    let mut row = mb::RunRow {
-        warmup,
-        prompt_tps: sample.prompt_per_second,
-        gen_tps: sample.predicted_per_second,
-        ttft_ms: sample.ttft_ms,
-        prompt_tokens,
-        generated_tokens: None,
-        acceptance_rate: None,
-        accepted: None,
-        generated: None,
-        mean_accepted_len: None,
-        drafters: Vec::new(),
-    };
-    // The aggregate line is the request's own verdict; the
-    // statistics lines attribute it per drafter (§1.5).
-    for line in lines {
-        if let Some(acc) = mb::parse_acceptance_line(line) {
-            row.acceptance_rate = Some(acc.rate);
-            row.accepted = Some(acc.accepted);
-            row.generated = Some(acc.generated);
-            row.mean_accepted_len = Some(acc.mean_len);
-            row.generated_tokens = Some(acc.generated as u32);
-        }
-        if let Some(stats) = mb::parse_statistics_line(line) {
-            if let Some(existing) = row
-                .drafters
-                .iter_mut()
-                .find(|d: &&mut mb::DrafterAgg| d.kind == stats.kind)
-            {
-                existing.gen_tokens += stats.gen_tokens;
-                existing.acc_tokens += stats.acc_tokens;
-            } else {
-                row.drafters.push(mb::DrafterAgg {
-                    kind: stats.kind.clone(),
-                    gen_tokens: stats.gen_tokens,
-                    acc_tokens: stats.acc_tokens,
-                });
-            }
-        }
-    }
-    row
-}
-
-/// Immutable per-sweep context the arm runner needs.
-struct SweepCtx {
-    cfg: AppConfig,
-    target: BackendConfig,
-    model_id: String,
-    temperature: f32,
-    draft_path: Option<String>,
-    draft_device_arg: Option<String>,
-}
-
-async fn set_progress(state: &AppState, arm_index: usize, arm_count: usize, phase: &str, run: usize) {
-    if let Ok(mut slot) = state.bench_job.try_lock() {
-        if let Some(job) = slot.as_mut() {
-            job.progress.arm_index = arm_index;
-            job.progress.arm_count = arm_count;
-            job.progress.phase = phase.to_string();
-            job.progress.run = run;
-        }
-    }
-}
-
-/// Save one sweep record into the results store (replace by id
-/// or append).
-fn save_sweep(state: &AppState, record: &mb::SweepRecord) {
-    let mut results = load_results(state);
-    if let Some(existing) = results.sweeps.iter_mut().find(|s| s.id == record.id) {
-        *existing = record.clone();
-    } else {
-        results.sweeps.push(record.clone());
-    }
-    save_results(state, &results);
-}
-
-/// Run one arm end to end. Every failure is data (an
-/// ArmOutcomeData with a non-Measured status), never an Err:
-/// the sweep records it and moves on. Cleanup is the CALLER's
-/// job — it lives outside this future so cancellation cannot
-/// skip it.
-#[allow(clippy::too_many_arguments)]
-async fn run_arm(
-    state: &AppState,
-    ctx: &SweepCtx,
-    sweep_id: &str,
-    arm_index: usize,
-    arm_count: usize,
-    spec: &mb::ArmSpec,
-    raw_flags: &str,
-    port: u16,
-    prompt_body: &str,
-) -> ArmOutcomeData {
-    let mut out = ArmOutcomeData {
-        status: mb::ArmStatus::Failed,
-        detail: None,
-        runs: Vec::new(),
-        peak_vram_mib: None,
-        first_output: None,
-        llama_build: None,
-        prompt_tokens: None,
-    };
-    let temp_id = format!("bench-{}", arm_index + 1);
-    let mut temp = ctx.target.clone();
-    temp.id = temp_id.clone();
-    temp.port = port;
-    temp.flags.n_ctx = spec.n_ctx;
-    // The bench backend runs at the most verbose log level the
-    // app exposes: the per-drafter TRACE statistics (§1.5) are
-    // the combined arms' attribution source.
-    temp.raw_flags = Some(format!("{raw_flags} --verbose"));
-    let mut temp_cfg = ctx.cfg.clone();
-    temp_cfg.backends.push(temp.clone());
-
-    // -- Start preflight (§6.3): the same gate every app-mediated
-    // start passes, evaluated against the cloned config carrying
-    // the temp backend. Its verdicts carry the numbers.
-    if let Err(e) = crate::backend_start_preflight_for(state, &temp_cfg, &temp, false).await {
-        out.status = mb::ArmStatus::PreflightFailed;
-        out.detail = Some(format!("start preflight refused this arm: {e}"));
-        return out;
-    }
-
-    // -- Journal before the spawn, so a crash from here on
-    // leaves a sweep record.
-    {
-        let mut journal = load_journal(state);
-        journal.add_active(ActiveBench {
-            temp_id: temp_id.clone(),
-            pid: None,
-            port,
-            sweep_id: sweep_id.to_string(),
-            started_at: chrono::Utc::now().to_rfc3339(),
-        });
-        save_journal(state, &journal);
-    }
-
-    // -- Register the spec directly and spawn.
-    let pid: Option<u32> = {
-        let store = state.telemetry().await;
-        let gpus = crate::lock_telemetry(&store).inventory();
-        let spec_proc = crate::backend_spec(&ctx.cfg, &temp, &gpus);
-        let mut sup = state.supervisor().await.lock().await;
-        sup.register_spec(spec_proc);
-        if let Err(e) = sup.spawn_backend(&temp_id).await {
-            out.detail = Some(format!("temp backend {temp_id} failed to start: {e:?}"));
-            return out;
-        }
-        sup.status()
-            .into_iter()
-            .find(|s| s.id == temp_id)
-            .and_then(|s| s.pid)
-    };
-    if let Some(pid) = pid {
-        let mut journal = load_journal(state);
-        journal.set_active_pid(&temp_id, pid);
-        save_journal(state, &journal);
-    }
-
-    // -- Wait healthy on the existing probe.
-    if let Err(e) = crate::optimize_experiments::wait_healthy(state, &temp_id, port).await {
-        out.detail = Some(e);
-        return out;
-    }
-    let base_url = format!("http://127.0.0.1:{port}");
-    out.llama_build = manager_supervisor::server_build_info(&base_url).await;
-
-    // -- The measured prompt: the library prompt padded to the
-    // arm's depth with DISTINCT shipped library text (§2.1 —
-    // never repeated filler, which would falsify n-gram
-    // acceptance). Depth 0, or a prompt already at depth, runs
-    // unpadded.
-    let library_tokens = tokenize_count(&base_url, prompt_body).await;
-    out.prompt_tokens = library_tokens;
-    let measured_prompt = match library_tokens {
-        Some(have) if spec.depth > have => {
-            let need = spec.depth - have;
-            let mut pad = String::new();
-            let mut est: u32 = 0;
-            let blocks = mb::padding_blocks();
-            let mut bi = 0usize;
-            while est < need && !blocks.is_empty() {
-                let block = blocks[bi % blocks.len()];
-                // The padding estimate is a character heuristic;
-                // the run rows carry the backend's own prompt
-                // rate, and the depth is the target the padding
-                // aims at, not a claim about the exact fill.
-                est += (block.len() as u32) / 4;
-                pad.push_str(block);
-                pad.push_str("\n\n");
-                bi += 1;
-            }
-            format!("{pad}{prompt_body}")
-        }
-        _ => prompt_body.to_string(),
-    };
-    let measured_tokens = tokenize_count(&base_url, &measured_prompt).await;
-
-    // -- VRAM peak sampling for the arm's duration (§5.1).
-    let peak = Arc::new(std::sync::Mutex::new(Option::<u64>::None));
-    let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sampler = if let Some(pid) = pid {
-        let store = state.telemetry().await;
-        let peak = Arc::clone(&peak);
-        let stop = Arc::clone(&sampler_stop);
-        Some(tokio::spawn(async move {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                {
-                    let guard = crate::lock_telemetry(&store);
-                    let total: u64 = guard
-                        .last_processes()
-                        .iter()
-                        .filter(|p| p.pid == pid)
-                        .filter_map(|p| p.vram_mib)
-                        .sum();
-                    if total > 0 {
-                        let mut slot = peak.lock().unwrap();
-                        *slot = Some(slot.map(|p| p.max(total)).unwrap_or(total));
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        }))
-    } else {
-        None
-    };
-
-    // -- Warm-up (discarded from the medians; its row is kept,
-    // flagged), then the measured runs. The spec-log window for
-    // each request is the ring's growth across that request.
-    let mut first_output: Option<String> = None;
-    let mut failure: Option<String> = None;
-    let phases: Vec<(bool, u32, &str)> = std::iter::once((true, mb::WARMUP_MAX_TOKENS, "warming"))
-        .chain((0..mb::MEASURED_RUNS).map(|_| (false, mb::MEASURED_MAX_TOKENS, "measuring")))
-        .collect();
-    for (step, (warmup, cap, phase)) in phases.iter().enumerate() {
-        set_progress(state, arm_index, arm_count, phase, if *warmup { 0 } else { step }).await;
-        let before = {
-            let sup = state.supervisor().await.lock().await;
-            newest_log_record(&sup, &temp_id)
-        };
-        let messages = vec![manager_supervisor::ChatMessage {
-            role: "user".to_string(),
-            content: measured_prompt.clone(),
-        }];
-        match manager_supervisor::benchmark_completion_seeded(
-            &base_url,
-            &ctx.model_id,
-            &messages,
-            ctx.temperature,
-            *cap,
-            Some(FIXED_SEED),
-            REQUEST_TIMEOUT,
-        )
-        .await
-        {
-            Ok(sample) => {
-                let lines = {
-                    let sup = state.supervisor().await.lock().await;
-                    new_log_lines(&sup, &temp_id, before.as_ref())
-                };
-                let row = run_row_from(&sample, &lines, *warmup, measured_tokens);
-                if !*warmup && first_output.is_none() {
-                    first_output = Some(sample.content.clone());
-                }
-                out.runs.push(row);
-            }
-            Err(e) => {
-                failure = Some(format!(
-                    "{} failed: {e}",
-                    if *warmup { "warm-up" } else { "benchmark run" }
-                ));
-                break;
-            }
-        }
-    }
-    sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Some(handle) = sampler {
-        let _ = handle.await;
-    }
-    out.peak_vram_mib = *peak.lock().unwrap();
-    out.first_output = first_output;
-    match failure {
-        Some(f) => {
-            out.status = mb::ArmStatus::Failed;
-            out.detail = Some(f);
-        }
-        None => {
-            out.status = mb::ArmStatus::Measured;
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// The sweep executor: arms in order, cancellation between and
-// within arms (cleanup always outside the arm future), the
-// correctness control, and the record kept current on disk.
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_sweep(
-    state: &Arc<AppState>,
-    ctx: &SweepCtx,
-    record: &mut mb::SweepRecord,
-    outcomes: Vec<mb::ArmOutcome>,
-    prompt_body: &str,
-    correctness_control: bool,
-    rx: &mut tokio::sync::oneshot::Receiver<()>,
-) -> bool {
-    let arm_count = outcomes.len();
-    let mut used_ports: HashSet<u16> = ctx.cfg.backends.iter().map(|b| b.port).collect();
-    let mut cancelled = false;
-    let mut baseline_output: Option<String> = None;
-    let mut stop_note: Option<String> = None;
-    for (index, outcome) in outcomes.iter().enumerate() {
-        if cancelled || stop_note.is_some() {
-            let arm_rec = &mut record.arms[index];
-            if arm_rec.status == mb::ArmStatus::Pending {
-                arm_rec.status = mb::ArmStatus::Cancelled;
-                arm_rec.detail = Some(
-                    stop_note
-                        .clone()
-                        .unwrap_or_else(|| "sweep cancelled by the operator".to_string()),
-                );
-            }
-            continue;
-        }
-        match outcome {
-            mb::ArmOutcome::Pruned { reason, .. } => {
-                let arm_rec = &mut record.arms[index];
-                arm_rec.status = mb::ArmStatus::Pruned;
-                arm_rec.detail = Some(reason.clone());
-                save_sweep(state, record);
-            }
-            mb::ArmOutcome::Ready(spec) => {
-                let raw_flags = mb::arm_raw_flags(
-                    ctx.target.raw_flags.as_deref(),
-                    spec,
-                    ctx.draft_path.as_deref(),
-                    ctx.draft_device_arg.as_deref(),
-                );
-                {
-                    let arm_rec = &mut record.arms[index];
-                    arm_rec.raw_flags = raw_flags.clone();
-                    arm_rec.status = mb::ArmStatus::Running;
-                    arm_rec.started_ms = Some(now_ms());
-                }
-                save_sweep(state, record);
-                set_progress(state, index, arm_count, "launching", 0).await;
-                let port = manager_optimize::lowest_free_port(
-                    &used_ports,
-                    ctx.cfg.gateway.port,
-                    ctx.cfg.postgres.port,
-                );
-                used_ports.insert(port);
-                let temp_id = format!("bench-{}", index + 1);
-                let arm_future = run_arm(
-                    state,
-                    ctx,
-                    &record.id,
-                    index,
-                    arm_count,
-                    spec,
-                    &raw_flags,
-                    port,
-                    prompt_body,
-                );
-                let data = tokio::select! {
-                    _ = &mut *rx => {
-                        cancelled = true;
-                        None
-                    }
-                    data = arm_future => Some(data),
-                };
-                // Cleanup is outside the arm future: it runs on
-                // completion, failure, and cancellation alike.
-                cleanup_bench_temp(state, &temp_id).await;
-                let arm_rec = &mut record.arms[index];
-                arm_rec.ended_ms = Some(now_ms());
-                match data {
-                    None => {
-                        arm_rec.status = mb::ArmStatus::Cancelled;
-                        arm_rec.detail =
-                            Some("sweep cancelled by the operator".to_string());
-                        record.partial = true;
-                    }
-                    Some(data) => {
-                        arm_rec.status = data.status;
-                        arm_rec.detail = data.detail;
-                        arm_rec.runs = data.runs;
-                        arm_rec.peak_vram_mib = data.peak_vram_mib;
-                        if !arm_rec.runs.is_empty() {
-                            arm_rec.summary = Some(mb::summarize(&arm_rec.runs));
-                        }
-                        if record.llama_build.is_empty() {
-                            if let Some(build) = &data.llama_build {
-                                record.llama_build = build.clone();
-                            }
-                        }
-                        if record.prompt_tokens.is_none() {
-                            record.prompt_tokens = data.prompt_tokens;
-                        }
-                        if index == record.baseline_arm_index {
-                            baseline_output = data.first_output.clone();
-                        }
-                        // Correctness control (§2.1): a spec
-                        // arm whose temperature-0 output
-                        // diverges from the baseline's stops
-                        // the sweep; the divergence is stated
-                        // on the record, never hidden.
-                        if correctness_control
-                            && ctx.temperature == 0.0
-                            && spec.spec != mb::SpecKind::None
-                            && index != record.baseline_arm_index
-                            && arm_rec.status == mb::ArmStatus::Measured
-                        {
-                            if let (Some(base), Some(out_text)) =
-                                (&baseline_output, &data.first_output)
-                            {
-                                let overlap = word_overlap(base, out_text);
-                                if overlap < 0.5 {
-                                    let note = format!(
-                                        "correctness control: arm {} output diverged from the baseline (word overlap {:.0}% < 50%); sweep stopped",
-                                        index + 1,
-                                        overlap * 100.0
-                                    );
-                                    arm_rec.detail = Some(match arm_rec.detail.take() {
-                                        Some(d) => format!("{d} {note}"),
-                                        None => note.clone(),
-                                    });
-                                    stop_note = Some(note);
-                                    record.partial = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                save_sweep(state, record);
-            }
-        }
-    }
-    // Comparability keys (§3.3): one key per sweep — the
-    // held-constant conditions (model identity, runner, prompt,
-    // temperature, llama build) are sweep-level facts. Set once
-    // the build is known from a launched arm; when no arm ever
-    // launched, the key stays empty and the record says so by
-    // absence rather than by a fabricated build string.
-    if !record.llama_build.is_empty() {
-        let key = mb::comparability_key(
-            &record.model,
-            &record.prompt_sha256,
-            record.temperature,
-            &record.llama_build,
-        );
-        for arm in record.arms.iter_mut() {
-            arm.comparability_key = key.clone();
-        }
-    }
-    if cancelled {
-        record.partial = true;
-    }
-    record.status = if record.partial {
-        "partial".to_string()
-    } else {
-        "complete".to_string()
-    };
-    record.ended_ms = Some(now_ms());
-    save_sweep(state, record);
-    cancelled
-}
-
-// ---------------------------------------------------------------------------
 // Sweep ops (§7)
 // ---------------------------------------------------------------------------
 
+/// llama-server's useful sampling range.
+fn check_temperature(t: f32) -> Result<(), ApiError> {
+    if (0.0..=2.0).contains(&t) {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidInput(format!(
+            "temperature {t} is outside 0 to 2"
+        )))
+    }
+}
+
+/// A custom arm's offload expression may only place tensors: it is
+/// appended to the temporary backend's command line, so any other
+/// token would be a llama-server flag of the caller's choosing.
+fn check_offload_expr(expr: &str) -> Result<(), ApiError> {
+    const VALUE_FLAGS: &[&str] = &["-ot", "--override-tensor", "--n-cpu-moe", "-ncmoe"];
+    let mut tokens = expr.split_whitespace();
+    while let Some(t) = tokens.next() {
+        let flag = t.split_once('=').map(|(f, _)| f).unwrap_or(t);
+        let ok = match t {
+            "--cpu-moe" | "-cmoe" => true,
+            _ if !VALUE_FLAGS.contains(&flag) => false,
+            _ if t != flag => true,
+            _ => tokens.next().is_some_and(|v| !v.starts_with('-')),
+        };
+        if !ok {
+            return Err(ApiError::InvalidInput(format!(
+                "offload_expr '{expr}' may hold only expert-offload flags ({}, --cpu-moe)",
+                VALUE_FLAGS.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The other half of "never alongside a measurement or experiment job":
+/// those do not start while a sweep runs.
+pub(crate) async fn refuse_during_sweep(state: &AppState) -> Result<(), ApiError> {
+    match state.bench.job.lock().await.is_some() {
+        true => Err(ApiError::Busy(
+            "a bench sweep is running; wait for it to end or cancel it".to_string(),
+        )),
+        false => Ok(()),
+    }
+}
+
+/// The refusal while another sweep holds the job slot.
+fn sweep_running() -> ApiError {
+    ApiError::Busy("a bench sweep is already running".to_string())
+}
+
+/// Start a sweep. Everything that can be refused is refused here; the
+/// rest — stopping the conflicting backends the caller named, and the
+/// arms — runs in its own task, so the caller gets the sweep id at
+/// once. The answer is the results payload plus `sweep_id` and the
+/// task record's `id` / `kind` / `status`; progress is
+/// `bench_results_list` (the sweep's `progress`, then its final
+/// `status`), and the task carries the outcome.
 pub async fn op_bench_run_start(
     state: &Arc<AppState>,
     sink: &Arc<dyn crate::EventSink>,
@@ -1587,13 +490,12 @@ pub async fn op_bench_run_start(
 ) -> crate::ApiResult {
     let req: SweepRequest = serde_json::from_value(request)
         .map_err(|e| ApiError::InvalidInput(format!("invalid sweep request: {e}")))?;
+    check_temperature(req.temperature)?;
     // One sweep at a time (§6.4), and never alongside a
     // measurement/experiment job (they contend for the same
     // GPUs the interlock reasons about).
-    if state.bench_job.lock().await.is_some() {
-        return Err(ApiError::InvalidInput(
-            "a bench sweep is already running".to_string(),
-        ));
+    if state.bench.job.lock().await.is_some() {
+        return Err(sweep_running());
     }
     // Nor alongside a debug console run (it stops and restores
     // backends on the same GPUs).
@@ -1602,10 +504,19 @@ pub async fn op_bench_run_start(
             "debug console run {run} is running; wait for it or cancel it"
         )));
     }
-    if state.optimize_job_abort.lock().await.is_some() {
-        return Err(ApiError::InvalidInput(
+    if state.optimize.job_abort.lock().await.is_some() {
+        return Err(ApiError::Busy(
             "a measurement or experiment job is already running".to_string(),
         ));
+    }
+    for expr in req
+        .dimensions
+        .iter()
+        .flatten()
+        .flatten()
+        .filter_map(|v| v.offload_expr.as_deref())
+    {
+        check_offload_expr(expr)?;
     }
     let cfg = state.config.read().await.clone();
     let target = cfg
@@ -1655,8 +566,8 @@ pub async fn op_bench_run_start(
     let model_entry = crate::model_for_backend(&cfg, &target).cloned();
     let model_abs = model_entry
         .as_ref()
-        .map(|m| crate::resolve_under_data_dir(&cfg.data_dir, &m.gguf_path))
-        .unwrap_or_else(|| crate::resolve_under_data_dir(&cfg.data_dir, &target.model_file));
+        .map(|m| cfg.resolve_model(&m.gguf_path).path)
+        .unwrap_or_else(|| cfg.resolve_model(&target.model_file).path);
     let (model_ctx_len, target_vocab) = gguf_header_facts(&model_abs);
     let draft_model_id = arms
         .iter()
@@ -1665,11 +576,10 @@ pub async fn op_bench_run_start(
     let (draft_path, draft_vocab) = match &draft_model_id {
         Some(id) => {
             let entry = cfg.models.iter().find(|m| &m.id == id).ok_or_else(|| {
-                ApiError::InvalidInput(format!(
-                    "draft model '{id}' is not a registered model"
-                ))
+                ApiError::InvalidInput(format!("draft model '{id}' is not a registered model"))
             })?;
-            let abs = crate::resolve_under_data_dir(&cfg.data_dir, &entry.gguf_path);
+            // The draft wherever it lives now (hot or cold tier).
+            let abs = cfg.resolve_model(&entry.gguf_path).path;
             let (_, vocab) = gguf_header_facts(&abs);
             (Some(abs.to_string_lossy().into_owned()), vocab)
         }
@@ -1725,6 +635,12 @@ pub async fn op_bench_run_start(
             allowed_layers,
             compute_capability,
             inherited_layers: Some(info.layers),
+            // Arm `--n-cpu-moe` values are block-index bounds;
+            // positions are MoE layers (review item 11). Sent only
+            // when it differs from the identity.
+            n_cpu_moe_by_position: Some(info.n_cpu_moe_by_position())
+                .filter(|b| b.iter().enumerate().any(|(k, &v)| v != k as u32))
+                .unwrap_or_default(),
         })
     });
     let prune_ctx = mb::PruneContext {
@@ -1780,20 +696,6 @@ pub async fn op_bench_run_start(
             "running backends conflict with this sweep and must be stopped first: {names} [conflicts: {names}]"
         )));
     }
-    let mut stopped_names: Vec<String> = Vec::new();
-    for id in &conflicts {
-        let opts = crate::backend_lifecycle::BackendOpOpts::new(
-            crate::lifecycle::Origin::Bench,
-        );
-        match crate::backend_lifecycle::stop_backend(state, sink, id, opts).await {
-            Ok(_) => stopped_names.push(id.clone()),
-            Err(e) => {
-                return Err(ApiError::InvalidInput(format!(
-                    "stopping backend '{id}' for the sweep failed: {e}"
-                )))
-            }
-        }
-    }
 
     // Draft device argument, resolved against the launch's
     // visibility restriction: the target's placed GPUs are the
@@ -1813,7 +715,15 @@ pub async fn op_bench_run_start(
             _ => None,
         })
         .collect();
-    let projected = mb::project_minutes(&ready_specs);
+    // What this backend and model really took before, when they have
+    // been swept; the design's reasoned constants otherwise.
+    let projected = mb::minutes_per_arm(
+        &load_results(state).sweeps,
+        &target.id,
+        &model_abs.to_string_lossy(),
+    )
+    .map(|per_arm| per_arm * ready_specs.len() as f64)
+    .unwrap_or_else(|| mb::project_minutes(&ready_specs));
     let baseline_arm_index = if req.baseline_arm_index < outcomes.len() {
         req.baseline_arm_index
     } else {
@@ -1826,11 +736,9 @@ pub async fn op_bench_run_start(
     let model_identity = mb::ModelIdentity {
         path: model_abs.to_string_lossy().into_owned(),
         size_bytes: std::fs::metadata(&model_abs).map(|m| m.len()).unwrap_or(0),
-        sha256: model_entry
-            .as_ref()
-            .and_then(|m| m.verified_sha256.clone()),
+        sha256: model_entry.as_ref().and_then(|m| m.verified_sha256.clone()),
     };
-    let mut record = mb::SweepRecord {
+    let record = mb::SweepRecord {
         id: sweep_id.clone(),
         status: "running".to_string(),
         started_ms: now_ms(),
@@ -1849,7 +757,8 @@ pub async fn op_bench_run_start(
         correctness_control: req.correctness_control,
         interlock: mb::InterlockRecord {
             running_before: conflicts.clone(),
-            stopped_confirmed: stopped_names.clone(),
+            // Filled in as the stops happen.
+            stopped_confirmed: Vec::new(),
         },
         baseline_arm_index,
         projected_minutes: projected,
@@ -1879,55 +788,142 @@ pub async fn op_bench_run_start(
             })
             .collect(),
     };
-    save_sweep(state, &record);
-
-    let task_id = state
-        .record_task(
-            "bench-run",
-            json!({
-                "sweep_id": sweep_id,
-                "backend": target.id,
-                "prompt": prompt.id,
-                "arms": outcomes.len(),
-            }),
-        )
-        .await;
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+    // Claim the one job slot before anything is written: two starts
+    // that both passed the early check end here.
     {
-        let mut slot = state.bench_abort.lock().await;
-        *slot = Some(tx);
-    }
-    {
-        let mut slot = state.bench_job.lock().await;
+        let mut slot = state.bench.job.lock().await;
+        if slot.is_some() {
+            return Err(sweep_running());
+        }
         *slot = Some(BenchJob {
             sweep_id: sweep_id.clone(),
             progress: BenchProgress {
                 arm_index: 0,
                 arm_count: outcomes.len(),
-                phase: "launching".to_string(),
+                phase: if conflicts.is_empty() {
+                    "launching".to_string()
+                } else {
+                    "stopping backends".to_string()
+                },
                 run: 0,
                 started_unix_ms: now_ms(),
             },
         });
     }
-    let ctx = SweepCtx {
-        cfg: cfg.clone(),
-        target: target.clone(),
-        model_id: model_entry
-            .as_ref()
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| target.id.clone()),
-        temperature: req.temperature,
-        draft_path: draft_path.clone(),
-        draft_device_arg: draft_device_arg.clone(),
+    save_sweep(state, &record);
+
+    let task_detail = json!({
+        "sweep_id": sweep_id,
+        "backend": target.id,
+        "prompt": prompt.id,
+        "arms": outcomes.len(),
+    });
+    let task_id = state.record_task("bench-run", task_detail.clone()).await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut slot = state.bench.abort.lock().await;
+        *slot = Some(tx);
+    }
+    state.tasks.controls.set_canceller(
+        &task_id,
+        crate::tasks::TaskCanceller::BenchRun {
+            sweep_id: sweep_id.clone(),
+        },
+    );
+    let job = SweepJob {
+        ctx: SweepCtx {
+            model_id: model_entry
+                .as_ref()
+                .map(|m| m.id.clone())
+                .unwrap_or_else(|| target.id.clone()),
+            cfg,
+            target,
+            temperature: req.temperature,
+            draft_path,
+            draft_device_arg,
+        },
+        record,
+        outcomes,
+        conflicts,
+        prompt_body: prompt.body,
+        correctness_control: req.correctness_control,
+        confirm_at_06: req.confirm_at_06,
+        task_id: task_id.clone(),
+        rx,
     };
+    let (run_state, run_sink) = (Arc::clone(state), Arc::clone(sink));
+    let origin = crate::event_bus::current_origin();
+    tokio::spawn(tracing::Instrument::in_current_span(async move {
+        crate::event_bus::with_origin(origin, run_sweep(&run_state, &run_sink, job)).await;
+    }));
+    let mut payload = results_payload(state, &load_results(state));
+    payload["sweep_id"] = json!(sweep_id);
+    payload["id"] = json!(task_id);
+    payload["kind"] = json!("bench-run");
+    payload["status"] = json!("running");
+    payload["detail"] = task_detail;
+    Ok(payload)
+}
+
+/// Everything a started sweep needs to run on its own.
+struct SweepJob {
+    ctx: SweepCtx,
+    record: mb::SweepRecord,
+    outcomes: Vec<mb::ArmOutcome>,
+    conflicts: Vec<String>,
+    prompt_body: String,
+    correctness_control: bool,
+    confirm_at_06: bool,
+    task_id: String,
+    rx: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Run a started sweep to its end: free the GPU, run the arms, the
+/// optional confirmation pass, release the job slot, settle the task.
+async fn run_sweep(state: &Arc<AppState>, sink: &Arc<dyn crate::EventSink>, job: SweepJob) {
+    let SweepJob {
+        ctx,
+        mut record,
+        outcomes,
+        conflicts,
+        prompt_body,
+        correctness_control,
+        confirm_at_06,
+        task_id,
+        mut rx,
+    } = job;
+    let sweep_id = record.id.clone();
+    for id in &conflicts {
+        let opts = crate::backend_lifecycle::BackendOpOpts::new(crate::lifecycle::Origin::Bench);
+        if let Err(e) = crate::backend_lifecycle::stop_backend(state, sink, id, opts).await {
+            let why = format!("stopping backend '{id}' for the sweep failed: {e}");
+            for arm in record.arms.iter_mut() {
+                arm.status = mb::ArmStatus::Cancelled;
+                arm.detail = Some(why.clone());
+            }
+            record.status = "failed".to_string();
+            record.ended_ms = Some(now_ms());
+            save_sweep(state, &record);
+            release_job(state).await;
+            state
+                .finish_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    json!({ "sweep_id": sweep_id, "error": why }),
+                )
+                .await;
+            return;
+        }
+        record.interlock.stopped_confirmed.push(id.clone());
+        save_sweep(state, &record);
+    }
     let mut cancelled = execute_sweep(
         state,
         &ctx,
         &mut record,
         outcomes.clone(),
-        &prompt.body,
-        req.correctness_control,
+        &prompt_body,
+        correctness_control,
         &mut rx,
     )
     .await;
@@ -1935,7 +931,7 @@ pub async fn op_bench_run_start(
     // Optional confirmation pass at temperature 0.6 (§2.1): a
     // separate record — the temperature differs, so the
     // comparability key differs — over the same arms.
-    if req.confirm_at_06 && req.temperature == 0.0 && !cancelled {
+    if confirm_at_06 && ctx.temperature == 0.0 && !cancelled {
         let mut confirm_record = record.clone();
         confirm_record.id = format!("{sweep_id}-confirm");
         confirm_record.temperature = mb::CONFIRM_TEMPERATURE;
@@ -1954,25 +950,21 @@ pub async fn op_bench_run_start(
             arm.raw_flags = String::new();
         }
         save_sweep(state, &confirm_record);
-        if let Ok(mut slot) = state.bench_job.try_lock() {
+        if let Ok(mut slot) = state.bench.job.try_lock() {
             if let Some(job) = slot.as_mut() {
                 job.sweep_id = confirm_record.id.clone();
             }
         }
         let confirm_ctx = SweepCtx {
-            cfg: cfg.clone(),
-            target: target.clone(),
-            model_id: ctx.model_id.clone(),
             temperature: mb::CONFIRM_TEMPERATURE,
-            draft_path: draft_path.clone(),
-            draft_device_arg: draft_device_arg.clone(),
+            ..ctx
         };
         let confirm_cancelled = execute_sweep(
             state,
             &confirm_ctx,
             &mut confirm_record,
             outcomes,
-            &prompt.body,
+            &prompt_body,
             false,
             &mut rx,
         )
@@ -1980,35 +972,25 @@ pub async fn op_bench_run_start(
         cancelled = cancelled || confirm_cancelled;
     }
 
-    {
-        let mut slot = state.bench_abort.lock().await;
-        *slot = None;
-    }
-    {
-        let mut slot = state.bench_job.lock().await;
-        *slot = None;
-    }
-    if cancelled {
-        state
-            .finish_task(
-                &task_id,
-                TaskStatus::Aborted,
-                json!({ "sweep_id": sweep_id, "cancelled": true }),
-            )
-            .await;
-        return Err(ApiError::InvalidInput(
-            "bench sweep cancelled".to_string(),
-        ));
-    }
-    state
-        .finish_task(
-            &task_id,
-            TaskStatus::Done,
-            json!({ "sweep_id": sweep_id }),
+    release_job(state).await;
+    let (status, detail) = if cancelled {
+        (
+            TaskStatus::Aborted,
+            json!({ "sweep_id": sweep_id, "cancelled": true }),
         )
-        .await;
-    let results = load_results(state);
-    Ok(results_payload(state, &results))
+    } else {
+        (
+            TaskStatus::Done,
+            json!({ "sweep_id": sweep_id, "status": record.status }),
+        )
+    };
+    state.finish_task(&task_id, status, detail).await;
+}
+
+/// The sweep is over: free the cancel handle and the job slot.
+async fn release_job(state: &AppState) {
+    *state.bench.abort.lock().await = None;
+    *state.bench.job.lock().await = None;
 }
 
 pub async fn op_bench_run_cancel(
@@ -2017,7 +999,7 @@ pub async fn op_bench_run_cancel(
     sweep_id: String,
 ) -> crate::ApiResult {
     let matches = {
-        let slot = state.bench_job.lock().await;
+        let slot = state.bench.job.lock().await;
         slot.as_ref().map(|j| j.sweep_id.clone())
     };
     let current = match matches {
@@ -2030,7 +1012,7 @@ pub async fn op_bench_run_cancel(
         return Ok(json!({ "cancelled": false }));
     }
     let sender = {
-        let mut slot = state.bench_abort.lock().await;
+        let mut slot = state.bench.abort.lock().await;
         slot.take()
     };
     match sender {
@@ -2055,7 +1037,7 @@ pub async fn op_bench_result_delete(
     _sink: &Arc<dyn crate::EventSink>,
     sweep_id: String,
 ) -> crate::ApiResult {
-    if let Some(job) = state.bench_job.lock().await.as_ref() {
+    if let Some(job) = state.bench.job.lock().await.as_ref() {
         if job.sweep_id == sweep_id {
             return Err(ApiError::InvalidInput(
                 "that sweep is running; cancel it before deleting".to_string(),
@@ -2073,147 +1055,4 @@ pub async fn op_bench_result_delete(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn backend(raw_flags: Option<&str>) -> BackendConfig {
-        BackendConfig {
-            id: "bench-target".to_string(),
-            enabled: true,
-            model_file: PathBuf::from("models/target.gguf"),
-            port: 8090,
-            flags: manager_config::ServerFlags {
-                n_ctx: 65536,
-                n_batch: 512,
-                tensor_split: Vec::new(),
-                split_mode: manager_config::SplitMode::None,
-            },
-            raw_flags: raw_flags.map(|s| s.to_string()),
-            flags_advanced: false,
-            restart_policy: manager_config::RestartPolicy {
-                max_retries: 5,
-                backoff_base_secs: 2,
-            },
-            overrides_global: false,
-            tool_call_probe: None,
-            purpose: String::new(),
-        }
-    }
-
-    #[test]
-    fn base_arm_captures_the_targets_offload_position() {
-        // The coder pattern: full expert offload is recorded on
-        // the base arm, so every arm snapshot names the position
-        // it runs at.
-        let spec = base_arm_spec(&backend(Some("-ot exps=CPU --parallel 1")));
-        assert_eq!(spec.offload_expr.as_deref(), Some("-ot exps=CPU"));
-        assert_eq!(spec.n_ctx, 65536);
-        // The partial pattern records its layer count.
-        let spec = base_arm_spec(&backend(Some("--n-cpu-moe 24")));
-        assert_eq!(spec.offload_expr.as_deref(), Some("--n-cpu-moe 24"));
-    }
-
-    #[test]
-    fn base_arm_canonicalizes_offload_spellings() {
-        // Every spelling the decoder recognizes lands on the one
-        // canonical expression for its position.
-        let spec = base_arm_spec(&backend(Some("--cpu-moe")));
-        assert_eq!(spec.offload_expr.as_deref(), Some("-ot exps=CPU"));
-        let spec = base_arm_spec(&backend(Some("-ncmoe=46")));
-        assert_eq!(spec.offload_expr.as_deref(), Some("--n-cpu-moe 46"));
-    }
-
-    #[test]
-    fn base_arm_without_offload_carries_no_expression() {
-        let spec = base_arm_spec(&backend(Some("--parallel 1")));
-        assert_eq!(spec.offload_expr, None);
-        let spec = base_arm_spec(&backend(None));
-        assert_eq!(spec.offload_expr, None);
-        // A non-expert `-ot` assignment is not expert offload.
-        let spec = base_arm_spec(&backend(Some("-ot blk.0.attn=CPU")));
-        assert_eq!(spec.offload_expr, None);
-    }
-
-    fn placed_backend(id: &str, tensor_split: Vec<f32>, raw_flags: Option<&str>) -> BackendConfig {
-        let mut b = backend(raw_flags);
-        b.id = id.to_string();
-        b.flags.tensor_split = tensor_split;
-        b
-    }
-
-    fn cfg_with(backends: Vec<BackendConfig>) -> AppConfig {
-        let mut cfg = AppConfig::default_config();
-        cfg.backends = backends;
-        cfg
-    }
-
-    fn running(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn interlock_cross_gpu_raw_placed_backend_does_not_conflict() {
-        // Pete's case (Oct 23, 2026): the target is resident
-        // entirely on GPU 0; coder runs on GPU 1 only, its
-        // placement stated in raw flags, and it CPU-offloads its
-        // experts. Neither rule binds: the GPUs are disjoint, and
-        // the CPU-offload rule binds only when the TARGET
-        // CPU-offloads (§6.2). Before the bench-local placement
-        // reading, backend_gpu_visibility reported coder
-        // Undetermined and the interlock flagged it against every
-        // sweep.
-        let target = placed_backend("planner", vec![1.0], Some("--parallel 1"));
-        let coder = placed_backend(
-            "coder",
-            Vec::new(),
-            Some("--tensor-split 0,1 -ot exps=CPU"),
-        );
-        let cfg = cfg_with(vec![target.clone(), coder]);
-        let conflicts = interlock_conflicts(&cfg, &running(&["coder"]), &target);
-        assert!(conflicts.is_empty(), "conflicts: {conflicts:?}");
-    }
-
-    #[test]
-    fn interlock_shared_gpu_and_running_target_conflict() {
-        // An unsplit backend sits on GPU 0 by default and shares
-        // it with a GPU-0 target; the running target itself
-        // always conflicts (§6.1).
-        let target = placed_backend("planner", Vec::new(), None);
-        let other = placed_backend("chat", Vec::new(), None);
-        let cfg = cfg_with(vec![target.clone(), other]);
-        let conflicts = interlock_conflicts(&cfg, &running(&["chat", "planner"]), &target);
-        assert_eq!(conflicts, vec!["planner".to_string(), "chat".to_string()]);
-    }
-
-    #[test]
-    fn interlock_cpu_offload_target_conflicts_with_cpu_offload_backend() {
-        // Disjoint GPUs, but the target CPU-offloads, so a
-        // running CPU-offload backend shares the CPU expert
-        // resource and conflicts (§3.4/§6.2) — while a running
-        // dense backend on the other GPU does not.
-        let target = placed_backend(
-            "coder-target",
-            vec![1.0, 0.0],
-            Some("-ot exps=CPU"),
-        );
-        let moe = placed_backend("planner-moe", vec![0.0, 1.0], Some("--n-cpu-moe 24"));
-        let dense = placed_backend("planner", vec![0.0, 1.0], Some("--parallel 1"));
-        let cfg = cfg_with(vec![target.clone(), moe, dense]);
-        let conflicts =
-            interlock_conflicts(&cfg, &running(&["planner-moe", "planner"]), &target);
-        assert_eq!(conflicts, vec!["planner-moe".to_string()]);
-    }
-
-    #[test]
-    fn interlock_unparseable_placement_still_conflicts() {
-        // A device selection that does not parse stays
-        // Undetermined, and Undetermined conflicts with
-        // everything — the conservative reading is kept for the
-        // genuinely unknown case.
-        let target = placed_backend("planner", vec![1.0], None);
-        let odd = placed_backend("odd", Vec::new(), Some("--device banana"));
-        let cfg = cfg_with(vec![target.clone(), odd]);
-        let conflicts = interlock_conflicts(&cfg, &running(&["odd"]), &target);
-        assert_eq!(conflicts, vec!["odd".to_string()]);
-    }
-}
+mod tests;

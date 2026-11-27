@@ -170,11 +170,8 @@ impl ArmSpec {
     /// Short human label naming the non-default axes, e.g.
     /// `q8_0/q8_0 · FA on · depth 30,720 · combined (n-min 16, draft n-max 3)`.
     pub fn label(&self) -> String {
-        let mut parts: Vec<String> = vec![format!(
-            "{}/{}",
-            self.cache_k.flag(),
-            self.cache_v.flag()
-        )];
+        let mut parts: Vec<String> =
+            vec![format!("{}/{}", self.cache_k.flag(), self.cache_v.flag())];
         match self.flash_attn {
             FlashAttn::Auto => {}
             FlashAttn::On => parts.push("FA on".to_string()),
@@ -403,6 +400,93 @@ pub struct OffloadGuardrail {
     /// judged too. `None` = unknown, and an arm that leaves the
     /// axis alone is then never pruned on this rule.
     pub inherited_layers: Option<u32>,
+    /// The `--n-cpu-moe` value each position `0..=moe_layers`
+    /// writes (code review v0.1.60 item 11): llama.cpp reads it
+    /// as a block-index bound, which differs from the MoE-layer
+    /// position for a model with leading or interleaved dense
+    /// blocks. Empty (unknown layout, older records) = identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub n_cpu_moe_by_position: Vec<u32>,
+}
+
+/// The MoE-layer position a `--n-cpu-moe` bound selects under a
+/// per-position bound table (`bounds[k]` = the bound position `k`
+/// writes, ascending): the largest `k` whose bound is `<= bound`,
+/// i.e. the MoE blocks with index below it. An empty or malformed
+/// table is the identity.
+pub fn layers_for_n_cpu_moe(bound: u32, bounds: &[u32]) -> u32 {
+    if bounds.len() < 2 {
+        return bound;
+    }
+    bounds
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take_while(|(_, &b)| b <= bound)
+        .last()
+        .map(|(k, _)| k as u32)
+        .unwrap_or(0)
+}
+
+/// [`offload_expr_for_layers`] writing the partial position at its
+/// `--n-cpu-moe` block-index bound from `bounds` (see
+/// [`OffloadGuardrail::n_cpu_moe_by_position`]); an empty table is
+/// exactly [`offload_expr_for_layers`].
+pub fn offload_expr_for_layers_mapped(layers: u32, moe_layers: u32, bounds: &[u32]) -> String {
+    match bounds.get(layers as usize) {
+        Some(&b) if layers > 0 && layers < moe_layers => format!("--n-cpu-moe {b}"),
+        _ => offload_expr_for_layers(layers, moe_layers),
+    }
+}
+
+/// [`offload_layers_of`] reading a `--n-cpu-moe` count as the
+/// block-index bound it is, through `bounds`; an empty table is
+/// exactly [`offload_layers_of`].
+pub fn offload_layers_of_mapped(expr: &str, moe_layers: u32, bounds: &[u32]) -> Option<u32> {
+    let layers = offload_layers_of(expr, moe_layers)?;
+    let (count, rest) = split_n_cpu_moe(expr);
+    let Some(count) = count else {
+        return Some(layers);
+    };
+    // An all-experts spelling beside the count wins regardless.
+    let all_experts_beside =
+        !rest.is_empty() && offload_layers_of(&rest, moe_layers) == Some(moe_layers);
+    if bounds.len() < 2 || all_experts_beside {
+        return Some(layers);
+    }
+    Some(layers_for_n_cpu_moe(count, bounds).min(moe_layers))
+}
+
+/// The last `--n-cpu-moe` / `-ncmoe` count in an expression (the
+/// value [`offload_layers_of`] uses), and the expression with those
+/// tokens removed.
+fn split_n_cpu_moe(expr: &str) -> (Option<u32>, String) {
+    let tokens: Vec<&str> = expr.split_whitespace().collect();
+    let mut count = None;
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if t == "--n-cpu-moe" || t == "-ncmoe" {
+            if let Some(v) = tokens.get(i + 1).and_then(|v| v.parse().ok()) {
+                count = Some(v);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = t
+            .strip_prefix("--n-cpu-moe=")
+            .or_else(|| t.strip_prefix("-ncmoe="))
+        {
+            if let Ok(v) = v.parse() {
+                count = Some(v);
+            }
+        } else {
+            rest.push(t);
+        }
+        i += 1;
+    }
+    (count, rest.join(" "))
 }
 
 /// The canonical offload expression for a position (`layers` of
@@ -594,7 +678,9 @@ pub fn prune_arms(arms: Vec<ArmSpec>, ctx: &PruneContext) -> Vec<ArmOutcome> {
             // verbatim custom `-ot`) is never pruned on this rule.
             if let Some(g) = &ctx.offload_guardrail {
                 let position = match &arm.offload_expr {
-                    Some(expr) => offload_layers_of(expr, g.moe_layers),
+                    Some(expr) => {
+                        offload_layers_of_mapped(expr, g.moe_layers, &g.n_cpu_moe_by_position)
+                    }
                     None => g.inherited_layers,
                 };
                 if let Some(layers) = position {
@@ -1019,6 +1105,7 @@ mod tests {
                 allowed_layers: vec![0, 48],
                 compute_capability: (6, 0),
                 inherited_layers: inherited,
+                n_cpu_moe_by_position: Vec::new(),
             }),
             ..PruneContext::default()
         }
@@ -1102,8 +1189,9 @@ mod tests {
         let kv = preset_kv();
         let arms = expand(&base(), &kv.dimensions);
         assert!(arms.iter().all(|a| a.depth == 8192));
-        assert!(arms.iter().any(|a| a.cache_k == CacheType::F16
-            && a.cache_v == CacheType::Q8_0));
+        assert!(arms
+            .iter()
+            .any(|a| a.cache_k == CacheType::F16 && a.cache_v == CacheType::Q8_0));
         assert_eq!(preset_combined().prompt_id, None);
     }
 
@@ -1159,9 +1247,100 @@ mod tests {
             serde_json::to_string(&DraftDevice::TargetGpu).expect("ser"),
             "\"target_gpu\""
         );
-        assert_eq!(SpecKind::Combined.spec_type_arg(), Some("ngram-mod,draft-simple"));
+        assert_eq!(
+            SpecKind::Combined.spec_type_arg(),
+            Some("ngram-mod,draft-simple")
+        );
         assert_eq!(SpecKind::None.spec_type_arg(), None);
         assert!(CacheType::Q4_0.quantized());
         assert!(!CacheType::F16.quantized());
+    }
+
+    // --- review item 11: positions are MoE layers, flags are bounds --
+
+    /// 2 leading dense blocks + 4 MoE blocks: position k writes
+    /// bound k+2 (0 for no offload).
+    const LEAD2_BOUNDS: [u32; 5] = [0, 3, 4, 5, 6];
+
+    #[test]
+    fn n_cpu_moe_bounds_convert_to_and_from_positions() {
+        assert_eq!(layers_for_n_cpu_moe(4, &LEAD2_BOUNDS), 2);
+        assert_eq!(layers_for_n_cpu_moe(2, &LEAD2_BOUNDS), 0);
+        assert_eq!(layers_for_n_cpu_moe(99, &LEAD2_BOUNDS), 4);
+        // No table: identity.
+        assert_eq!(layers_for_n_cpu_moe(4, &[]), 4);
+        assert_eq!(
+            offload_expr_for_layers_mapped(2, 4, &LEAD2_BOUNDS),
+            "--n-cpu-moe 4"
+        );
+        assert_eq!(offload_expr_for_layers_mapped(0, 4, &LEAD2_BOUNDS), "");
+        assert_eq!(
+            offload_expr_for_layers_mapped(4, 4, &LEAD2_BOUNDS),
+            "-ot exps=CPU"
+        );
+        assert_eq!(offload_expr_for_layers_mapped(2, 4, &[]), "--n-cpu-moe 2");
+        assert_eq!(
+            offload_layers_of_mapped("--n-cpu-moe 4", 4, &LEAD2_BOUNDS),
+            Some(2)
+        );
+        assert_eq!(
+            offload_layers_of_mapped("-ncmoe=3", 4, &LEAD2_BOUNDS),
+            Some(1)
+        );
+        assert_eq!(offload_layers_of_mapped("--n-cpu-moe 4", 4, &[]), Some(4));
+        // All-experts spellings stay the full position.
+        assert_eq!(
+            offload_layers_of_mapped("--cpu-moe --n-cpu-moe 3", 4, &LEAD2_BOUNDS),
+            Some(4)
+        );
+        assert_eq!(
+            offload_layers_of_mapped("-ot exps=CPU", 4, &LEAD2_BOUNDS),
+            Some(4)
+        );
+        assert_eq!(offload_layers_of_mapped("", 4, &LEAD2_BOUNDS), Some(0));
+        // Round trip over every position.
+        for k in 0..=4 {
+            let e = offload_expr_for_layers_mapped(k, 4, &LEAD2_BOUNDS);
+            assert_eq!(
+                offload_layers_of_mapped(&e, 4, &LEAD2_BOUNDS),
+                Some(k),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_offload_guardrail_reads_bounds_as_moe_layers() {
+        // Endpoints-only on 4 MoE layers behind 2 dense blocks:
+        // `--n-cpu-moe 6` moves all 4 MoE layers (the full
+        // position, allowed); `--n-cpu-moe 4` is position 2.
+        let ctx = PruneContext {
+            offload_guardrail: Some(OffloadGuardrail {
+                moe_layers: 4,
+                allowed_layers: vec![0, 4],
+                compute_capability: (6, 0),
+                inherited_layers: Some(4),
+                n_cpu_moe_by_position: LEAD2_BOUNDS.to_vec(),
+            }),
+            ..PruneContext::default()
+        };
+        let mut arm = base();
+        arm.offload_expr = Some("--n-cpu-moe 6".to_string());
+        assert!(matches!(
+            prune_arms(vec![arm], &ctx)[0],
+            ArmOutcome::Ready(_)
+        ));
+        let mut arm = base();
+        arm.offload_expr = Some("--n-cpu-moe 4".to_string());
+        match &prune_arms(vec![arm], &ctx)[0] {
+            ArmOutcome::Pruned { reason, .. } => assert!(reason.contains("2 of 4"), "{reason}"),
+            ArmOutcome::Ready(_) => panic!("expected pruning"),
+        }
+        // The table defaults empty (older records): identity.
+        let g: OffloadGuardrail = serde_json::from_str(
+            r#"{"moe_layers":4,"allowed_layers":[0,4],"compute_capability":[6,0],"inherited_layers":null}"#,
+        )
+        .unwrap();
+        assert!(g.n_cpu_moe_by_position.is_empty());
     }
 }

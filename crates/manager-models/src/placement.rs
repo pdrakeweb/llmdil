@@ -82,9 +82,24 @@ pub struct PlacementProjection {
     #[serde(default)]
     pub fit_states: Vec<super::FitState>,
     /// Per-GPU paged amount (MiB paging to system RAM) for GPUs
-    /// classified [`crate::FitState::WddmPaged`]; 0 elsewhere.
+    /// classified [`crate::FitState::WddmPaged`], computed from the
+    /// memory free now (crediting the backend's own); 0 elsewhere.
     #[serde(default)]
     pub paged_mib: Vec<u64>,
+    /// Per-GPU fit against free memory now, crediting the backend's
+    /// own residency (see [`super::free_fit`]). `per_gpu_fits` /
+    /// `fits` keep their meaning.
+    #[serde(default)]
+    pub fits_free: Vec<Option<bool>>,
+    /// MiB each WDDM GPU will page, over its free memory.
+    #[serde(default)]
+    pub will_page_mib: Vec<u64>,
+    /// Per-GPU wording, e.g. "Will page 11.9 GiB to system RAM".
+    #[serde(default)]
+    pub fit_text: Vec<String>,
+    /// Every GPU fits its free memory now.
+    #[serde(default)]
+    pub fits_now: Option<bool>,
 }
 
 /// Validate a tensor split: non-empty, `len == n_gpus`, every fraction in
@@ -202,6 +217,8 @@ pub fn propose_placement_resident(
         .map(|(add, free)| add <= free)
         .collect();
     let fits = per_gpu_fits.iter().all(|b| *b);
+    // This projection is already judged against free VRAM.
+    let fits_free: Vec<Option<bool>> = per_gpu_fits.iter().map(|b| Some(*b)).collect();
     // The recommendation verdict judges the same weight total the
     // projection used: with offload in scope, a model whose file is
     // larger than any GPU can still fit by its resident share. It
@@ -238,6 +255,10 @@ pub fn propose_placement_resident(
         gpu_total_mib: Vec::new(),
         fit_states: Vec::new(),
         paged_mib: Vec::new(),
+        fits_now: Some(fits),
+        fits_free,
+        will_page_mib: vec![0; split.len()],
+        fit_text: Vec::new(),
     })
 }
 
@@ -279,9 +300,7 @@ pub fn propose_placement_full(
 ) -> Result<PlacementProjection, ModelError> {
     validate_split(split, free_vram_mib_per_gpu.len())?;
     let n = split.len();
-    let pick = |v: &[u64]| -> Vec<u64> {
-        (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect()
-    };
+    let pick = |v: &[u64]| -> Vec<u64> { (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect() };
     let required = pick(required_mib);
     let current = pick(current_mib);
     let totals = pick(gpu_total_mib);
@@ -292,15 +311,26 @@ pub fn propose_placement_full(
         .collect();
     let mut fit_states: Vec<super::FitState> = Vec::with_capacity(n);
     let mut paged_mib: Vec<u64> = Vec::with_capacity(n);
+    let mut free_fits: Vec<super::FreeFit> = Vec::with_capacity(n);
     for i in 0..n {
-        let (state, paged) = super::fit_state(
+        let wddm = is_wddm.get(i).copied().unwrap_or(false);
+        let (state, _) = super::fit_state(required[i], totals[i], wddm);
+        let free = super::free_fit(
             required[i],
             totals[i],
-            is_wddm.get(i).copied().unwrap_or(false),
+            Some(free_vram_mib_per_gpu[i]),
+            current[i],
+            wddm,
         );
         fit_states.push(state);
-        paged_mib.push(paged);
+        paged_mib.push(if state == crate::FitState::WddmPaged {
+            free.will_page_mib
+        } else {
+            0
+        });
+        free_fits.push(free);
     }
+    let fits_free: Vec<Option<bool>> = free_fits.iter().map(|f| f.fits_free).collect();
     let per_gpu_fits: Vec<bool> = fit_states
         .iter()
         .map(|s| *s != crate::FitState::DoesNotFit)
@@ -340,6 +370,10 @@ pub fn propose_placement_full(
         gpu_total_mib: totals,
         fit_states,
         paged_mib,
+        fits_now: super::fits_now(&fits_free),
+        fits_free,
+        will_page_mib: free_fits.iter().map(|f| f.will_page_mib).collect(),
+        fit_text: free_fits.into_iter().map(|f| f.text).collect(),
     })
 }
 
@@ -531,8 +565,8 @@ mod tests {
         // plus the requirement's small compute allowance, =
         // 17,224 required on GPU 0 (16,376 total, WDDM). The
         // weights-only projection called this "fits" at 10,865;
-        // the full projection classifies it as a WDDM paged fit
-        // with 848 MiB paged — the start gate's own numbers.
+        // the full projection classifies it as a WDDM paged fit,
+        // paging the excess over the 15,098 MiB free.
         let p = propose_placement_full(
             &spec(),
             &[1.0],
@@ -554,7 +588,9 @@ mod tests {
         assert_eq!(p.rs_mib, Some(614));
         assert_eq!(p.gpu_weights_mib, 10_865);
         assert_eq!(p.fit_states, vec![crate::FitState::WddmPaged]);
-        assert_eq!(p.paged_mib, vec![848]);
+        assert_eq!(p.paged_mib, vec![2_126]);
+        assert_eq!(p.fits_now, Some(false));
+        assert_eq!(p.fit_text, vec!["Will page 2.1 GiB to system RAM"]);
         assert!(p.fits, "a paged fit is fittable, with confirmation");
         // The same requirement on a TCC GPU does not fit.
         let p = propose_placement_full(
@@ -595,7 +631,37 @@ mod tests {
             assert_eq!(p.fit_states, vec![crate::FitState::Fits]);
             assert_eq!(p.paged_mib, vec![0]);
             assert!(p.fits);
+            assert_eq!(p.fits_now, Some(true));
         }
+    }
+
+    #[test]
+    fn propose_full_reports_free_memory_beside_total() {
+        // Fits the card, not the 355 MiB free: `fits` (against
+        // total) stands, fits_now says no. Running there already,
+        // its own residency is credited.
+        let propose = |current: u64| {
+            propose_placement_full(
+                &spec(),
+                &[1.0],
+                &[355],
+                &[16_276],
+                &[false],
+                &[7_330],
+                &[current],
+                7_000,
+                330,
+                None,
+                0,
+                0,
+            )
+            .unwrap()
+        };
+        let p = propose(0);
+        assert!(p.fits);
+        assert_eq!(p.fits_free, vec![Some(false)]);
+        assert_eq!(p.fits_now, Some(false));
+        assert_eq!(propose(7_330).fits_now, Some(true));
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //! [`editor_mcp_config`] generates the `mcpServers` JSON object consumed by
 //! Continue (`config.json`) and Cline (`cline_mcp_settings.json`).
 
+pub mod local;
+
 use manager_supervisor::{ProcessSpec, Supervisor, SupervisorError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

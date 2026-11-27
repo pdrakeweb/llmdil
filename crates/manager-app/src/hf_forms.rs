@@ -99,10 +99,15 @@ pub fn suggested_default_offload(
         return (None, false);
     };
     let largest_bytes = largest_mib * 1024 * 1024;
-    let sys = manager_models::sys_bytes_by_position(
+    // Position N counts MoE layers; it is written as the
+    // `--n-cpu-moe` block-index bound that moves the first N MoE
+    // blocks: price it from the tensor index when the parse
+    // carried one (the same table the slider shows).
+    let sys = manager_models::memory::sys_bytes_by_position_with_tensors(
         layout.expert_bytes,
         Some(&layout.expert_bytes_by_block),
         moe_layers,
+        (!layout.expert_tensors.is_empty()).then_some(&*layout.expert_tensors),
     );
     for n in 0..=moe_layers {
         let gpu_bytes = layout.tensor_bytes.saturating_sub(sys[n as usize]);
@@ -192,9 +197,7 @@ pub fn refetch_proposals(stored: &StoredFacts, fetched: &FetchedFacts) -> Refetc
     };
     let mtp_proposed = fetched.mtp && stored.mtp_declared != Some(true);
     let hash_changed = match (&stored.sha256, &fetched.sha256) {
-        (pin, Some(f)) if crate::is_real_pin(pin) && pin != f => {
-            Some((pin.clone(), f.clone()))
-        }
+        (pin, Some(f)) if crate::is_real_pin(pin) && pin != f => Some((pin.clone(), f.clone())),
         _ => None,
     };
     RefetchProposals {
@@ -254,8 +257,8 @@ pub async fn op_model_hf_lookup(
             "a model name or search term is required".to_string(),
         ));
     }
-    let client = HfClient::with_default_base()
-        .map_err(|e| ApiError::InvalidInput(e.to_string()))?;
+    let client =
+        HfClient::with_default_base().map_err(|e| ApiError::InvalidInput(e.to_string()))?;
     if suggest.unwrap_or(false) {
         let hits = client
             .search_with_limit(&query, MAX_LOOKUP_REPOS)
@@ -308,8 +311,8 @@ pub async fn op_model_hf_header(
             "a repository id and a file name are required".to_string(),
         ));
     }
-    let client = HfClient::with_default_base()
-        .map_err(|e| ApiError::InvalidInput(e.to_string()))?;
+    let client =
+        HfClient::with_default_base().map_err(|e| ApiError::InvalidInput(e.to_string()))?;
     let source_url = format!("https://huggingface.co/{repo_id}/resolve/main/{file}");
     // Catalog detection is file-exact (the resolvers match
     // the constructed source URL): a catalog repo hosting
@@ -341,9 +344,7 @@ pub async fn op_model_hf_header(
             }))
         }
         Err(e) => {
-            tracing::warn!(
-                "HF header read for {repo_id}/{file} unavailable: {e}"
-            );
+            tracing::warn!("HF header read for {repo_id}/{file} unavailable: {e}");
             None
         }
     };
@@ -366,6 +367,7 @@ mod tests {
             tensor_bytes: dense_bytes + expert_bytes,
             expert_bytes,
             expert_bytes_by_block: vec![per_block; moe_blocks as usize],
+            expert_tensors: Default::default(),
             block_count: Some(moe_blocks),
             moe_block_count: (moe_blocks > 0).then_some(moe_blocks),
             nextn_predict_layers: None,
@@ -406,10 +408,7 @@ mod tests {
         // 30 GiB dense alone exceeds the largest GPU: even
         // full expert offload cannot fit it on one card.
         let l = layout(48, 100_000_000, 30_000_000_000);
-        assert_eq!(
-            suggested_default_offload(&l, &[16_376]),
-            (Some(48), true)
-        );
+        assert_eq!(suggested_default_offload(&l, &[16_376]), (Some(48), true));
     }
 
     #[test]
@@ -426,7 +425,10 @@ mod tests {
         // total governs — the 8 GiB card alone would suggest
         // offload.
         let l = layout(48, 100_000_000, 9_000_000_000);
-        assert_eq!(suggested_default_offload(&l, &[8_192, 16_376]), (Some(0), false));
+        assert_eq!(
+            suggested_default_offload(&l, &[8_192, 16_376]),
+            (Some(0), false)
+        );
     }
 
     #[test]
@@ -505,10 +507,7 @@ mod tests {
         let p = refetch_proposals(&stored, &fetched);
         assert_eq!(p.moe_file_layers, Some(46));
         assert!(p.mtp_proposed);
-        assert_eq!(
-            p.hash_changed,
-            Some(("a".repeat(64), "b".repeat(64)))
-        );
+        assert_eq!(p.hash_changed, Some(("a".repeat(64), "b".repeat(64))));
         // An unpinned record has no hash to change.
         let unpinned = StoredFacts {
             moe_layers: None,

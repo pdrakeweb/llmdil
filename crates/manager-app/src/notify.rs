@@ -78,6 +78,16 @@ pub async fn notify(
     crate::logship::offer_app_line(state, level, || {
         format!("notify ({category:?}): {title} — {body}")
     });
+    // Failures and activation outcomes are alerts on the app event
+    // bus, independent of the toast switches (completions are not).
+    let alert_category = match category {
+        Category::Failures => Some("failures"),
+        Category::Activation => Some("activation"),
+        Category::Operations => None,
+    };
+    if let Some(c) = alert_category {
+        crate::event_bus::publish_alert(state, c, title, body);
+    }
     let allowed = {
         let cfg = state.config.read().await;
         match category {
@@ -90,7 +100,7 @@ pub async fn notify(
         return;
     }
     if let Err(e) = send_toast(sink, title, body) {
-        eprintln!("notification ({category:?}) not shown: {e}");
+        tracing::warn!("notification ({category:?}) not shown: {e}");
     }
 }
 
@@ -123,7 +133,12 @@ pub struct NotifyWatch {
 /// the exit string cannot. The recorded string carries no trailing
 /// period, so the sentence is terminated here when it does not
 /// already end with one.
-fn backend_failure_body(id: &str, exit_status: Option<&str>, reason: Option<&str>) -> String {
+fn backend_failure_body(
+    id: &str,
+    exit_status: Option<&str>,
+    reason: Option<&str>,
+    restarting: bool,
+) -> String {
     let mut body = match exit_status {
         Some(status) => format!("Backend {id} exited unexpectedly ({status})."),
         None => format!("Backend {id} is no longer running."),
@@ -135,7 +150,11 @@ fn backend_failure_body(id: &str, exit_status: Option<&str>, reason: Option<&str
             body.push('.');
         }
     }
-    body.push_str(" Restart it from the Backends view.");
+    body.push_str(if restarting {
+        " It is restarted automatically."
+    } else {
+        " Restart it from the Backends view."
+    });
     body
 }
 
@@ -146,10 +165,11 @@ fn monitor_toast(event: &MonitorEvent) -> (Category, String, String) {
             id,
             exit_status,
             reason,
+            restarting,
         } => (
             Category::Failures,
             "Backend stopped unexpectedly".to_string(),
-            backend_failure_body(id, exit_status.as_deref(), reason.as_deref()),
+            backend_failure_body(id, exit_status.as_deref(), reason.as_deref(), *restarting),
         ),
         MonitorEvent::GatewayDown { reason } => (
             Category::Failures,
@@ -275,11 +295,15 @@ mod tests {
     #[test]
     fn failure_body_without_reason_is_the_original_copy() {
         assert_eq!(
-            backend_failure_body("planner", Some("exit code: 1"), None),
+            backend_failure_body("planner", Some("exit code: 1"), None, false),
             "Backend planner exited unexpectedly (exit code: 1). Restart it from the Backends view."
         );
         assert_eq!(
-            backend_failure_body("planner", None, None),
+            backend_failure_body("planner", Some("exit code: 1"), None, true),
+            "Backend planner exited unexpectedly (exit code: 1). It is restarted automatically."
+        );
+        assert_eq!(
+            backend_failure_body("planner", None, None, false),
             "Backend planner is no longer running. Restart it from the Backends view."
         );
     }
@@ -291,11 +315,11 @@ mod tests {
         // sentence in both reap shapes. The recorded string has
         // no trailing period; the helper terminates the sentence.
         assert_eq!(
-            backend_failure_body("planner-moe", Some("exit code: 1"), Some(GPU_REASON)),
+            backend_failure_body("planner-moe", Some("exit code: 1"), Some(GPU_REASON), false),
             "Backend planner-moe exited unexpectedly (exit code: 1). GPU unavailable: the device was busy or unavailable while the backend loaded. Restart it from the Backends view."
         );
         assert_eq!(
-            backend_failure_body("planner-moe", None, Some(GPU_REASON)),
+            backend_failure_body("planner-moe", None, Some(GPU_REASON), false),
             "Backend planner-moe is no longer running. GPU unavailable: the device was busy or unavailable while the backend loaded. Restart it from the Backends view."
         );
     }

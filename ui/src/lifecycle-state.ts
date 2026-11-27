@@ -209,11 +209,13 @@ export interface LifecycleActionSpec {
 const ACTION_LABEL: Record<LifecycleAction, string> = { start: "Start", stop: "Stop", restart: "Restart" };
 
 /** The one Start/Stop/Restart rule for every card:
- *  - running / degraded / starting: Stop + Restart (Restart disabled
+ *  - running / degraded / starting: Restart + Stop (Restart disabled
  *    unless enabled and configured — the server refuses it otherwise);
  *  - restarting / stopping: the same buttons, disabled until it settles;
  *  - stopped / failed: Start (disabled unless enabled and configured)
- *    + Restart disabled (nothing to restart);
+ *    + Stop disabled (nothing to stop).
+ *  Two slots in a fixed order — Start or Restart first, Stop second —
+ *  so a state change never puts Stop where Start just was;
  *  - not registered / unknown: none — except the gateway, whose own
  *    page must stay operable when its status call fails: Start, Stop
  *    and Restart, enabled, titled "Gateway status unavailable".
@@ -227,20 +229,20 @@ export function lifecycleActions(s: LifecycleState, ctx: LifecycleActionCtx): Li
   let out: LifecycleActionSpec[];
   switch (s) {
     case "running": case "degraded": case "starting":
-      out = [mk("stop", false), mk("restart", Boolean(notStartable), notStartable)];
+      out = [mk("restart", Boolean(notStartable), notStartable), mk("stop", false)];
       break;
     case "restarting": case "stopping": {
       const why = `${META[s].label.replace(/…$/, "")} — wait for it to finish`;
-      out = [mk("stop", true, why), mk("restart", true, why)];
+      out = [mk("restart", true, why), mk("stop", true, why)];
       break;
     }
     case "stopped": case "failed":
-      out = [mk("start", Boolean(notStartable), notStartable), mk("restart", true, "Not running")];
+      out = [mk("start", Boolean(notStartable), notStartable), mk("stop", true, "Not running")];
       break;
     case "unknown":
       if (ctx.kind === "gateway") {
         const why = "Gateway status unavailable";
-        out = [mk("start", false, why), mk("stop", false, why), mk("restart", false, why)];
+        out = [mk("start", false, why), mk("restart", false, why), mk("stop", false, why)];
       } else {
         out = [];
       }
@@ -251,6 +253,27 @@ export function lifecycleActions(s: LifecycleState, ctx: LifecycleActionCtx): Li
   if (ctx.kind === "postgres") out = out.filter((a) => a.action === "stop");
   if (ctx.blockedReason) out = out.map((a) => ({ ...a, disabled: true, reason: ctx.blockedReason }));
   return out;
+}
+
+/* ---------------- Swapped-button guard ----------------
+ * Start turns into Restart/Stop (and back) in place when a state
+ * changes, so the second click of a double-click could land on the
+ * other action. Every render notes the actions it offers; a click within
+ * SWAP_GUARD_MS of a change in that set is ignored. */
+export const SWAP_GUARD_MS = 800;
+const offered = new Map<string, { sig: string; at: number }>();
+
+export function noteOfferedActions(key: string, specs: readonly LifecycleActionSpec[], now: number = Date.now()): void {
+  const sig = specs.map((a) => `${a.action}${a.disabled ? "-" : "+"}`).join("");
+  const prev = offered.get(key);
+  if (prev?.sig === sig) return;
+  // The first render of a target is not a swap.
+  offered.set(key, { sig, at: prev ? now : 0 });
+}
+
+export function actionJustSwapped(key: string, now: number = Date.now()): boolean {
+  const o = offered.get(key);
+  return o !== undefined && now - o.at < SWAP_GUARD_MS;
 }
 
 /* ---------------- Summaries and the system verdict ---------------- */
@@ -274,8 +297,8 @@ export interface LifecycleSummary {
   gateway: LifecycleState | null;
 }
 
-/** The one count rule for the sidebar, the dashboard pill and Start-all
- *  bar, and the map pill: enabled + configured backends only. */
+/** The one count rule for the sidebar (its counts and Start All), the
+ *  dashboard pill and the map pill: enabled + configured backends only. */
 export function summarize(input: {
   backends: readonly SummarizableBackend[];
   gateway: LifecycleState | null;

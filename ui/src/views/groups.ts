@@ -31,10 +31,11 @@ import type {
   BackendRow, GatewayConfigData, GatewayGroup, ModelRow,
 } from "../api";
 import { trim1 } from "../charts";
-import { esc } from "../html";
+import { esc, fitMenus, keepFocus, setHtml } from "../html";
 import { fromWire, lifecycleDot, lifecycleLabel, serviceStore } from "../lifecycle";
 import { icon } from "../icons";
-import { predictedCardTip, sameModelFile } from "./static";
+import { modelDisplayName } from "./common";
+import { predictedCardTip } from "./static";
 
 const UNGROUPED = "__ungrouped";
 const INPUT_STYLE = "background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:12px";
@@ -151,8 +152,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
       : membershipsOf(id);
 
   const modelName = (b: BackendRow): string => {
-    const m = models.find((x) => sameModelFile(b.model_file, x.gguf_path));
-    return m ? m.name : b.model_file.split(/[\\/]/).pop() ?? b.model_file;
+    return modelDisplayName(b.model_file, models);
   };
 
   /** The backend's effective lifecycle state (wire state + the shared
@@ -320,9 +320,10 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     // the dragged card is inside it, and destroying the drag
     // source cancels the drag (see paintDeferredDuringDrag).
     if (dragId !== null) { paintDeferredDuringDrag = true; return; }
-    if (!loaded) { el.innerHTML = loadingHtml("Loading groups\u2026"); return; }
-    if (loadError) { el.innerHTML = emptyHtml(`Groups unavailable: ${loadError}`); return; }
-    el.innerHTML = `<div class="groups-lanes">${[...groups.map((g) => laneHtml(g)), laneHtml(null)].join("")}</div>`;
+    if (!loaded) { setHtml(el, loadingHtml("Loading groups\u2026")); return; }
+    if (loadError) { setHtml(el, emptyHtml(`Groups unavailable: ${loadError}`)); return; }
+    keepFocus(root, () => { setHtml(el, `<div class="groups-lanes">${[...groups.map((g) => laneHtml(g)), laneHtml(null)].join("")}</div>`); });
+    fitMenus(root);
   }
 
   async function load(): Promise<void> {
@@ -495,6 +496,11 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
 
   function onKeydown(ev: KeyboardEvent): void {
     if (disposed) return;
+    if (ev.key === "Escape" && openMenus.size) {
+      openMenus.clear();
+      paint();
+      return;
+    }
     if ((ev.target as HTMLElement).id === "groupsNewName" && ev.key === "Enter") {
       ev.preventDefault();
       void doCreate();
@@ -609,7 +615,8 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
 
   root.addEventListener("click", onClick);
   root.addEventListener("input", onInput);
-  root.addEventListener("keydown", onKeydown);
+  // On the document: Escape closes the menu wherever the focus is.
+  document.addEventListener("keydown", onKeydown);
   root.addEventListener("dragstart", onDragStart);
   root.addEventListener("dragover", onDragOver);
   root.addEventListener("dragleave", onDragLeave);
@@ -629,7 +636,7 @@ export async function wireGroups(root: HTMLElement): Promise<() => void> {
     // (code review v0.1.60 UI-6).
     root.removeEventListener("click", onClick);
     root.removeEventListener("input", onInput);
-    root.removeEventListener("keydown", onKeydown);
+    document.removeEventListener("keydown", onKeydown);
     root.removeEventListener("dragstart", onDragStart);
     root.removeEventListener("dragover", onDragOver);
     root.removeEventListener("dragleave", onDragLeave);

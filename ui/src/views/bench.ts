@@ -16,9 +16,11 @@ import type {
   BenchSweepRequest, ModelRow,
 } from "../api";
 import { fmtCount, stackedBar, trim1 } from "../charts";
-import { esc } from "../html";
+import { editingIn, esc, keepFocus } from "../html";
 import { fromWire } from "../lifecycle";
 import { icon } from "../icons";
+import { pageState } from "../viewState";
+import { modelDisplayName } from "./common";
 
 export function renderBench(): string {
   return `<div class="topbar"><h1>Bench</h1><span class="spacer"></span><a class="btn icon-only" href="#/logs?scope=bench&follow=1" title="Logs" aria-label="Bench logs">${icon("logs")}</a></div>
@@ -29,13 +31,21 @@ const SELECT_STYLE = "background:var(--panel);color:var(--text);border:1px solid
 const INPUT_STYLE = "background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:12px";
 const TARGET_MINUTES = 20;
 
-function fmtDateMs(ms: number | null | undefined): string {
-  if (ms == null) return "—";
+/** A timestamp, or a dash when it was never recorded (null, or the 0 a
+ *  shipped entry carries — not 1 January 1970). */
+export function fmtDateMs(ms: number | null | undefined): string {
+  if (!ms || ms < 0) return "—";
   const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" });
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
-function fmtElapsed(ms: number): string {
+/** The sampling temperature from the form's text, or why it is not one. */
+export function parseTemperature(text: string): { value: number } | { error: string } {
+  const n = text.trim() === "" ? NaN : Number(text);
+  return Number.isFinite(n) && n >= 0 && n <= 2 ? { value: n } : { error: "Temperature must be a number between 0 and 2." };
+}
+
+export function fmtElapsed(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
   const m = Math.floor(s / 60);
   return m > 0 ? `${m} min ${s % 60} s` : `${s} s`;
@@ -45,7 +55,7 @@ function fmtNum(v: number | null | undefined): string {
   return v == null ? "—" : trim1(v);
 }
 
-function fmtVram(mib: number | null): string {
+export function fmtVram(mib: number | null): string {
   if (mib == null) return "—";
   return mib >= 1024 ? `${trim1(mib / 1024)} GiB` : `${fmtCount(mib)} MiB`;
 }
@@ -69,7 +79,7 @@ const DEPTH_VALUES = [0, 8192, 30720];
 const SPEC_VALUES = ["none", "ngram-mod", "draft-simple", "combined"];
 const NMIN_VALUES = [4, 16, 48];
 
-function armLabel(v: BenchArmVariant): string {
+export function armLabel(v: BenchArmVariant): string {
   const parts: string[] = [];
   if (v.cache_k || v.cache_v) parts.push(`KV ${v.cache_k ?? "—"}/${v.cache_v ?? "—"}`);
   if (v.flash_attn) parts.push(`FA ${v.flash_attn}`);
@@ -88,20 +98,31 @@ function armLabel(v: BenchArmVariant): string {
  *  manager-bench's offload_expr_for_layers): 0 layers → no offload
  *  (the empty string, deliberately not null — the arm sets the
  *  position), all layers → full expert offload, otherwise the
- *  partial --n-cpu-moe spelling. */
-function offloadExprFor(layers: number, moeLayers: number): string {
+ *  partial --n-cpu-moe spelling at the position's block-index bound
+ *  (`bounds`, the backend's n_cpu_moe_by_position; absent = the
+ *  position itself). */
+export function offloadExprFor(layers: number, moeLayers: number, bounds?: number[]): string {
   if (layers <= 0) return "";
   if (layers >= moeLayers) return "-ot exps=CPU";
-  return `--n-cpu-moe ${layers}`;
+  return `--n-cpu-moe ${bounds?.[layers] ?? layers}`;
+}
+
+/** The MoE-layer position a --n-cpu-moe bound selects: the largest
+ *  position whose bound is <= it (identity without a table). */
+function layersForBound(bound: number, bounds?: number[]): number {
+  if (!bounds || bounds.length < 2) return bound;
+  let k = 0;
+  for (let i = 1; i < bounds.length && bounds[i] <= bound; i++) k = i;
+  return k;
 }
 
 /** The position an offload expression names, in layers (null when
  *  the expression is a custom form the preview cannot judge). */
-function offloadLayersOf(expr: string, moeLayers: number): number | null {
+export function offloadLayersOf(expr: string, moeLayers: number, bounds?: number[]): number | null {
   const t = expr.trim();
   if (t === "") return 0;
   const ncmoe = /^(?:--n-cpu-moe|-ncmoe)[=\s](\d+)$/.exec(t);
-  if (ncmoe) return Math.min(Number(ncmoe[1]), moeLayers);
+  if (ncmoe) return Math.min(layersForBound(Number(ncmoe[1]), bounds), moeLayers);
   if (/^(?:--cpu-moe|-cmoe)$/.test(t)) return moeLayers;
   if (/^-ot\s+(.+)$/.test(t)) {
     const parts = t.replace(/^-ot\s+/, "").split(",").map((p) => p.trim());
@@ -113,21 +134,21 @@ function offloadLayersOf(expr: string, moeLayers: number): number | null {
 /** Sweep positions offered for an MoE backend: no offload,
  *  quarter steps of the MoE layer count, full offload, plus the
  *  backend's current position when it is not already one of them. */
-function offloadChoices(off: BackendOffload): number[] {
+export function offloadChoices(off: BackendOffload): number[] {
   const m = off.moe_layers;
   const set = new Set<number>([0, Math.round(m / 4), Math.round(m / 2), Math.round((3 * m) / 4), m, off.layers]);
   return [...set].sort((a, b) => a - b);
 }
 
-function offloadPosLabel(n: number, off: BackendOffload): string {
+export function offloadPosLabel(n: number, off: BackendOffload): string {
   if (n === 0) return "No offload";
   if (n === off.moe_layers) return "All experts";
-  return `-ncmoe ${n}`;
+  return `-ncmoe ${off.n_cpu_moe_by_position?.[n] ?? n}`;
 }
 
 /** The client-knowable pruning rules (§3.2); the server's
  *  validation remains authoritative at run time. */
-function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off: BackendOffload | null = null): string | null {
+export function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off: BackendOffload | null = null): string | null {
   const cv = v.cache_v ?? null;
   if ((cv === "q8_0" || cv === "q4_0") && v.flash_attn === "off") {
     return "Quantized V cache with flash attention off — llama.cpp refuses this pairing";
@@ -144,7 +165,7 @@ function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off
   // no journaled override). The server's prune is authoritative.
   if (off?.guardrail && off.guardrail.allowed === "endpoints_only"
     && off.guardrail.placed_ccs.includes(off.guardrail.compute_capability)) {
-    const position = v.offload_expr != null ? offloadLayersOf(v.offload_expr, off.moe_layers) : off.layers;
+    const position = v.offload_expr != null ? offloadLayersOf(v.offload_expr, off.moe_layers, off.n_cpu_moe_by_position) : off.layers;
     if (position != null && position > 0 && position < off.moe_layers) {
       return `Partial expert offload is forbidden on compute capability ${off.guardrail.compute_capability} — only no offload or full expert offload is permitted; nearest permitted position: ${off.layers >= off.moe_layers / 2 ? off.moe_layers : 0} of ${off.moe_layers} layers`;
     }
@@ -152,7 +173,7 @@ function pruneReason(v: BenchArmVariant, requestDraftModelId: string | null, off
   return null;
 }
 
-function expandDims(dims: BenchArmVariant[][]): BenchArmVariant[] {
+export function expandDims(dims: BenchArmVariant[][]): BenchArmVariant[] {
   let arms: BenchArmVariant[] = [{}];
   for (const dim of dims) {
     if (!dim.length) continue;
@@ -163,7 +184,7 @@ function expandDims(dims: BenchArmVariant[][]): BenchArmVariant[] {
   return arms;
 }
 
-function presetArms(preset: "kv" | "spec" | "combined", draftModelId: string, draftNMax: number, draftDevice: string): BenchArmVariant[] {
+export function presetArms(preset: "kv" | "spec" | "combined", draftModelId: string, draftNMax: number, draftDevice: string): BenchArmVariant[] {
   if (preset === "kv") {
     return [["f16", "f16"], ["q8_0", "q8_0"], ["f16", "q8_0"], ["q4_0", "q4_0"]]
       .map(([k, v]) => ({ cache_k: k, cache_v: v, depth: 8192, spec: "none" }));
@@ -281,9 +302,11 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   let disposed = false;
   let live = isTauri();
   let loadError: string | null = null;
-  let tab: "run" | "results" | "prompts" = "run";
-  let statusLine = "";
-  let statusErr = false;
+  const kept = pageState<{ tab: "run" | "results" | "prompts" }>("bench", { tab: "run" });
+  let tab = kept.tab;
+  /** The last message and the form or list it is about: it renders
+   *  beside it. */
+  let status: { text: string; err: boolean; at: "run" | "progress" | "results" | "generate" | "prompt" | "prompts" } | null = null;
 
   let prompts: BenchPromptEntry[] = [];
   let sweeps: BenchSweepRecord[] = [];
@@ -295,7 +318,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   let selBackend = "";
   let selPrompt = "";
   let preset: "kv" | "spec" | "combined" | "custom" = "kv";
-  let temperature = 0;
+  let temperatureText = "0";
   let confirm06 = false;
   let correctness: boolean | null = null;
   let baselineIdx = 0;
@@ -312,6 +335,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   };
   let interlock: { names: string[]; message: string; request: BenchSweepRequest } | null = null;
   let runBusy = false;
+  /** Backends the sweep being started was told to stop first. */
+  let stoppingNames: string[] = [];
 
   /* Results-tab state. */
   const sweepMetric = new Map<string, "gen" | "prompt" | "ttft" | "acceptance">();
@@ -333,6 +358,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   let pollTimer: number | null = null;
 
   const enabledBackends = (): BackendRow[] => backends.filter((b) => b.enabled !== false);
+  const statusHtml = (at: NonNullable<typeof status>["at"]): string =>
+    status && status.at === at ? `<div style="font-size:12px;margin-top:6px;color:${status.err ? "var(--err)" : "var(--text2)"}" role="status">${esc(status.text)}</div>` : "";
   const runningSweep = (): BenchSweepRecord | undefined => sweeps.find((s) => s.status === "running");
 
   function defaultCorrectness(): boolean {
@@ -379,7 +406,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     const off = selOffload();
     if (off && dims.offloadOn && dims.offloadPositions.size) {
       out.push([...dims.offloadPositions].sort((a, b) => a - b)
-        .map((n) => ({ offload_expr: offloadExprFor(n, off.moe_layers) })));
+        .map((n) => ({ offload_expr: offloadExprFor(n, off.moe_layers, off.n_cpu_moe_by_position) })));
     }
     return out;
   }
@@ -403,7 +430,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     return {
       backend_id: selBackend,
       prompt_id: selPrompt,
-      temperature,
+      temperature: Number(temperatureText),
       correctness_control: correctness ?? defaultCorrectness(),
       stop_backend_ids: stopIds,
       preset: preset === "custom" ? null : preset,
@@ -442,7 +469,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       || (preset === "custom" && dims.specOn && ([...dims.specs].includes("draft-simple") || [...dims.specs].includes("combined")));
     const showNmin = preset === "custom" && dims.specOn && ([...dims.specs].includes("ngram-mod") || [...dims.specs].includes("combined"));
     const running = runningSweep();
-    const backendOpts = backs.map((b) => `<option value="${esc(b.id)}"${b.id === selBackend ? " selected" : ""}>${esc(b.id)} · ${esc(b.model_file)}</option>`).join("");
+    const backendOpts = backs.map((b) => `<option value="${esc(b.id)}"${b.id === selBackend ? " selected" : ""}>${esc(b.id)} · ${esc(modelDisplayName(b.model_file, models))}</option>`).join("");
     const promptOpts = prompts.map((p) => `<option value="${esc(p.id)}"${p.id === selPrompt ? " selected" : ""}>${esc(p.name)} (${esc(p.purpose)})</option>`).join("");
     const modelOpts = `<option value="">—</option>` + models.map((m) => `<option value="${esc(m.id)}"${m.id === draftModelId ? " selected" : ""}>${esc(m.name || m.id)}</option>`).join("");
 
@@ -452,7 +479,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         <span style="flex:1"></span>
         <button class="btn danger" data-bench-act="cancel-run" data-sweep="${esc(running.id)}">${icon("x")} Cancel</button>
       </div>
-    </div>` : "";
+      ${statusHtml("progress")}
+    </div>` : runBusy ? `<div class="opt-row" style="margin-bottom:12px"><span class="opt-consulting">${icon("clock")} ${stoppingNames.length ? `Stopping ${esc(stoppingNames.join(", "))} and starting the sweep…` : "Starting the sweep…"}</span></div>` : statusHtml("progress");
 
     const interlockHtml = interlock ? `<div class="opt-row invalid" style="margin-bottom:12px">
       <div class="opt-row-main">
@@ -526,7 +554,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       <div>
         <div class="opt-field-label">Sampling</div>
         <div class="opt-consult-row">
-          <label style="font-size:12px;color:var(--text2)">Temperature <input id="benchTemp" type="number" min="0" max="2" step="0.1" value="${temperature}" style="${INPUT_STYLE};width:70px"></label>
+          <label style="font-size:12px;color:var(--text2)">Temperature <input id="benchTemp" type="number" min="0" max="2" step="0.1" value="${esc(temperatureText)}" style="${INPUT_STYLE};width:70px"></label>
           <label style="font-size:12px"><input type="checkbox" data-bench-flag="confirm06"${confirm06 ? " checked" : ""}> Confirm at 0.6${infoTip("Adds a second pass at temperature 0.6 for the winning arm, per the screening protocol.")}</label>
         </div>
         <div class="opt-consult-row" style="margin-top:8px">
@@ -553,6 +581,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         <button class="btn primary" data-bench-act="run" ${runBusy || running || !backs.length || !prompts.length || !arms.length ? "disabled" : ""}>${icon("play")} Run sweep</button>
         ${running ? `<span class="opt-note">A sweep is running — cancel it before starting another.</span>` : ""}
       </div>
+      ${statusHtml("run")}
     </div>`;
   }
 
@@ -752,7 +781,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   }
 
   function resultsHtml(): string {
-    if (!sweeps.length) return `<div class="empty">No sweeps recorded</div>`;
+    const starting = runBusy && !runningSweep() ? `<div class="opt-row" style="margin-bottom:12px"><span class="opt-consulting">${icon("clock")} Starting the sweep…</span></div>` : "";
+    if (!sweeps.length) return `${starting}${statusHtml("results")}<div class="empty">No sweeps recorded</div>`;
     const sorted = [...sweeps].sort((a, b) => b.started_ms - a.started_ms);
     let compareHtml = "";
     const sel = sorted.filter((s) => compareSel.has(s.id));
@@ -776,7 +806,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     } else if (sel.length > 2) {
       compareHtml = `<div class="opt-note" style="margin-bottom:8px">Compare takes exactly two sweeps — ${sel.length} selected.</div>`;
     }
-    return `${compareHtml}${sorted.map(sweepCardHtml).join("")}`;
+    return `${starting}${statusHtml("results")}${statusHtml("progress")}${compareHtml}${sorted.map(sweepCardHtml).join("")}`;
   }
 
   /* ---------------- Prompts tab ---------------- */
@@ -801,6 +831,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
              <button class="btn danger" data-bench-act="generate-cancel" ${genCancelArmed ? "disabled" : ""}>${icon("x")} Cancel</button>`
           : `<button class="btn" data-bench-act="generate">${icon("bolt")} Generate draft</button>`}
       </div>
+      ${statusHtml("generate")}
     </div>`;
 
     let editorHtml = "";
@@ -823,6 +854,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
           ${changedFromShipped ? `<button class="btn" data-bench-act="prompt-restore">${icon("restart")} Restore shipped text</button>` : ""}
           ${changedFromShipped ? `<span class="opt-note">Saving an edited shipped entry saves it as a user entry.</span>` : ""}
         </div>
+        ${statusHtml("prompt")}
       </div>`;
     }
 
@@ -841,6 +873,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     <div class="opt-consult-actions" style="margin:0 0 10px">
       <button class="btn" data-bench-act="prompt-new">${icon("plus")} New prompt</button>
     </div>
+    ${statusHtml("prompts")}
     ${prompts.length
       ? `<div style="overflow-x:auto"><table class="tbl" style="min-width:640px"><thead><tr><th>Name</th><th>Purpose</th><th>Origin</th><th>Chars</th><th>Updated</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
       : `<div class="empty">No prompts in the library</div>`}`;
@@ -852,25 +885,33 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     if (disposed) return;
     const tabBtn = (t: typeof tab, label: string) =>
       `<button data-bench-tab="${t}" class="${tab === t ? "active" : ""}">${label}</button>`;
-    hostEl.innerHTML = `
+    keepFocus(hostEl, () => { hostEl.innerHTML = `
     ${!live ? `<div class="banner mode-live">${icon("info")} Sample mode — Bench data needs the desktop app.</div>` : ""}
     ${loadError ? `<div class="banner">${icon("err")} Backend error — ${esc(loadError)}</div>` : ""}
     <div class="card">
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
         <span class="viewsel" role="group" aria-label="Bench tabs">${tabBtn("run", "Run")}${tabBtn("results", "Results")}${tabBtn("prompts", "Prompts")}</span>
-        <span style="flex:1"></span>
-        ${statusLine ? `<span style="font-size:12px;${statusErr ? "color:var(--err)" : "color:var(--text2)"}">${esc(statusLine)}</span>` : ""}
       </div>
       ${tab === "run" ? runHtml() : tab === "results" ? resultsHtml() : promptsHtml()}
-    </div>`;
+    </div>`; });
   }
 
   async function refreshResults(): Promise<void> {
     const r = await benchResultsList();
     if (disposed) return;
     if (r.error) { loadError = r.error; return; }
+    // A sweep runs in the background: the poll that sees it end says so.
+    const wasRunning = new Set(sweeps.filter((s) => s.status === "running").map((s) => s.id));
     sweeps = r.data.sweeps;
     loadError = null;
+    for (const s of sweeps) {
+      if (wasRunning.has(s.id) && s.status !== "running") sweepEnded(s);
+    }
+  }
+
+  function sweepEnded(s: BenchSweepRecord): void {
+    const why = s.status === "failed" ? s.arms.find((a) => a.detail)?.detail : null;
+    setStatus(`Sweep ${s.status === "complete" ? "finished" : s.status}: ${s.backend_name} · ${s.prompt_name}${why ? ` — ${why}` : ""}`, s.status === "failed", "progress");
   }
 
   async function refreshAll(): Promise<void> {
@@ -909,34 +950,39 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
 
   /* ---------------- Actions ---------------- */
 
-  function setStatus(text: string, err = false): void {
-    statusLine = text;
-    statusErr = err;
+  function setStatus(text: string, err: boolean, at: NonNullable<typeof status>["at"]): void {
+    status = text ? { text, err, at } : null;
   }
 
   async function doRun(stopIds: string[]): Promise<void> {
-    if (!selBackend || !selPrompt) { setStatus("Pick a backend and a prompt first.", true); paint(); return; }
-    runBusy = true;
-    paint();
+    const temp = parseTemperature(temperatureText);
+    const bad = !selBackend || !selPrompt ? "Pick a backend and a prompt first." : "error" in temp ? temp.error : null;
+    if (bad) { setStatus(bad, true, "run"); paint(); return; }
     const req = buildRequest(stopIds);
+    // The call answers at once; the 2 s poll shows the progress and
+    // the end.
+    runBusy = true;
+    stoppingNames = stopIds;
+    interlock = null;
+    setStatus("", false, "run");
+    paint();
     const r = await benchRunStart(req);
     runBusy = false;
+    stoppingNames = [];
     if (disposed) return;
     if (r.error) {
       const names = parseConflicts(r.error);
-      if (names.length && !stopIds.length) {
-        interlock = { names, message: r.error, request: req };
-        setStatus("");
-      } else {
-        interlock = null;
-        setStatus(`Run failed — ${r.error}`, true);
-      }
-      paint();
+      if (names.length && !stopIds.length) interlock = { names, message: r.error, request: req };
+      else setStatus(`Run failed — ${r.error}`, true, "run");
+      await refreshResults();
+      if (!disposed) paint();
       return;
     }
-    interlock = null;
-    setStatus(`Sweep started: ${r.data.sweep_id}`);
     await refreshResults();
+    if (disposed) return;
+    // One that ended before the first poll was never seen running.
+    const mine = sweeps.find((s) => s.id === r.data.sweep_id);
+    if (mine && mine.status !== "running") sweepEnded(mine);
     paint();
   }
 
@@ -956,8 +1002,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     generating = false;
     if (disposed) return;
     if (r.error) {
-      if (!cancelled()) setStatus(`Generate failed — ${r.error}`, true);
-      else setStatus("Generation cancelled.");
+      if (!cancelled()) setStatus(`Generate failed — ${r.error}`, true, "generate");
+      else setStatus("Generation cancelled.", false, "generate");
       paint();
       return;
     }
@@ -968,7 +1014,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
       isNew: true, origName: "", origBody: "",
       genBackend: r.data.backend_id || null, genModel: r.data.model || null,
     };
-    setStatus("");
+    setStatus("", false, "generate");
     paint();
   }
 
@@ -981,7 +1027,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     if (!editing) return;
     const e = editing;
     if (!e.name.trim() || !e.purpose.trim()) {
-      setStatus("Name and purpose are required.", true);
+      setStatus("Name and purpose are required.", true, "prompt");
       paint();
       return;
     }
@@ -1001,10 +1047,10 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     };
     const r = await benchPromptSave(entry);
     if (disposed) return;
-    if (r.error) { setStatus(`Save failed — ${r.error}`, true); paint(); return; }
+    if (r.error) { setStatus(`Save failed — ${r.error}`, true, "prompt"); paint(); return; }
     prompts = r.data.prompts;
     editing = null; // rule 17: saving a form closes it
-    setStatus(`Prompt saved: ${entry.name}`);
+    setStatus(`Prompt saved: ${entry.name}`, false, "prompts");
     paint();
   }
 
@@ -1016,6 +1062,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     const tabBtnEl = t.closest<HTMLElement>("[data-bench-tab]");
     if (tabBtnEl) {
       tab = (tabBtnEl.dataset.benchTab as typeof tab) ?? "run";
+      kept.tab = tab;
       paint();
       return;
     }
@@ -1030,8 +1077,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
     if (copyBtn) {
       const text = copyBtn.dataset.benchCopy ?? "";
       void (async () => {
-        try { await navigator.clipboard.writeText(text); setStatus("Raw flags copied."); }
-        catch { setStatus("Copy failed.", true); }
+        try { await navigator.clipboard.writeText(text); setStatus("Raw flags copied.", false, "results"); }
+        catch { setStatus("Copy failed.", true, "results"); }
         paint();
       })();
       return;
@@ -1076,8 +1123,8 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         void (async () => {
           const r = await benchRunCancel(sid);
           if (disposed) return;
-          if (r.error) { setStatus(`Cancel failed — ${r.error}`, true); paint(); return; }
-          setStatus("Sweep cancellation requested.");
+          if (r.error) { setStatus(`Cancel failed — ${r.error}`, true, "progress"); paint(); return; }
+          setStatus("Sweep cancellation requested.", false, "progress");
           await refreshResults();
           paint();
         })();
@@ -1097,10 +1144,10 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         void (async () => {
           const r = await benchResultDelete(sid);
           if (disposed) return;
-          if (r.error) { setStatus(`Delete failed — ${r.error}`, true); paint(); return; }
+          if (r.error) { setStatus(`Delete failed — ${r.error}`, true, "results"); paint(); return; }
           sweeps = r.data.sweeps;
           compareSel.delete(sid);
-          setStatus("Sweep deleted.");
+          setStatus("Sweep deleted.", false, "results");
           paint();
         })();
         return;
@@ -1158,11 +1205,11 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
         void (async () => {
           const r = await benchPromptDelete(id);
           if (disposed) return;
-          if (r.error) { setStatus(`Delete failed — ${r.error}`, true); paint(); return; }
+          if (r.error) { setStatus(`Delete failed — ${r.error}`, true, "prompts"); paint(); return; }
           prompts = r.data.prompts;
           if (editing?.id === id) editing = null;
           if (selPrompt === id) selPrompt = autoPromptFor(selBackend);
-          setStatus("Prompt deleted.");
+          setStatus("Prompt deleted.", false, "prompts");
           paint();
         })();
         return;
@@ -1251,7 +1298,7 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   hostEl.addEventListener("input", (ev) => {
     const t = ev.target as HTMLElement;
     // Drafts sync on input so poll repaints never lose operator text.
-    if (t.id === "benchTemp") { const n = Number((t as HTMLInputElement).value); if (Number.isFinite(n)) temperature = n; return; }
+    if (t.id === "benchTemp") { temperatureText = (t as HTMLInputElement).value; return; }
     if (t.id === "benchGenPurpose") { genPurpose = (t as HTMLInputElement).value; return; }
     if (t.id === "benchGenDesc") { genDescription = (t as HTMLInputElement).value; return; }
     if (!editing) return;
@@ -1261,16 +1308,12 @@ export async function wireBench(root: HTMLElement): Promise<() => void> {
   });
 
   await refreshAll();
-  // Poll every 2 s while any sweep is running (§ contract). A tick
-  // is skipped while the operator is editing a text field, so a
-  // repaint cannot drop the caret mid-edit.
+  // Poll every 2 s while a sweep is running or being started (§
+  // contract). A tick is skipped while the operator is in a text field
+  // or a select, so a repaint cannot drop the caret or the open list.
   pollTimer = window.setInterval(() => {
-    if (disposed || !sweeps.some((s) => s.status === "running")) return;
-    const active = document.activeElement;
-    if (active && hostEl.contains(active)
-      && (active instanceof HTMLTextAreaElement || (active instanceof HTMLInputElement && active.type === "text"))) {
-      return;
-    }
+    if (disposed || (!runBusy && !sweeps.some((s) => s.status === "running"))) return;
+    if (editingIn(hostEl)) return;
     void (async () => { await refreshResults(); if (!disposed) paint(); })();
   }, 2000);
 

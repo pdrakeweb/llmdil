@@ -226,10 +226,7 @@ pub struct LaunchSpec {
 /// the app's log dir (the supervisor's in-memory rings cannot capture
 /// a process the app did not spawn).
 pub fn backend_definition(spec: &ProcessSpec, log_dir: &Path) -> ServiceDefinition {
-    let port_note = spec
-        .port
-        .map(|p| format!(", port {p}"))
-        .unwrap_or_default();
+    let port_note = spec.port.map(|p| format!(", port {p}")).unwrap_or_default();
     ServiceDefinition {
         version: DEFINITION_VERSION,
         name: backend_service_name(&spec.id),
@@ -414,10 +411,7 @@ pub fn log_receiver_definition(data_dir: &Path, receiver_exe: &Path) -> ServiceD
 /// quotes, or a trailing backslash; double embedded quotes and the
 /// backslashes that precede them).
 pub fn quote_arg(arg: &str) -> String {
-    if !arg.is_empty()
-        && !arg.contains([' ', '\t', '"'])
-        && !arg.ends_with('\\')
-    {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) && !arg.ends_with('\\') {
         return arg.to_string();
     }
     let mut out = String::with_capacity(arg.len() + 2);
@@ -492,11 +486,9 @@ pub fn resolve_env(
         match &entry.value {
             EnvValue::Literal { value } => out.push((entry.name.clone(), value.clone())),
             EnvValue::CredentialRef { target } => {
-                let value = read_cred(target).ok_or_else(|| {
-                    ServiceError::CredentialMissing {
-                        name: entry.name.clone(),
-                        target: target.clone(),
-                    }
+                let value = read_cred(target).ok_or_else(|| ServiceError::CredentialMissing {
+                    name: entry.name.clone(),
+                    target: target.clone(),
                 })?;
                 out.push((entry.name.clone(), value));
             }
@@ -629,9 +621,7 @@ impl ServiceStatus {
                 HOST_EXIT_ENV_FAILURE => {
                     "service host could not resolve the environment/credentials".to_string()
                 }
-                HOST_EXIT_SPAWN_FAILURE => {
-                    "service host could not spawn the program".to_string()
-                }
+                HOST_EXIT_SPAWN_FAILURE => "service host could not spawn the program".to_string(),
                 code => format!("child exited with code {}", exit_code_text(code)),
             });
         }
@@ -653,9 +643,9 @@ impl ServiceStatus {
             ServiceState::StopPending => ProcessState::Stopping,
             ServiceState::Paused => ProcessState::Failed,
             ServiceState::Stopped if self.stopped_with_error() => ProcessState::Failed,
-            ServiceState::Stopped
-            | ServiceState::NotInstalled
-            | ServiceState::Unknown(_) => ProcessState::Stopped,
+            ServiceState::Stopped | ServiceState::NotInstalled | ServiceState::Unknown(_) => {
+                ProcessState::Stopped
+            }
         }
     }
 }
@@ -669,7 +659,10 @@ pub trait ServiceControl: Send + Sync {
     fn query(&self, name: &str) -> Result<ServiceStatus, ServiceError>;
     /// Whether the service exists in the SCM; derived from [`Self::query`].
     fn is_registered(&self, name: &str) -> Result<bool, ServiceError> {
-        Ok(!matches!(self.query(name)?.state, ServiceState::NotInstalled))
+        Ok(!matches!(
+            self.query(name)?.state,
+            ServiceState::NotInstalled
+        ))
     }
     /// Ask the SCM to start the service. An already-running service counts as success.
     /// Returns once the SCM accepts the request, not when the service reaches `Running`.
@@ -786,7 +779,12 @@ impl ServiceTimeouts {
     }
 }
 
-fn timeout_error(name: &str, waiting_for: &str, last: ServiceState, started: Instant) -> ServiceError {
+fn timeout_error(
+    name: &str,
+    waiting_for: &str,
+    last: ServiceState,
+    started: Instant,
+) -> ServiceError {
     ServiceError::Timeout {
         name: name.to_string(),
         waiting_for: waiting_for.to_string(),
@@ -821,7 +819,14 @@ pub fn wait_for_state(
     timeout: Duration,
     on_change: &mut dyn FnMut(&ServiceStatus),
 ) -> Result<ServiceStatus, ServiceError> {
-    wait_for_state_polling(control, name, accept, timeout, ServiceTimeouts::POLL, on_change)
+    wait_for_state_polling(
+        control,
+        name,
+        accept,
+        timeout,
+        ServiceTimeouts::POLL,
+        on_change,
+    )
 }
 
 fn state_matches(state: ServiceState, accept: &[ServiceState]) -> bool {
@@ -841,7 +846,10 @@ fn wait_for_state_polling(
     on_change: &mut dyn FnMut(&ServiceStatus),
 ) -> Result<ServiceStatus, ServiceError> {
     let started = Instant::now();
-    let mut tracker = ChangeTracker { last: None, on_change };
+    let mut tracker = ChangeTracker {
+        last: None,
+        on_change,
+    };
     loop {
         let status = control.query(name)?;
         tracker.see(&status);
@@ -899,7 +907,10 @@ fn stop_and_wait_polling(
     on_change: &mut dyn FnMut(&ServiceStatus),
 ) -> Result<StopOutcome, ServiceError> {
     let started = Instant::now();
-    let mut tracker = ChangeTracker { last: None, on_change };
+    let mut tracker = ChangeTracker {
+        last: None,
+        on_change,
+    };
     let mut first = true;
     let mut stop_sent = false;
     loop {
@@ -978,7 +989,10 @@ fn start_and_wait_polling(
     on_change: &mut dyn FnMut(&ServiceStatus),
 ) -> Result<ServiceStatus, ServiceError> {
     let started = Instant::now();
-    let mut tracker = ChangeTracker { last: None, on_change };
+    let mut tracker = ChangeTracker {
+        last: None,
+        on_change,
+    };
     let mut start_sent = false;
     loop {
         let status = control.query(name)?;
@@ -1020,7 +1034,14 @@ pub fn wait_until_absent(
     name: &str,
     timeout: Duration,
 ) -> Result<(), ServiceError> {
-    wait_for_state(control, name, &[ServiceState::NotInstalled], timeout, &mut |_| {}).map(|_| ())
+    wait_for_state(
+        control,
+        name,
+        &[ServiceState::NotInstalled],
+        timeout,
+        &mut |_| {},
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1055,7 +1076,10 @@ mod tests {
     fn backend_definition_mirrors_the_spec() {
         let def = backend_definition(&sample_spec(), Path::new(r"C:\data\logs"));
         assert_eq!(def.name, "llm-backend-planner");
-        assert_eq!(def.program, PathBuf::from(r"C:\data\llamacpp\llama-server.exe"));
+        assert_eq!(
+            def.program,
+            PathBuf::from(r"C:\data\llamacpp\llama-server.exe")
+        );
         assert_eq!(def.args.len(), 6);
         assert_eq!(
             def.env,
@@ -1092,8 +1116,8 @@ mod tests {
                 EnvEntry {
                     name: "DATABASE_URL".to_string(),
                     value: EnvValue::DatabaseUrl {
-                        password_credential:
-                            "local-llm-service-manager/postgres-password".to_string(),
+                        password_credential: "local-llm-service-manager/postgres-password"
+                            .to_string(),
                         port: 54329,
                     },
                 },
@@ -1181,7 +1205,8 @@ mod tests {
         let resolved = resolve_env(&def, |_| None).expect("no-db resolve");
         assert!(resolved.is_empty());
         // A missing hard credential reference fails the start.
-        def.env.push(EnvEntry::credential_ref("LITELLM_MASTER_KEY", "target/key"));
+        def.env
+            .push(EnvEntry::credential_ref("LITELLM_MASTER_KEY", "target/key"));
         let err = resolve_env(&def, |_| None).expect_err("must fail");
         assert!(matches!(err, ServiceError::CredentialMissing { .. }));
     }
@@ -1190,7 +1215,10 @@ mod tests {
     fn quote_arg_follows_windows_rules() {
         assert_eq!(quote_arg("plain"), "plain");
         assert_eq!(quote_arg(r"C:\path\file.exe"), r"C:\path\file.exe");
-        assert_eq!(quote_arg(r"C:\Program Files\app.exe"), r#""C:\Program Files\app.exe""#);
+        assert_eq!(
+            quote_arg(r"C:\Program Files\app.exe"),
+            r#""C:\Program Files\app.exe""#
+        );
         assert_eq!(quote_arg(r"C:\trailing\"), r#""C:\trailing\\""#);
         assert_eq!(quote_arg("a\"b"), r#""a\"b""#);
         assert_eq!(quote_arg(""), "\"\"");
@@ -1211,10 +1239,8 @@ mod tests {
 
     #[test]
     fn definition_files_round_trip_through_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-services-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-services-test-{}", std::process::id()));
         let def = backend_definition(&sample_spec(), Path::new("logs"));
         let path = write_definition(&dir, &def).expect("write");
         assert_eq!(path, definition_path(&dir, "llm-backend-planner"));
@@ -1273,11 +1299,26 @@ mod tests {
             win32_exit_code: 0,
             service_specific_exit_code: 0,
         };
-        assert_eq!(status(ServiceState::Running).process_state(), ProcessState::Running);
-        assert_eq!(status(ServiceState::StartPending).process_state(), ProcessState::Starting);
-        assert_eq!(status(ServiceState::StopPending).process_state(), ProcessState::Stopping);
-        assert_eq!(status(ServiceState::Stopped).process_state(), ProcessState::Stopped);
-        assert_eq!(status(ServiceState::NotInstalled).process_state(), ProcessState::Stopped);
+        assert_eq!(
+            status(ServiceState::Running).process_state(),
+            ProcessState::Running
+        );
+        assert_eq!(
+            status(ServiceState::StartPending).process_state(),
+            ProcessState::Starting
+        );
+        assert_eq!(
+            status(ServiceState::StopPending).process_state(),
+            ProcessState::Stopping
+        );
+        assert_eq!(
+            status(ServiceState::Stopped).process_state(),
+            ProcessState::Stopped
+        );
+        assert_eq!(
+            status(ServiceState::NotInstalled).process_state(),
+            ProcessState::Stopped
+        );
         // A crash (or a failed start) is Failed, not a clean stop.
         let mut crashed = status(ServiceState::Stopped);
         crashed.win32_exit_code = ERROR_SERVICE_SPECIFIC_ERROR;
@@ -1299,14 +1340,35 @@ mod tests {
     #[test]
     fn lifecycle_state_mapping_includes_exit_codes() {
         use LifecycleState as L;
-        assert_eq!(st(ServiceState::Running, 0, 0).lifecycle_state(), L::Running);
-        assert_eq!(st(ServiceState::StartPending, 0, 0).lifecycle_state(), L::Starting);
-        assert_eq!(st(ServiceState::StopPending, 0, 0).lifecycle_state(), L::Stopping);
-        assert_eq!(st(ServiceState::Stopped, 0, 0).lifecycle_state(), L::Stopped);
+        assert_eq!(
+            st(ServiceState::Running, 0, 0).lifecycle_state(),
+            L::Running
+        );
+        assert_eq!(
+            st(ServiceState::StartPending, 0, 0).lifecycle_state(),
+            L::Starting
+        );
+        assert_eq!(
+            st(ServiceState::StopPending, 0, 0).lifecycle_state(),
+            L::Stopping
+        );
+        assert_eq!(
+            st(ServiceState::Stopped, 0, 0).lifecycle_state(),
+            L::Stopped
+        );
         assert_eq!(st(ServiceState::Stopped, 0, 0).failure_reason(), None);
-        assert_eq!(st(ServiceState::Paused, 0, 0).lifecycle_state(), L::Degraded);
-        assert_eq!(st(ServiceState::Unknown(42), 0, 0).lifecycle_state(), L::Unknown);
-        assert_eq!(st(ServiceState::NotInstalled, 0, 0).lifecycle_state(), L::NotInstalled);
+        assert_eq!(
+            st(ServiceState::Paused, 0, 0).lifecycle_state(),
+            L::Degraded
+        );
+        assert_eq!(
+            st(ServiceState::Unknown(42), 0, 0).lifecycle_state(),
+            L::Unknown
+        );
+        assert_eq!(
+            st(ServiceState::NotInstalled, 0, 0).lifecycle_state(),
+            L::NotInstalled
+        );
 
         let env = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 1);
         assert_eq!(env.lifecycle_state(), L::Failed);
@@ -1320,8 +1382,15 @@ mod tests {
             Some("service host could not spawn the program")
         );
         let child = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 7);
-        assert_eq!(child.failure_reason().as_deref(), Some("child exited with code 7"));
-        let av = st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, 0xC000_0005);
+        assert_eq!(
+            child.failure_reason().as_deref(),
+            Some("child exited with code 7")
+        );
+        let av = st(
+            ServiceState::Stopped,
+            ERROR_SERVICE_SPECIFIC_ERROR,
+            0xC000_0005,
+        );
         assert_eq!(
             av.failure_reason().as_deref(),
             Some("child exited with code 3221225477 (0xC0000005)")
@@ -1329,7 +1398,10 @@ mod tests {
         // An older shim reported the child's code as the Win32 code.
         let legacy = st(ServiceState::Stopped, 1, 0);
         assert_eq!(legacy.lifecycle_state(), L::Failed);
-        assert_eq!(legacy.failure_reason().as_deref(), Some("child exited with code 1"));
+        assert_eq!(
+            legacy.failure_reason().as_deref(),
+            Some("child exited with code 1")
+        );
         // A running service never has a failure reason.
         assert_eq!(
             st(ServiceState::Running, ERROR_SERVICE_SPECIFIC_ERROR, 2).failure_reason(),
@@ -1379,9 +1451,18 @@ mod tests {
         }
         fn stop(&self, _name: &str) -> Result<(), ServiceError> {
             self.calls.lock().unwrap().push("stop");
-            self.stop_results.lock().unwrap().pop_front().unwrap_or(Ok(()))
+            self.stop_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
         }
-        fn register(&self, _: &ServiceDefinition, _: &str, _: Option<&str>) -> Result<(), ServiceError> {
+        fn register(
+            &self,
+            _: &ServiceDefinition,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), ServiceError> {
             Ok(())
         }
         fn unregister(&self, _name: &str) -> Result<(), ServiceError> {
@@ -1427,7 +1508,11 @@ mod tests {
         assert_eq!(fake.calls(), vec!["stop"]);
         assert_eq!(
             seen,
-            vec![ServiceState::Running, ServiceState::StopPending, ServiceState::Stopped]
+            vec![
+                ServiceState::Running,
+                ServiceState::StopPending,
+                ServiceState::Stopped
+            ]
         );
     }
 
@@ -1459,12 +1544,13 @@ mod tests {
         assert_eq!(fake.calls(), vec!["stop", "stop", "stop"]);
 
         // Any other control error is an error.
-        let fake = FakeControl::new(vec![st(ServiceState::Running, 0, 0)]).with_stop_results(vec![
-            Err(ServiceError::Scm {
-                operation: "ControlService",
-                code: 5,
-            }),
-        ]);
+        let fake =
+            FakeControl::new(vec![st(ServiceState::Running, 0, 0)]).with_stop_results(vec![Err(
+                ServiceError::Scm {
+                    operation: "ControlService",
+                    code: 5,
+                },
+            )]);
         let err = stop_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap_err();
         assert_eq!(err.win32_code(), Some(5));
 
@@ -1472,7 +1558,16 @@ mod tests {
         let fake = FakeControl::new(vec![st(ServiceState::StopPending, 0, 0)]);
         let err = stop_and_wait_polling(&fake, "svc", Duration::from_millis(20), FAST, &mut |_| {})
             .unwrap_err();
-        assert!(matches!(err, ServiceError::Timeout { last_state: "stop_pending", .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                ServiceError::Timeout {
+                    last_state: "stop_pending",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1480,7 +1575,11 @@ mod tests {
         let fake = FakeControl::new(vec![
             st(ServiceState::Stopped, 0, 0),
             st(ServiceState::StartPending, 0, 0),
-            st(ServiceState::Stopped, ERROR_SERVICE_SPECIFIC_ERROR, HOST_EXIT_SPAWN_FAILURE),
+            st(
+                ServiceState::Stopped,
+                ERROR_SERVICE_SPECIFIC_ERROR,
+                HOST_EXIT_SPAWN_FAILURE,
+            ),
         ]);
         let err = start_and_wait_polling(&fake, "svc", LONG, FAST, &mut |_| {}).unwrap_err();
         match &err {
@@ -1529,8 +1628,15 @@ mod tests {
             st(ServiceState::StopPending, 0, 0),
             st(ServiceState::NotInstalled, 0, 0),
         ]);
-        let s = wait_for_state_polling(&fake, "svc", &[ServiceState::NotInstalled], LONG, FAST, &mut |_| {})
-            .unwrap();
+        let s = wait_for_state_polling(
+            &fake,
+            "svc",
+            &[ServiceState::NotInstalled],
+            LONG,
+            FAST,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(s.state, ServiceState::NotInstalled);
         let fake = FakeControl::new(vec![st(ServiceState::Running, 0, 0)]);
         let err = wait_for_state_polling(
@@ -1593,7 +1699,10 @@ mod tests {
         let logs = Path::new(r"C:\data\logs");
         let def = backend_definition(&sample_spec(), logs);
         assert_eq!(def.pid_file, Some(logs.join("backend-planner.pid")));
-        assert_eq!(def.lifecycle_log, Some(logs.join("backend-planner.lifecycle.log")));
+        assert_eq!(
+            def.lifecycle_log,
+            Some(logs.join("backend-planner.lifecycle.log"))
+        );
         assert!(!def.failure_actions.restart_on_child_exit);
 
         let gw = gateway_definition(
@@ -1614,7 +1723,11 @@ mod tests {
         let lr = log_receiver_definition(data_dir, Path::new("recv.exe"));
         assert_eq!(
             lr.lifecycle_log,
-            Some(log_receiver_dir(data_dir).join("logs").join("receiver.lifecycle.log"))
+            Some(
+                log_receiver_dir(data_dir)
+                    .join("logs")
+                    .join("receiver.lifecycle.log")
+            )
         );
         assert!(lr.failure_actions.restart_on_child_exit);
         assert_eq!(lifecycle_log_path(&lr), lr.lifecycle_log);
@@ -1624,7 +1737,10 @@ mod tests {
     fn lifecycle_keys_match_the_app_vocabulary() {
         assert_eq!(lifecycle_key(GATEWAY_SERVICE_NAME), "gateway");
         assert_eq!(lifecycle_key(LOG_RECEIVER_SERVICE_NAME), "log-receiver");
-        assert_eq!(lifecycle_key(&backend_service_name("coder")), "backend:coder");
+        assert_eq!(
+            lifecycle_key(&backend_service_name("coder")),
+            "backend:coder"
+        );
         assert_eq!(lifecycle_key("other"), "other");
     }
 }

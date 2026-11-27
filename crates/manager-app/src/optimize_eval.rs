@@ -190,9 +190,14 @@ pub async fn run_eval_suite(backend_id: &str, base_url: &str, model: &str) -> Ev
 /// kind `optimize-eval-baseline`, so it is cancellable through
 /// `optimize_cancel_job` and never overlaps a measurement or an
 /// experiment batch.
-pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _sink: &std::sync::Arc<dyn crate::EventSink>, backend_id: String) -> crate::ApiResult {
+pub async fn op_optimize_run_baseline(
+    state: &std::sync::Arc<crate::AppState>,
+    _sink: &std::sync::Arc<dyn crate::EventSink>,
+    backend_id: String,
+) -> crate::ApiResult {
+    crate::bench::refuse_during_sweep(state).await?;
     {
-        let slot = state.optimize_job_abort.lock().await;
+        let slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             return Err(ApiError::InvalidInput(
                 "a measurement or experiment job is already running".to_string(),
@@ -253,7 +258,7 @@ pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _
         .await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         if slot.is_some() {
             state
                 .finish_task(
@@ -266,8 +271,12 @@ pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _
                 "a measurement or experiment job is already running".to_string(),
             ));
         }
-        *slot = Some(tx);
+        *slot = Some(crate::state::JobSlot::new(tx));
     }
+    state
+        .tasks
+        .controls
+        .set_canceller(&task_id, crate::tasks::TaskCanceller::OptimizeJob);
     // Loopback by construction, as with consultations (§3).
     let base_url = format!("http://127.0.0.1:{}", backend.port);
     let run = run_eval_suite(&backend_id, &base_url, &model_id);
@@ -276,7 +285,7 @@ pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _
         _ = rx => None,
     };
     {
-        let mut slot = state.optimize_job_abort.lock().await;
+        let mut slot = state.optimize.job_abort.lock().await;
         *slot = None;
     }
     let record = match outcome {
@@ -288,7 +297,9 @@ pub async fn op_optimize_run_baseline(state: &std::sync::Arc<crate::AppState>, _
                     json!({ "backend": backend_id }),
                 )
                 .await;
-            return Err(ApiError::InvalidInput("screening eval cancelled".to_string()));
+            return Err(ApiError::InvalidInput(
+                "screening eval cancelled".to_string(),
+            ));
         }
         Some(record) => record,
     };

@@ -14,10 +14,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
+# CancellationToken for the task registry's cooperative abort
+# (already in the lockfile via reqwest).
+tokio-util = "0.7"
 chrono = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 manager-config = { path = "../manager-config" }
 manager-wizard = { path = "../manager-wizard" }
 manager-supervisor = { path = "../manager-supervisor" }
@@ -32,3 +36,11 @@ manager-services = { path = "../manager-services" }
 manager-mxc = { path = "../manager-mxc" }
 manager-winml = { path = "../manager-winml" }
 manager-diag = { path = "../manager-diag" }
+# Component updates: the release-feed and update-environment seams
+# (also the test-only WizardStep impls; the trait is #[async_trait]).
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# Reading diagnostics bundles back in tests (already a manager-config
+# dependency).
+zip = { workspace = true }

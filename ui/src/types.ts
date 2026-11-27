@@ -15,6 +15,8 @@ export type Status = "ok" | "degraded" | "starting" | "stopping" | "restarting" 
 export interface StatusResponse {
   status: string;
   version: string;
+  /** Whether the MXC runtime is installed; absent on older shells. */
+  mxc_runtime_installed?: boolean;
   /** Startup config-load outcome (code review v0.1.60 F2); absent in
    *  mock data and older shells. `backup`: config.json was unreadable
    *  and config.json.bak was used. `defaults`: neither loaded, the app
@@ -164,11 +166,18 @@ export interface DashboardModel {
   /** The one global LiteLLM routing strategy resolved from the
    *  gateway config, or null when no config/groups are available. */
   gatewayStrategy: string | null;
+  /** The configured model groups (get_gateway_config), drawn by the
+   *  Topology view as containers of their member backends. Null when
+   *  the gateway config could not be read. */
+  groups: import("./api").GatewayGroup[] | null;
   /** Set when the gateway_status probe call itself failed (gateway
    *  state unknown). A probe failure does NOT fail the dashboard poll:
    *  the gateway card is absent and this message is shown as its own
    *  banner, while backends/telemetry data stays fresh. */
   gatewayError?: string;
+  /** OpenRouter daily spend vs cap from gateway_status (spec §7);
+   *  drives the Dashboard spend-cap banner. */
+  openrouterSpend?: import("./api").OpenRouterSpend | null;
   stale: boolean;
   updatedAt: number;
 }

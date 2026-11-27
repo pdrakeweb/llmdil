@@ -81,26 +81,35 @@ check("lifecycleLabel names origin and age of a transition", () => {
 });
 check("lifecycleActions: the one Start/Stop/Restart rule", () => {
   const acts = (s, ctx = { kind: "backend" }) => L.lifecycleActions(s, ctx).map((a) => `${a.action}:${a.disabled ? "off" : "on"}`);
-  assert.deepEqual(acts("running"), ["stop:on", "restart:on"]);
-  assert.deepEqual(acts("degraded"), ["stop:on", "restart:on"]);
-  assert.deepEqual(acts("starting"), ["stop:on", "restart:on"]);
-  assert.deepEqual(acts("restarting"), ["stop:off", "restart:off"]);
-  assert.deepEqual(acts("stopping"), ["stop:off", "restart:off"]);
-  assert.deepEqual(acts("stopped"), ["start:on", "restart:off"]);
-  assert.deepEqual(acts("failed", { kind: "backend", enabled: false }), ["start:off", "restart:off"]);
-  assert.deepEqual(acts("stopped", { kind: "backend", configured: false }), ["start:off", "restart:off"]);
+  assert.deepEqual(acts("running"), ["restart:on", "stop:on"]);
+  assert.deepEqual(acts("degraded"), ["restart:on", "stop:on"]);
+  assert.deepEqual(acts("starting"), ["restart:on", "stop:on"]);
+  assert.deepEqual(acts("restarting"), ["restart:off", "stop:off"]);
+  assert.deepEqual(acts("stopping"), ["restart:off", "stop:off"]);
+  assert.deepEqual(acts("stopped"), ["start:on", "stop:off"]);
+  assert.deepEqual(acts("failed", { kind: "backend", enabled: false }), ["start:off", "stop:off"]);
+  assert.deepEqual(acts("stopped", { kind: "backend", configured: false }), ["start:off", "stop:off"]);
   assert.deepEqual(acts("not_installed"), []);
   assert.deepEqual(acts("unknown"), []);
   assert.deepEqual(acts("running", { kind: "postgres" }), ["stop:on"]);
   assert.deepEqual(acts("running", { kind: "postgres", blockedReason: "Stop the gateway first" }), ["stop:off"]);
   assert.ok(L.lifecycleActions("restarting", { kind: "gateway" })[0].reason);
   // A running disabled backend or orphan: Stop yes, Restart refused.
-  assert.deepEqual(acts("running", { kind: "backend", enabled: false }), ["stop:on", "restart:off"]);
-  assert.deepEqual(acts("degraded", { kind: "backend", configured: false }), ["stop:on", "restart:off"]);
-  assert.ok(L.lifecycleActions("running", { kind: "backend", enabled: false })[1].reason);
+  assert.deepEqual(acts("running", { kind: "backend", enabled: false }), ["restart:off", "stop:on"]);
+  assert.deepEqual(acts("degraded", { kind: "backend", configured: false }), ["restart:off", "stop:on"]);
+  assert.ok(L.lifecycleActions("running", { kind: "backend", enabled: false })[0].reason);
   // The gateway's status call failed: its page stays operable.
-  assert.deepEqual(acts("unknown", { kind: "gateway" }), ["start:on", "stop:on", "restart:on"]);
+  assert.deepEqual(acts("unknown", { kind: "gateway" }), ["start:on", "restart:on", "stop:on"]);
   assert.ok(L.lifecycleActions("unknown", { kind: "gateway" })[0].reason);
+});
+check("a click on a just-swapped button is ignored", () => {
+  const key = "backend:guard";
+  L.noteOfferedActions(key, L.lifecycleActions("stopped", { kind: "backend" }), 10_000);
+  assert.equal(L.actionJustSwapped(key, 10_001), false); // first render is not a swap
+  L.noteOfferedActions(key, L.lifecycleActions("running", { kind: "backend" }), 12_000);
+  assert.equal(L.actionJustSwapped(key, 12_700), true);
+  L.noteOfferedActions(key, L.lifecycleActions("running", { kind: "backend" }), 12_750); // same set: no restart of the clock
+  assert.equal(L.actionJustSwapped(key, 12_801), false);
 });
 check("applyBlockedReason blocks gateway and backend actions during an apply", () => {
   assert.equal(L.applyBlockedReason({ kind: "gateway" }, true), "An activation apply is running");
@@ -177,7 +186,7 @@ check("renderers emit the shared classes and escape details", () => {
   assert.match(chip, /pid &lt;1&gt;/);
   const btns = L.renderLifecycleActions({ kind: "backend", id: "x\"y" }, "stopped", { enabled: true });
   assert.match(btns, /data-lc-act="start" data-lc-target="backend:x&quot;y"/);
-  assert.match(btns, /data-lc-act="restart"[^>]* disabled/);
+  assert.match(btns, /data-lc-act="stop"[^>]* disabled/);
 });
 check("serviceRowState prefers lifecycle, falls back to SCM state", () => {
   assert.equal(L.serviceRowState({ registered: true, state: "stopped", lifecycle: "failed" }), "failed");

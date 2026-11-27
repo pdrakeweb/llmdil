@@ -75,3 +75,15 @@ outcome (close/clear only in or after the success branch; failure branch
 returns ahead of any close/repaint that would discard input), the same
 pattern the pre-existing Add Model pins use. Runtime click-through
 verification belongs to Pete's on-machine pass.
+
+## Update (Nov 2026): the backend Edit panel is one draft
+
+Every control in the backend card's Edit panel — model, context, batch,
+parallel slots, KV cache and flash attention, expert offload, expert cache,
+MTP, and the GPU selection — is a draft until Save; X discards all of them.
+The commit-on-change controls inside the panel (and the Placement section's
+own Apply) are gone: two save models in one form meant X did not undo what
+looked undoable. Save runs the changed writes in order and stops at the first
+failure, which keeps the panel open, the drafts intact, and names what was and
+was not saved. The guardrail's override/snap decision moves the draft too;
+Save carries the override.

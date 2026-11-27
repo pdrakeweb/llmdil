@@ -398,7 +398,7 @@ pub(crate) async fn start(
             "plan": plan.to_review_json(),
         }));
     }
-    if state.bench_job.lock().await.is_some() {
+    if state.bench.job.lock().await.is_some() {
         return Err(ApiError::Busy(
             "a Bench sweep is running; wait for it or cancel it".into(),
         ));

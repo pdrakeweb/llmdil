@@ -22,6 +22,12 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+mod op_types;
+pub use op_types::{
+    camel_case, render_schema_json, render_ts, request_params, request_schema, ParamInfo, ParamType,
+};
+
+pub use crate::event_bus::EventOrigin;
 use crate::{ApiError, AppState, EventSink};
 
 /// Capability classes (auth plan §1; PLAN.md §2.6 — the auth taxonomy
@@ -96,6 +102,12 @@ pub enum RouteMode {
     AsyncOp,
     /// Creates a resource: 201 with the operation result.
     Created,
+    /// The operation itself starts background work and returns at
+    /// once with the work's own task record (`id` = task id, plus the
+    /// operation's fields): 202 with that result. Refusals stay
+    /// synchronous errors, and the id polls and aborts through
+    /// `/operations`.
+    Accepted,
 }
 
 /// One operation's declared REST route. Path placeholders are named
@@ -140,6 +152,21 @@ pub const fn route_async(method: HttpMethod, path: &'static str) -> RouteSpec {
         path,
         body_wrap: None,
         mode: RouteMode::AsyncOp,
+    }
+}
+
+/// A route whose operation starts background work and returns its
+/// task record (202); the body is one named argument's value.
+pub const fn route_accepted_wrap(
+    method: HttpMethod,
+    path: &'static str,
+    wrap: &'static str,
+) -> RouteSpec {
+    RouteSpec {
+        method,
+        path,
+        body_wrap: Some(wrap),
+        mode: RouteMode::Accepted,
     }
 }
 
@@ -190,6 +217,9 @@ macro_rules! for_each_operation {
             // Excluded from REST v1 (PLAN.md decision 11: the broad raw
             // config patch; domain endpoints cover the same ground).
             (UpdateConfig, update_config, C, op_update_config, [patch: Value], None),
+            // The one narrow settings section writable over REST; every
+            // other section stays with its domain endpoint.
+            (SettingsSetSupervision, settings_set_supervision, C, op_settings_set_supervision, [mode: manager_config::SupervisionMode], Some(route(HttpMethod::Put, "/api/v1/settings/supervision"))),
             // Backends
             (ListBackends, list_backends, R, op_list_backends, [], Some(route(HttpMethod::Get, "/api/v1/backends"))),
             (StartBackend, start_backend, L, op_start_backend, [id: String, allow_wddm_overcommit: Option<bool>, origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/backends/{id}/start"))),
@@ -200,7 +230,7 @@ macro_rules! for_each_operation {
             (BackendPreviewDiff, backend_preview_diff, R, op_backend_preview_diff, [id: String, patch: Value], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/config/preview-diff"))),
             (BackendApplyConfig, backend_apply_config, C, op_backend_apply_config, [id: String, patch: Value, apply_mode: String], Some(route(HttpMethod::Patch, "/api/v1/backends/{id}/config"))),
             (BackendAdd, backend_add, C, op_backend_add, [id: String, model_id: String, port: u16, group: String, create_group: bool, enabled: bool, n_ctx: Option<u32>, n_batch: Option<u32>, offload_layers: Option<u32>, offload_override: Option<bool>, gpu_indices: Option<Vec<u32>>, parallel: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route_created(HttpMethod::Post, "/api/v1/backends"))),
-            (BackendAddPreview, backend_add_preview, R, op_backend_add_preview, [model_id: String, gpu_indices: Option<Vec<u32>>, n_ctx: Option<u32>, parallel: Option<u32>], None),
+            (BackendAddPreview, backend_add_preview, R, op_backend_add_preview, [model_id: String, gpu_indices: Option<Vec<u32>>, n_ctx: Option<u32>, parallel: Option<u32>, offload_layers: Option<u32>], Some(route(HttpMethod::Post, "/api/v1/backends/preview"))),
             (BackendUpdateFlags, backend_update_flags, C, op_backend_update_flags, [id: String, n_ctx: u32, n_batch: u32], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/flags"))),
             (BackendSetOffload, backend_set_offload, C, op_backend_set_offload, [id: String, layers: u32, allow_override: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/offload"))),
             // Deliberate guardrail overrides for the SAVED position
@@ -214,7 +244,7 @@ macro_rules! for_each_operation {
             (BackendSetParallel, backend_set_parallel, C, op_backend_set_parallel, [id: String, slots: Option<u32>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/parallel"))),
             (BackendSetCache, backend_set_cache, C, op_backend_set_cache, [id: String, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/cache"))),
             (BackendSetMoeCache, backend_set_moe_cache, C, op_backend_set_moe_cache, [id: String, mib: Option<u32>, auto: Option<bool>], Some(route(HttpMethod::Put, "/api/v1/backends/{id}/moe-cache"))),
-            (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>, moe_cache_mib: Option<u32>], None),
+            (BackendCachePreview, backend_cache_preview, R, op_backend_cache_preview, [id: String, n_ctx: Option<u32>, slots: Option<u32>, cache_k: Option<String>, cache_v: Option<String>, flash_attn: Option<String>, moe_cache_mib: Option<u32>, offload_layers: Option<u32>, gpu_indices: Option<Vec<u32>>], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/cache/preview"))),
             // Advanced flags mode (tracker #60): the raw-flags save
             // (advanced mode only; validation warns, never blocks)
             // and the mode flip itself (writes no flags).
@@ -259,11 +289,9 @@ macro_rules! for_each_operation {
             // Add Model form helpers (deep-discovery design
             // Part 2, §P2.11): the shallow HF lookup behind the
             // pick list and its type-ahead, and the pick-time
-            // GGUF header read. Read-class, desktop-only in v1
-            // (route None, documented in rest-api.md §6.16) —
-            // they serve the form, not the API surface.
-            (ModelHfLookup, model_hf_lookup, R, op_model_hf_lookup, [query: String, suggest: Option<bool>], None),
-            (ModelHfHeader, model_hf_header, R, op_model_hf_header, [repo_id: String, file: String], None),
+            // GGUF header read. Read-class.
+            (ModelHfLookup, model_hf_lookup, R, op_model_hf_lookup, [query: String, suggest: Option<bool>], Some(route(HttpMethod::Post, "/api/v1/models/lookup"))),
+            (ModelHfHeader, model_hf_header, R, op_model_hf_header, [repo_id: String, file: String], Some(route(HttpMethod::Post, "/api/v1/models/header"))),
             (ModelSetEnabled, model_set_enabled, C, op_model_set_enabled, [id: String, enabled: bool], None),
             // PATCH /models/{id} composite over this, model_set_short_name
             // and model_set_enabled (rest-api.md §6.3); no 1:1 route.
@@ -272,6 +300,17 @@ macro_rules! for_each_operation {
             // model_set_short_name, model_set_enabled and
             // model_set_offload_spec (rest-api.md §6.3); no 1:1 route.
             (ModelSetMtp, model_set_mtp, C, op_model_set_mtp, [id: String, mtp: Option<bool>], None),
+            // Tiered model storage (docs/tiered-model-storage.md).
+            // `target` is a model id or a logical path (models\X.gguf),
+            // so unregistered files can be moved too.
+            (ModelStorageStatus, model_storage_status, R, op_model_storage_status, [], Some(route(HttpMethod::Get, "/api/v1/model-storage"))),
+            (ModelStorageSet, model_storage_set, C, op_model_storage_set, [storage: Value], Some(route(HttpMethod::Put, "/api/v1/model-storage"))),
+            (ModelStoragePromote, model_storage_promote, L, op_model_storage_promote, [target: String], Some(route(HttpMethod::Post, "/api/v1/model-storage/promote"))),
+            (ModelStorageDemote, model_storage_demote, L, op_model_storage_demote, [target: String], Some(route(HttpMethod::Post, "/api/v1/model-storage/demote"))),
+            (ModelStorageCancel, model_storage_cancel, L, op_model_storage_cancel, [target: String], Some(route(HttpMethod::Post, "/api/v1/model-storage/cancel"))),
+            // PATCH /models/{id} composite candidate, like the other
+            // model setters; no 1:1 route.
+            (ModelSetKeepHot, model_set_keep_hot, C, op_model_set_keep_hot, [target: String, keep: bool], None),
             // Logs
             (GetLogs, get_logs, R, op_get_logs, [scope: String, level: Option<String>, search: Option<String>, query: Option<String>, since_ms: Option<i64>, until_ms: Option<i64>, order: Option<String>, offset: Option<u64>, limit: Option<u64>], Some(route(HttpMethod::Get, "/api/v1/logs"))),
             // Gateway
@@ -329,30 +368,34 @@ macro_rules! for_each_operation {
             (TaskAbort, task_abort, L, op_task_abort, [task_id: String], Some(route(HttpMethod::Post, "/api/v1/operations/{task_id}/abort"))),
             (TasksList, tasks_list, R, op_tasks_list, [], Some(route(HttpMethod::Get, "/api/v1/operations"))),
             (DiagnosticsExportBundle, diagnostics_export_bundle, SDisclosure, op_diagnostics_export_bundle, [], Some(route_async(HttpMethod::Post, "/api/v1/diagnostics/bundles"))),
-            // MCP / VS Code — peripheral, excluded from REST v1
-            // (PLAN.md decision 10); Tauri surface unchanged.
-            (McpList, mcp_list, R, op_mcp_list, [], None),
-            (McpStartPreflight, mcp_start_preflight, R, op_mcp_start_preflight, [], None),
-            (McpTestConnection, mcp_test_connection, X, op_mcp_test_connection, [id: String], None),
+            // MCP: reads and the connection test are routed; saving,
+            // deleting, exposing a server and storing its credential
+            // stay without a route (rest-api.md §6.16: a registered
+            // server is a command the app runs, and a secret).
+            (McpList, mcp_list, R, op_mcp_list, [], Some(route(HttpMethod::Get, "/api/v1/mcp/servers"))),
+            (McpStartPreflight, mcp_start_preflight, R, op_mcp_start_preflight, [], Some(route(HttpMethod::Get, "/api/v1/mcp/preflight"))),
+            (McpTestConnection, mcp_test_connection, X, op_mcp_test_connection, [id: String], Some(route(HttpMethod::Post, "/api/v1/mcp/servers/{id}/test"))),
             (McpSetExposure, mcp_set_exposure, X, op_mcp_set_exposure, [id: String, exposure: String], None),
             (McpSaveServer, mcp_save_server, X, op_mcp_save_server, [server: manager_config::McpServerConfig], None),
             (McpDeleteServer, mcp_delete_server, X, op_mcp_delete_server, [id: String], None),
             (McpStoreCredential, mcp_store_credential, X, op_mcp_store_credential, [id: String, value: String], None),
-            (BackendTestToolCall, backend_test_tool_call, L, op_backend_test_tool_call, [id: String], None),
-            // Notifications — desktop-only (toast delivery is a shell
-            // concern); the config itself rides update_config.
-            (NotificationsSetConfig, notifications_set_config, C, op_notifications_set_config, [config: manager_config::NotificationConfig], None),
-            (NotificationsSendTest, notifications_send_test, L, op_notifications_send_test, [], None),
-            // Windows services — desktop-only (SCM elevation is a
-            // shell concern in v1).
-            (ServicesList, services_list, R, op_services_list, [], None),
+            (BackendTestToolCall, backend_test_tool_call, L, op_backend_test_tool_call, [id: String], Some(route(HttpMethod::Post, "/api/v1/backends/{id}/test-tool-call"))),
+            // Notifications: the preferences, and the test toast (shown
+            // by the desktop shell, see AppState::set_desktop_sink).
+            (NotificationsSetConfig, notifications_set_config, C, op_notifications_set_config, [config: manager_config::NotificationConfig], Some(route_wrap(HttpMethod::Put, "/api/v1/notifications", "config"))),
+            (NotificationsSendTest, notifications_send_test, L, op_notifications_send_test, [], Some(route(HttpMethod::Post, "/api/v1/notifications/test"))),
+            // Windows services: the list is a read; registering and
+            // unregistering prompt for elevation and a password at the
+            // console and stay without a route.
+            (ServicesList, services_list, R, op_services_list, [], Some(route(HttpMethod::Get, "/api/v1/services"))),
             (ServicesRegister, services_register, D, op_services_register, [target: String], None),
             (ServicesUnregister, services_unregister, D, op_services_unregister, [target: String], None),
-            // Log receiver — desktop-only (deployment runs the
-            // bundled receiver binary elevated through the shell's
-            // runas pattern; the endpoint flip is a separate
-            // deliberate op, never bundled into deploy).
-            (LogReceiverStatus, log_receiver_status, R, op_log_receiver_status, [], None),
+            // Log receiver: the status is a read (no local paths over
+            // REST); deployment runs the bundled receiver binary
+            // elevated through the shell's runas pattern and stays
+            // desktop-only, as does the endpoint flip, a separate
+            // deliberate op, never bundled into deploy.
+            (LogReceiverStatus, log_receiver_status, R, op_log_receiver_status, [], Some(route(HttpMethod::Get, "/api/v1/log-receiver"))),
             (LogReceiverDeploy, log_receiver_deploy, D, op_log_receiver_deploy, [], None),
             (LogReceiverRemove, log_receiver_remove, D, op_log_receiver_remove, [], None),
             (LogReceiverFlipEndpoint, log_receiver_flip_endpoint, C, op_log_receiver_flip_endpoint, [], None),
@@ -363,51 +406,58 @@ macro_rules! for_each_operation {
             (LogReceiverStart, log_receiver_start, L, op_log_receiver_start, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/start"))),
             (LogReceiverStop, log_receiver_stop, L, op_log_receiver_stop, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/stop"))),
             (LogReceiverRestart, log_receiver_restart, L, op_log_receiver_restart, [origin: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/log-receiver/restart"))),
-            // Optimize — desktop-only in v1 (consultation spends local
-            // backend capacity; plan state lives beside the config).
-            (OptimizeGetState, optimize_get_state, R, op_optimize_get_state, [], None),
-            (OptimizeValidatePlan, optimize_validate_plan, R, op_optimize_validate_plan, [], None),
-            (OptimizeSavePurpose, optimize_save_purpose, C, op_optimize_save_purpose, [scope: String, target: Option<String>, text: String], None),
-            (OptimizeSetItemState, optimize_set_item_state, C, op_optimize_set_item_state, [item_id: usize, decision: String], None),
-            (OptimizeSetItemOutcome, optimize_set_item_outcome, C, op_optimize_set_item_outcome, [item_id: usize, outcome: String, error: Option<String>], None),
-            (OptimizeDiscardPlan, optimize_discard_plan, C, op_optimize_discard_plan, [], None),
-            (OptimizeSetExperimentState, optimize_set_experiment_state, C, op_optimize_set_experiment_state, [experiment_id: usize, decision: String], None),
-            (OptimizeConsult, optimize_consult, L, op_optimize_consult, [backend_id: Option<String>, sample: Option<bool>, directive: Option<String>, candidate_repos: Option<Vec<String>>], None),
-            (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], None),
-            (OptimizeCancelConsult, optimize_cancel_consult, L, op_optimize_cancel_consult, [], None),
-            (OptimizeMeasureBackend, optimize_measure_backend, L, op_optimize_measure_backend, [backend_id: String], None),
+            // Optimize. The long operations are AsyncOp and cancel
+            // through their task (tasks::TaskCanceller) or the two
+            // cancel routes.
+            (OptimizeGetState, optimize_get_state, R, op_optimize_get_state, [], Some(route(HttpMethod::Get, "/api/v1/optimize"))),
+            (OptimizeValidatePlan, optimize_validate_plan, C, op_optimize_validate_plan, [], Some(route(HttpMethod::Post, "/api/v1/optimize/plan/validate"))),
+            (OptimizeSavePurpose, optimize_save_purpose, C, op_optimize_save_purpose, [scope: String, target: Option<String>, text: String], Some(route(HttpMethod::Put, "/api/v1/optimize/purpose"))),
+            (OptimizeSetItemState, optimize_set_item_state, C, op_optimize_set_item_state, [item_id: usize, decision: String], Some(route(HttpMethod::Put, "/api/v1/optimize/plan/items/{item_id}"))),
+            (OptimizeSetItemOutcome, optimize_set_item_outcome, C, op_optimize_set_item_outcome, [item_id: usize, outcome: String, error: Option<String>], Some(route(HttpMethod::Put, "/api/v1/optimize/plan/items/{item_id}/outcome"))),
+            (OptimizeDiscardPlan, optimize_discard_plan, D, op_optimize_discard_plan, [], Some(route(HttpMethod::Delete, "/api/v1/optimize/plan"))),
+            // Rust apply executor (optimize design §5.2, Phase 3):
+            // executes accepted items through the existing ops.
+            // Class D because the destructive phase deletes
+            // backends and groups (backend_delete is D).
+            (OptimizeApplyPlan, optimize_apply_plan, D, op_optimize_apply_plan, [destructive: Option<bool>, dry_run: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/optimize/plan/apply"))),
+            (OptimizeSetExperimentState, optimize_set_experiment_state, C, op_optimize_set_experiment_state, [experiment_id: usize, decision: String], Some(route(HttpMethod::Put, "/api/v1/optimize/experiments/{experiment_id}"))),
+            (OptimizeConsult, optimize_consult, L, op_optimize_consult, [backend_id: Option<String>, sample: Option<bool>, directive: Option<String>, candidate_repos: Option<Vec<String>>, replace: Option<bool>], Some(route_async(HttpMethod::Post, "/api/v1/optimize/consult"))),
+            (OptimizeDiscover, optimize_discover, L, op_optimize_discover, [directive: String], Some(route_async(HttpMethod::Post, "/api/v1/optimize/discover"))),
+            (OptimizeCancelConsult, optimize_cancel_consult, L, op_optimize_cancel_consult, [], Some(route(HttpMethod::Post, "/api/v1/optimize/consult/cancel"))),
+            (OptimizeMeasureBackend, optimize_measure_backend, L, op_optimize_measure_backend, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/measure"))),
             // Predicted throughput (design §6.2, §10): the lookup
             // is a pure read over the measurement store plus the
             // live configuration; the delete is the history
-            // view's per-entry control. Both carry REST routes
-            // by design §11, unlike the rest of this section.
+            // view's per-entry control.
             (MeasurementLookup, measurement_lookup, R, op_measurement_lookup, [request: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/measurements/lookup", "request"))),
             (MeasurementDelete, measurement_delete, D, op_measurement_delete, [fingerprint: String, measured_at: String], Some(route(HttpMethod::Delete, "/api/v1/measurements"))),
-            (OptimizeEstimateBackend, optimize_estimate_backend, L, op_optimize_estimate_backend, [backend_id: String], None),
-            (OptimizeCancelJob, optimize_cancel_job, L, op_optimize_cancel_job, [], None),
-            (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], None),
-            (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], None),
-            (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], None),
-            // Bench — desktop-only (Bench design §7, D15): sweeps
-            // launch temporary backends and stop running ones
-            // under the interlock; REST parity is deferred by
-            // name in the design.
-            (BenchPromptsList, bench_prompts_list, R, op_bench_prompts_list, [], None),
-            (BenchPromptSave, bench_prompt_save, C, op_bench_prompt_save, [entry: Value], None),
-            (BenchPromptDelete, bench_prompt_delete, D, op_bench_prompt_delete, [id: String], None),
-            (BenchPromptGenerate, bench_prompt_generate, L, op_bench_prompt_generate, [purpose: String, description: String, size: String, backend_id: Option<String>], None),
-            (BenchPromptGenerateCancel, bench_prompt_generate_cancel, L, op_bench_prompt_generate_cancel, [], None),
-            (BenchRunStart, bench_run_start, L, op_bench_run_start, [request: Value], None),
-            (BenchRunCancel, bench_run_cancel, L, op_bench_run_cancel, [sweep_id: String], None),
-            (BenchResultsList, bench_results_list, R, op_bench_results_list, [], None),
-            (BenchResultDelete, bench_result_delete, D, op_bench_result_delete, [sweep_id: String], None),
+            (OptimizeEstimateBackend, optimize_estimate_backend, L, op_optimize_estimate_backend, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/estimate"))),
+            (OptimizeCancelJob, optimize_cancel_job, L, op_optimize_cancel_job, [], Some(route(HttpMethod::Post, "/api/v1/optimize/job/cancel"))),
+            (OptimizeRunBaseline, optimize_run_baseline, L, op_optimize_run_baseline, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/baseline"))),
+            (OptimizeRunExperiments, optimize_run_experiments, L, op_optimize_run_experiments, [], Some(route_async(HttpMethod::Post, "/api/v1/optimize/experiments/run"))),
+            (OptimizeEstimateExperiments, optimize_estimate_experiments, L, op_optimize_estimate_experiments, [], Some(route_async(HttpMethod::Post, "/api/v1/optimize/experiments/estimate"))),
+            // Bench (Bench design §7): sweeps launch temporary
+            // backends and stop the running ones the caller named
+            // under the interlock. bench_run_start answers at once
+            // with the sweep id and its task.
+            (BenchPromptsList, bench_prompts_list, R, op_bench_prompts_list, [], Some(route(HttpMethod::Get, "/api/v1/bench/prompts"))),
+            (BenchPromptSave, bench_prompt_save, C, op_bench_prompt_save, [entry: Value], Some(route_wrap(HttpMethod::Post, "/api/v1/bench/prompts", "entry"))),
+            (BenchPromptDelete, bench_prompt_delete, D, op_bench_prompt_delete, [id: String], Some(route(HttpMethod::Delete, "/api/v1/bench/prompts/{id}"))),
+            (BenchPromptGenerate, bench_prompt_generate, L, op_bench_prompt_generate, [purpose: String, description: String, size: String, backend_id: Option<String>], Some(route_async(HttpMethod::Post, "/api/v1/bench/prompts/generate"))),
+            (BenchPromptGenerateCancel, bench_prompt_generate_cancel, L, op_bench_prompt_generate_cancel, [], Some(route(HttpMethod::Post, "/api/v1/bench/prompts/generate/cancel"))),
+            (BenchRunStart, bench_run_start, L, op_bench_run_start, [request: Value], Some(route_accepted_wrap(HttpMethod::Post, "/api/v1/bench/runs", "request"))),
+            (BenchRunCancel, bench_run_cancel, L, op_bench_run_cancel, [sweep_id: String], Some(route(HttpMethod::Post, "/api/v1/bench/runs/{sweep_id}/cancel"))),
+            (BenchResultsList, bench_results_list, R, op_bench_results_list, [], Some(route(HttpMethod::Get, "/api/v1/bench/results"))),
+            (BenchResultDelete, bench_result_delete, D, op_bench_result_delete, [sweep_id: String], Some(route(HttpMethod::Delete, "/api/v1/bench/results/{sweep_id}"))),
             // Per-backend tuning (Addendum B §B.2): preview is a
             // pure read over live state; run holds the shared
             // job slot for the sweep; adopt writes the winner
             // through the structured save ops.
-            (OptimizeTuningPreview, optimize_tuning_preview, R, op_optimize_tuning_preview, [backend_id: String], None),
-            (OptimizeTuningRun, optimize_tuning_run, L, op_optimize_tuning_run, [backend_id: String], None),
-            (OptimizeTuningAdopt, optimize_tuning_adopt, C, op_optimize_tuning_adopt, [sweep_id: String, adopt_anyway: Option<bool>], None),
+            (OptimizeTuningPreview, optimize_tuning_preview, R, op_optimize_tuning_preview, [backend_id: String], Some(route(HttpMethod::Get, "/api/v1/backends/{backend_id}/tuning"))),
+            (OptimizeTuningRun, optimize_tuning_run, L, op_optimize_tuning_run, [backend_id: String], Some(route_async(HttpMethod::Post, "/api/v1/backends/{backend_id}/tuning/run"))),
+            (OptimizeTuningAdopt, optimize_tuning_adopt, C, op_optimize_tuning_adopt, [sweep_id: String, adopt_anyway: Option<bool>], Some(route(HttpMethod::Post, "/api/v1/optimize/tuning/{sweep_id}/adopt"))),
+            // VS Code — excluded from REST (decision 10: they write to
+            // the managed machine's user profile).
             (VscodeInstallExtensions, vscode_install_extensions, X, op_vscode_install_extensions, [], None),
             (VscodeWriteConfig, vscode_write_config, X, op_vscode_write_config, [backup: bool], None),
             // MXC
@@ -424,7 +474,8 @@ macro_rules! for_each_operation {
             (WinmlStatus, winml_status, R, op_winml_status, [], None),
             // Updates
             (UpdatesCheckAll, updates_check_all, R, op_updates_check_all, [], Some(route(HttpMethod::Post, "/api/v1/updates/check"))),
-            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
+            (UpdatesList, updates_list, R, op_updates_list, [], Some(route(HttpMethod::Get, "/api/v1/updates/components"))),
+            (UpdatesApply, updates_apply, D, op_updates_apply, [component_id: String, version: Option<String>], Some(route(HttpMethod::Post, "/api/v1/updates/components/{component_id}/apply"))),
             (UpdatesPin, updates_pin, C, op_updates_pin, [component_id: String, version: Option<String>], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/pin"))),
             (UpdatesSetAuto, updates_set_auto, C, op_updates_set_auto, [component_id: String, enabled: bool], Some(route(HttpMethod::Put, "/api/v1/updates/components/{component_id}/auto"))),
             // App self-update (Settings → Updates & diagnostics):
@@ -501,32 +552,156 @@ macro_rules! gen_op_specs {
 }
 for_each_operation!(gen_op_specs);
 
+macro_rules! gen_requests {
+    ($(($variant:ident, $name:ident, $class:ident, $op:ident, [$($pname:ident : $pty:ty),*], $route:expr)),*) => {
+        /// Typed request envelopes: one struct per registered
+        /// operation, named after its [`Op`] variant, with one field
+        /// per declared parameter under the declared (snake_case)
+        /// name. Generated from the same declaration as [`Op`]; do
+        /// not edit.
+        ///
+        /// `from_args` (and the `Deserialize` impl, which delegates
+        /// to it) reads each field with the registry's per-argument
+        /// rule — a missing key reads as `null`, so `Option`
+        /// arguments are `None` and a missing required argument is
+        /// `InvalidInput("argument `name`: …")`; unknown keys are
+        /// ignored — so the accepted wire format is unchanged.
+        pub mod requests {
+            use super::{arg, ApiError, Value};
+
+            $(
+                #[doc = concat!("Arguments of `", stringify!($name), "`.")]
+                #[derive(Debug, Clone, serde::Serialize)]
+                pub struct $variant {
+                    $(pub $pname: $pty),*
+                }
+
+                impl $variant {
+                    /// Read the declared arguments out of an argument
+                    /// object, in declaration order.
+                    #[allow(unused_variables)] // no-argument operations
+                    pub fn from_args(args: &Value) -> Result<Self, ApiError> {
+                        Ok(Self {
+                            $($pname: arg::<$pty>(args, stringify!($pname))?),*
+                        })
+                    }
+                }
+
+                impl<'de> serde::Deserialize<'de> for $variant {
+                    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                        let args = <Value as serde::Deserialize>::deserialize(d)?;
+                        Self::from_args(&args).map_err(serde::de::Error::custom)
+                    }
+                }
+            )*
+        }
+
+        /// The declared parameters of `op` (see [`request_params`]).
+        fn gen_request_params(op: Op) -> Vec<op_types::ParamInfo> {
+            match op {
+                $(Op::$variant => vec![$(op_types::ParamInfo::of::<$pty>(stringify!($pname))),*],)*
+            }
+        }
+
+        /// The [`Op`] variant's identifier (names the generated
+        /// request struct and TS interface).
+        fn variant_name(op: Op) -> &'static str {
+            match op {
+                $(Op::$variant => stringify!($variant),)*
+            }
+        }
+
+        /// Parse `args` into `op`'s request struct and serialize it
+        /// back (contract tests).
+        #[cfg(test)]
+        fn parse_request(op: Op, args: &Value) -> Result<Value, ApiError> {
+            match op {
+                $(Op::$variant => Ok(serde_json::to_value(requests::$variant::from_args(args)?)
+                    .expect("request serializes")),)*
+            }
+        }
+    };
+}
+for_each_operation!(gen_requests);
+
 macro_rules! gen_dispatch {
     ($(($variant:ident, $name:ident, $class:ident, $op:ident, [$($pname:ident : $pty:ty),*], $route:expr)),*) => {
         /// Run one operation by its registry handle. The match is
         /// exhaustive with no wildcard arm — a registered operation
         /// without a dispatch arm does not compile.
-        pub async fn dispatch(
+        async fn run_op(
             state: &Arc<AppState>,
             sink: &Arc<dyn EventSink>,
             op: Op,
             args: Value,
         ) -> Result<Value, ApiError> {
-            // Every operation's events also reach the log shipper's
-            // in-process feed (source `app`); a no-op while log
-            // streaming is off.
-            let sink = &crate::logship::tap_sink(state, Arc::clone(sink));
-            match op {
-                $(
-                    Op::$variant => {
-                        crate::$op(state, sink, $(arg::<$pty>(&args, stringify!($pname))?),*).await
+            // Every operation runs inside an `op` span; a task the
+            // operation records stamps its task_id and kind onto it
+            // (see `tasks::op_span`), so the operation's log events
+            // carry the task they belong to.
+            let span = crate::tasks::op_span(spec(op).name);
+            tracing::Instrument::instrument(
+                async move {
+                    match op {
+                        $(
+                            Op::$variant => {
+                                // The typed request envelope reads the
+                                // declared arguments exactly as the
+                                // per-argument reads always did (see
+                                // `requests`), then hands its fields on.
+                                let requests::$variant { $($pname),* } =
+                                    requests::$variant::from_args(&args)?;
+                                crate::$op(state, sink, $($pname),*).await
+                            }
+                        )*
                     }
-                )*
-            }
+                },
+                span,
+            )
+            .await
         }
     };
 }
 for_each_operation!(gen_dispatch);
+
+/// Run one operation invoked from the desktop UI (Tauri IPC) — the
+/// shell's entry point. Same as [`dispatch_from`] with
+/// [`EventOrigin::Desktop`].
+pub async fn dispatch(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    op: Op,
+    args: Value,
+) -> Result<Value, ApiError> {
+    dispatch_from(state, sink, op, args, EventOrigin::Desktop).await
+}
+
+/// Run one operation on behalf of `origin`. This is the single choke
+/// point every surface shares: the operation's events go to the
+/// caller's sink, to the log shipper's in-process feed (source `app`;
+/// a no-op while log streaming is off), and to the app event bus
+/// tagged with `origin` — so an action taken in the desktop UI
+/// reaches Admin API event subscribers exactly as the same action
+/// through the API does. After a successful run the dispatch-level
+/// events (`config-changed`, `gateway-request`) are emitted the same
+/// way (see [`crate::event_bus::after_dispatch`]).
+pub async fn dispatch_from(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    op: Op,
+    args: Value,
+    origin: EventOrigin,
+) -> Result<Value, ApiError> {
+    let sink = crate::event_bus::bus_sink(state, Arc::clone(sink), origin);
+    let sink = &crate::logship::tap_sink(state, sink);
+    crate::event_bus::with_origin(origin, async {
+        let watch = crate::event_bus::before_dispatch(state, op).await;
+        let result = run_op(state, sink, op, args).await;
+        crate::event_bus::after_dispatch(state, sink, op, &result, watch).await;
+        result
+    })
+    .await
+}
 
 /// The spec for one operation.
 pub fn spec(op: Op) -> &'static OpSpec {
@@ -547,7 +722,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_82_commands() {
-        assert_eq!(OP_SPECS.len(), 179);
+        assert_eq!(OP_SPECS.len(), 188);
     }
 
     #[test]
@@ -614,8 +789,23 @@ mod tests {
     #[test]
     fn frontend_invocations_are_all_registered() {
         let api_ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/api.ts");
-        let src = std::fs::read_to_string(&api_ts)
+        let mut src = std::fs::read_to_string(&api_ts)
             .unwrap_or_else(|e| panic!("read {}: {e}", api_ts.display()));
+        // api.ts is a barrel over its per-domain modules in ui/src/api/
+        // (T-02h); the invoke call sites live there, so scan them all.
+        let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui/src/api");
+        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&api_dir)
+            .unwrap_or_else(|e| panic!("read dir {}: {e}", api_dir.display()))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "ts"))
+            .collect();
+        parts.sort();
+        for p in &parts {
+            src.push('\n');
+            src.push_str(
+                &std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {}: {e}", p.display())),
+            );
+        }
         // Scan for invoke<T>("name", ...) / invoke("name", ...) call
         // sites: after `invoke`, allow a generic argument list, then
         // `(`, then the quoted command name as the first argument.
@@ -727,17 +917,23 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_reaches_the_operation() {
-        // updates_check_all is a stub that always errors Unsupported;
-        // reaching it through dispatch proves the arm is wired.
+        // updates_apply on a report-only component errors Unsupported
+        // before any I/O; reaching it through dispatch proves the arm
+        // is wired (and that the optional `version` may be omitted).
         let state = Arc::new(AppState::new(
             manager_config::AppConfig::default_config(),
             std::path::PathBuf::from("/nonexistent/config.json"),
             std::path::PathBuf::from("/nonexistent"),
         ));
         let sink: Arc<dyn EventSink> = Arc::new(crate::NoopSink);
-        let err = dispatch(&state, &sink, Op::UpdatesCheckAll, serde_json::json!({}))
-            .await
-            .unwrap_err();
+        let err = dispatch(
+            &state,
+            &sink,
+            Op::UpdatesApply,
+            serde_json::json!({ "component_id": "postgres" }),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ApiError::Unsupported(_)), "{err}");
     }
 }

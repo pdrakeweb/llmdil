@@ -41,8 +41,8 @@ pub struct PromptEntry {
     /// changes so [`PromptLibrary::materialize_shipped`] can refresh
     /// untouched copies.
     pub version: u32,
-    /// Last edit, wall-clock milliseconds since the Unix epoch.
-    /// 0 for shipped entries as compiled in.
+    /// Last edit, wall-clock milliseconds since the Unix epoch;
+    /// [`SHIPPED_PROMPT_UPDATED_MS`] for shipped entries.
     pub updated_ms: i64,
 }
 
@@ -74,6 +74,10 @@ impl PromptEntry {
 /// Current version of every shipped prompt entry.
 const SHIPPED_PROMPT_VERSION: u32 = 1;
 
+/// When the shipped prompts were written (2026-10-23 UTC). Bump with
+/// [`SHIPPED_PROMPT_VERSION`].
+const SHIPPED_PROMPT_UPDATED_MS: i64 = 1_792_713_600_000;
+
 /// Current on-disk format version of the prompt library file.
 const PROMPT_LIBRARY_FORMAT_VERSION: u32 = 1;
 
@@ -97,7 +101,7 @@ pub fn shipped_prompts() -> Vec<PromptEntry> {
             CODER_STANDARD_BODY.to_string(),
             PromptOrigin::Shipped,
             SHIPPED_PROMPT_VERSION,
-            0,
+            SHIPPED_PROMPT_UPDATED_MS,
         ),
         PromptEntry::new(
             "coder-long",
@@ -106,7 +110,7 @@ pub fn shipped_prompts() -> Vec<PromptEntry> {
             CODER_LONG_BODY.to_string(),
             PromptOrigin::Shipped,
             SHIPPED_PROMPT_VERSION,
-            0,
+            SHIPPED_PROMPT_UPDATED_MS,
         ),
         PromptEntry::new(
             "planner-standard",
@@ -115,7 +119,7 @@ pub fn shipped_prompts() -> Vec<PromptEntry> {
             PLANNER_STANDARD_BODY.to_string(),
             PromptOrigin::Shipped,
             SHIPPED_PROMPT_VERSION,
-            0,
+            SHIPPED_PROMPT_UPDATED_MS,
         ),
         PromptEntry::new(
             "tool-standard",
@@ -124,7 +128,7 @@ pub fn shipped_prompts() -> Vec<PromptEntry> {
             TOOL_STANDARD_BODY.to_string(),
             PromptOrigin::Shipped,
             SHIPPED_PROMPT_VERSION,
-            0,
+            SHIPPED_PROMPT_UPDATED_MS,
         ),
         PromptEntry::new(
             "general-standard",
@@ -133,7 +137,7 @@ pub fn shipped_prompts() -> Vec<PromptEntry> {
             GENERAL_STANDARD_BODY.to_string(),
             PromptOrigin::Shipped,
             SHIPPED_PROMPT_VERSION,
-            0,
+            SHIPPED_PROMPT_UPDATED_MS,
         ),
     ]
 }
@@ -216,8 +220,10 @@ impl PromptLibrary {
                     changed = true;
                 }
                 Some(existing) => {
+                    // Older libraries stored shipped entries with a
+                    // zero date.
                     if existing.origin == PromptOrigin::Shipped
-                        && existing.version < shipped.version
+                        && (existing.version < shipped.version || existing.updated_ms == 0)
                     {
                         *existing = shipped;
                         changed = true;
@@ -316,6 +322,11 @@ mod tests {
         assert_eq!(lib.entries.len(), 5);
         assert!(!lib.materialize_shipped());
         assert_eq!(lib.entries.len(), 5);
+        // A library written before shipped entries were dated.
+        assert!(lib.entries.iter().all(|e| e.updated_ms > 0));
+        lib.entries[0].updated_ms = 0;
+        assert!(lib.materialize_shipped());
+        assert!(lib.entries.iter().all(|e| e.updated_ms > 0));
     }
 
     #[test]
@@ -379,10 +390,8 @@ mod tests {
 
     #[test]
     fn load_missing_file_is_empty_and_roundtrip_saves() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-bench-prompts-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-bench-prompts-test-{}", std::process::id()));
         let path = dir.join("bench-prompts.json");
         let lib = PromptLibrary::load(&path).expect("missing file loads empty");
         assert!(lib.entries.is_empty());

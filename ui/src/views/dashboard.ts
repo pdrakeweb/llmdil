@@ -1,7 +1,7 @@
 /* Dashboard view — fully functional.
    - Appliance: service cards, GPU strip, model placement, throughput chart.
    - Console: dense tables with sparklines/bars.
-   - Topology: mini cluster node map (SVG).
+   - Topology: gateway -> groups holding their models -> GPUs (SVG).
    Lifecycle state comes from the shared service store (lifecycle.ts):
    every store refresh repaints the cards with the effective state (a
    restart from any surface reads "restarting…"), and getDashboard() —
@@ -12,16 +12,18 @@
    Backend failures keep the last good model and show an error banner —
    never fabricated data presented as live. */
 
-import { getDashboard, systemVerdict } from "../api";
-import type { SystemVerdict } from "../api";
+import { getDashboard, getModels, openRouterSpendBannerHtml, systemVerdict } from "../api";
+import type { ModelRow, SystemVerdict } from "../api";
 import {
-  LIFECYCLE_COLORS, META, lifecycleChip, lifecycleColor, lifecycleDot, lifecycleEdge, lifecycleLabel,
+  META, lifecycleChip, lifecycleColor, lifecycleDot,
   renderLifecycleActions, runLifecycle, serviceStore, summarize, toStatus, wireLifecycleActions,
 } from "../lifecycle";
 import type { LifecycleState, ServiceSnapshot } from "../lifecycle";
-import { esc } from "../html";
+import { esc, keepFocus } from "../html";
 import { fmtCount, fmtGb, fmtPct, gaugeRing, meter, sparkline, stackedBar, trim1 } from "../charts";
 import { icon } from "../icons";
+import { modelDisplayName } from "./common";
+import { topologySvg } from "./topology";
 import type { BackendInfo, DashboardModel, GpuInfo, PlacementSegment, Status } from "../types";
 
 type ViewMode = "appliance" | "console" | "topology";
@@ -48,17 +50,16 @@ let unwireActions: (() => void) | null = null;
 let lastFetchAt = 0;
 let fetching = false;
 const FULL_FETCH_MS = 4500;
-/** Start All in flight: the bar stays rendered with a busy button so
- *  the action's state is visible while starts complete one by one. */
-let startAllBusy = false;
-/** Failures from the last Start All run; shown in the header notice
- *  area and cleared by the next successful poll. */
-let startAllError: string | null = null;
 /** Gateway-probe failure from the latest successful poll. The probe
  *  failing does not fail the poll (backends/telemetry stay fresh), so
  *  it gets its own banner line instead of the backend-error one. */
 let lastGatewayError: string | null = null;
+/** OpenRouter spend-cap banner HTML from the latest successful poll
+ *  (spec §7: cap reached or ≥80% of it); empty when neither. */
+let lastSpendBanner = "";
 let tickTimer: number | null = null;
+/** Registered models, for the one display name per model. */
+let models: ModelRow[] = [];
 /** Set by the mount's teardown: an in-flight poll that resolves after
  *  navigation must not render into the next route's #view. */
 let disposed = false;
@@ -80,13 +81,8 @@ function gpuDot(s: Status): string {
   return `<span class="dot ${cls}"></span>`;
 }
 
-/** GPU health color for the topology nodes (same palette). */
-function gpuColor2(s: Status): string {
-  return s === "ok" ? LIFECYCLE_COLORS.green : s === "down" ? LIFECYCLE_COLORS.red : s === "idle" ? LIFECYCLE_COLORS.grey : LIFECYCLE_COLORS.amber;
-}
-
 /** A Status that means a live (or coming-up) process: placements and
- *  topology edges are drawn only for these. */
+ *  are drawn as live only for these. */
 function statusLive(s: Status | undefined): boolean {
   return s === "ok" || s === "starting" || s === "restarting" || s === "degraded";
 }
@@ -98,6 +94,7 @@ function statusLive(s: Status | undefined): boolean {
  *  the transition at once. */
 function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel {
   if (!snap.live || snap.updatedAt === 0) return m;
+  const name = (x: string): string => modelDisplayName(x, models);
   const rows = new Map(snap.backends.map((r) => [r.id, r]));
   const backends = m.backends.map((b) => {
     const r = rows.get(b.id);
@@ -105,6 +102,7 @@ function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel 
     const st = r ? serviceStore.backendState(r) : serviceStore.effective(key, b.lifecycle);
     return {
       ...b,
+      model: name(b.model),
       lifecycle: st,
       status: toStatus(st),
       transition: serviceStore.transitionOf(key, r ? r.transition ?? null : b.transition ?? null),
@@ -114,11 +112,11 @@ function overlayModel(m: DashboardModel, snap: ServiceSnapshot): DashboardModel 
   });
   const gs = serviceStore.gatewayState();
   const gateway = m.gateway && gs
-    ? { ...m.gateway, lifecycle: gs, status: toStatus(gs), transition: serviceStore.transitionOf("gateway", snap.gateway?.transition ?? null) }
+    ? { ...m.gateway, port: snap.gateway?.running_port ?? m.gateway.port, lifecycle: gs, status: toStatus(gs), transition: serviceStore.transitionOf("gateway", snap.gateway?.transition ?? null) }
     : m.gateway;
   const placement = m.placement.map((p) => {
     const b = p.backendId ? backends.find((x) => x.id === p.backendId) : undefined;
-    return b ? { ...p, backendStatus: b.status } : p;
+    return { ...p, model: name(p.model), ...(b ? { backendStatus: b.status } : {}) };
   });
   return { ...m, backends, gateway, placement, gatewayState: gs ?? m.gatewayState, gatewayUp: gs ? META[gs].isLive : m.gatewayUp };
 }
@@ -163,7 +161,7 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   const m2v = isGateway
     ? (b.errors_1h !== undefined ? fmtCount(b.errors_1h) : "—")
     : (b.vram_held_gb !== undefined ? fmtGb(b.vram_held_gb) : "—");
-  const m2u = isGateway || b.vram_held_gb === undefined ? "" : " GB";
+  const m2u = isGateway || b.vram_held_gb === undefined ? "" : " GiB";
   // The ring's arc encodes a share, never a raw count. The gateway's
   // arc is its trailing-hour success share (1 - errors/requests)
   // with the integer percent centered; with no requests the share is
@@ -171,13 +169,15 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
   // IS a percentage and drives its arc when present; when health is
   // absent the ring is omitted entirely and the rows take the width.
   let ring = "";
+  let ringTip = "Health: success share, last hour";
   if (isGateway) {
     const share = b.requests_1h !== undefined && b.requests_1h > 0
       ? 100 * (1 - (b.errors_1h ?? 0) / b.requests_1h)
       : undefined;
+    ringTip = "Success share, last hour";
     ring = share === undefined
-      ? gaugeRing(0, 64, "var(--line)", "—", "success / 1h")
-      : gaugeRing(share, 64, ringColor, `${Math.round(share)}%`, "success / 1h");
+      ? gaugeRing(0, 64, "var(--line)", "—", "success")
+      : gaugeRing(share, 64, ringColor, `${Math.round(share)}%`, "success");
   } else if (b.health !== undefined) {
     ring = gaugeRing(b.health, 64, ringColor, b.health.toFixed(0), "health");
   }
@@ -204,9 +204,9 @@ function serviceCard(b: BackendInfo, isGateway: boolean): string {
       <button class="btn icon-only" data-act="logs" data-id="${esc(b.id)}" title="Logs" aria-label="Logs for ${esc(b.id)}">${icon("logs")}</button>
     </div>`;
   return `<div class="card">
-    <h3>${lifecycleDot(b.lifecycle)} ${esc(b.name)} <span class="port">:${b.port}</span> ${lifecycleChip(b.lifecycle, { transition: b.transition ?? null })}</h3>
+    <h3>${lifecycleDot(b.lifecycle)} <span class="svc-name" title="${esc(b.name)}">${esc(b.name)}</span> <span class="port">:${b.port}</span> ${lifecycleChip(b.lifecycle, { transition: b.transition ?? null })}</h3>
     <div class="svc-top">
-      ${ring}
+      ${ring ? `<span title="${ringTip}" style="display:flex;flex:0 0 auto">${ring}</span>` : ""}
       <div class="kv">
         <span class="k">${m1k}</span><span class="v">${esc(m1v)}<small>${m1u}</small></span>
         <span class="k" style="margin-top:4px">${m2k}</span><span class="v">${esc(m2v)}<small>${m2u}</small></span>
@@ -232,7 +232,7 @@ function gpuStripCard(g: GpuInfo): string {
     vramHtml = `<div class="mrow"><span class="mlabel">VRAM</span><span class="mval">not measured</span></div>`;
   } else {
     const usedPct = (g.vram_used_gb / g.vram_total_gb) * 100;
-    const vramVal = `${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB · ${trim1(usedPct)}%`;
+    const vramVal = `${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GiB · ${trim1(usedPct)}%`;
     let segments: { pct: number; color: string; label?: string }[];
     let keyHtml = "";
     if (procs.length && procs.some((p) => p.vram_mib === null)) {
@@ -243,16 +243,16 @@ function gpuStripCard(g: GpuInfo): string {
       segments = procs.map((p, i) => ({
         pct: ((p.vram_mib ?? 0) / totalMib) * 100,
         color: palette[i % palette.length],
-        label: `${procLabel(p)} — ${fmtGb((p.vram_mib ?? 0) / 1024)} GB`,
+        label: `${procLabel(p)} — ${fmtGb((p.vram_mib ?? 0) / 1024)} GiB`,
       }));
       const attributed = procs.reduce((a, p) => a + (p.vram_mib ?? 0), 0);
       const otherMib = g.vram_used_gb * 1024 - attributed;
       if (otherMib > 0) {
-        segments.push({ pct: (otherMib / totalMib) * 100, color: "#6d7686", label: `other — ${fmtGb(otherMib / 1024)} GB` });
+        segments.push({ pct: (otherMib / totalMib) * 100, color: "#6d7686", label: `other — ${fmtGb(otherMib / 1024)} GiB` });
       }
       keyHtml = `<div class="legend" style="margin-top:4px">${segments.map((s) => `<span><span class="sw" style="background:${s.color}"></span>${esc((s.label ?? "").split(" — ")[0])}</span>`).join("")}</div>`;
     } else {
-      segments = [{ pct: usedPct, color: C.purple, label: `VRAM used — ${fmtGb(g.vram_used_gb)} GB` }];
+      segments = [{ pct: usedPct, color: C.purple, label: `VRAM used — ${fmtGb(g.vram_used_gb)} GiB` }];
     }
     vramHtml = `<div class="mrow"><span class="mlabel">VRAM</span><span class="mval">${vramVal}</span></div>
       <div class="mrow"><span></span><span>${stackedBar(segments, 220, 8)}</span></div>
@@ -275,9 +275,9 @@ function gpuStripCard(g: GpuInfo): string {
   // series keyed by its metric name); open state is module-level so
   // the poll repaint preserves it.
   const trendRows: string[] = [];
-  if (g.util_spark && g.util_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Utilization</span>${sparkline(g.util_spark, 220, 26, C.blue)}</div>`);
-  if (g.temp_spark && g.temp_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Temperature</span>${sparkline(g.temp_spark, 220, 26, C.amber)}</div>`);
-  if (g.power_w != null && g.power_spark && g.power_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Power</span>${sparkline(g.power_spark, 220, 26, C.green)}</div>`);
+  if (g.util_spark && g.util_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Utilization</span>${sparkline(g.util_spark, 220, 26, C.blue, 0.18, 20)}</div>`);
+  if (g.temp_spark && g.temp_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Temperature</span>${sparkline(g.temp_spark, 220, 26, C.amber, 0.18, 10)}</div>`);
+  if (g.power_w != null && g.power_spark && g.power_spark.length) trendRows.push(`<div class="mrow"><span class="mlabel">Power</span>${sparkline(g.power_spark, 220, 26, C.green, 0.18, 20)}</div>`);
   const trendsOpen = openTrends.has(g.id);
   const trends = trendRows.length
     ? `<div style="margin-top:8px"><button class="btn" data-trends="${esc(g.id)}" aria-expanded="${trendsOpen}" title="Trends" aria-label="Trends" style="padding:2px 8px;font-size:11px">${icon(trendsOpen ? "chevD" : "chevR")}</button>
@@ -322,8 +322,8 @@ function applianceView(m: DashboardModel, live: boolean): string {
   // Placement rows are per BACKEND (placements belong to backends,
   // not models). Eventual treatment keys off actuality: a disabled
   // backend's placement, and an enabled-but-not-running backend's,
-  // are both not in effect — gray segments, reduced opacity, an
-  // "eventual" tag. Bar widths and tooltip percentages both come
+  // are both not in effect — reduced opacity and an "eventual" tag,
+  // each segment in its GPU's color. Bar widths and tooltip percentages both come
   // from the segment's unrounded fraction, so the chart and its
   // stated values are the same number; sub-1% shares render as a
   // minimum-width sliver with the true value in the tooltip. A
@@ -343,20 +343,18 @@ function applianceView(m: DashboardModel, live: boolean): string {
     const barTip = p.defaulted ? ` title="No split configured — an unsplit launch loads on GPU 0."` : "";
     const segs = p.segments.map((s, k) => ({
       pct: Math.max(s.frac * 100, s.frac > 0 ? 2 : 0),
-      color: eventual || p.defaulted ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)),
+      color: p.defaulted ? "#6d7686" : gpuColor(segmentGpuPos(s, k, m.gpus)),
       label: `${s.gpu} ${fmtPct(s.frac)}%`,
     }));
     return `<div class="place-row${eventual ? " eventual" : ""}"${p.defaulted && !eventual ? ` style="opacity:.55"` : ""}><span class="mname">${esc(label)}${p.backendId ? ` <span class="place-model">${esc(p.model)}</span>` : ""}${tag}</span>
       <div${barTip}>${stackedBar(segs)}</div></div>`;
   }).join("");
-  // The legend is built from the RUNNING rows actually rendered:
-  // each distinct segment label with the palette color its GPU
-  // position produced. Eventual and defaulted rows render gray or
-  // ghosted and stay out of the legend — their colors assert nothing.
+  // The legend lists every GPU a configured placement uses, running or
+  // not, with the palette color its GPU position produced. Defaulted
+  // rows render gray and stay out of it.
   const legendByLabel = new Map<string, string>();
   for (const p of m.placement) {
-    if (p.backendEnabled === false || p.defaulted) continue;
-    if (p.backendStatus !== undefined && !statusLive(p.backendStatus)) continue;
+    if (p.defaulted) continue;
     p.segments.forEach((s, k) => {
       if (!legendByLabel.has(s.gpu)) legendByLabel.set(s.gpu, gpuColor(segmentGpuPos(s, k, m.gpus)));
     });
@@ -407,7 +405,7 @@ function consoleView(m: DashboardModel): string {
     const vramPct = Math.round((g.vram_used_gb / g.vram_total_gb) * 100);
     return `<tr><td>${gpuDot(g.status)} ${esc(g.name)}</td><td>${trim1(g.util_pct)}%</td>
       <td>${meter(g.util_pct, 120, 8, C.blue)}</td>
-      <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GB</td>
+      <td>${fmtGb(g.vram_used_gb)}/${fmtGb(g.vram_total_gb)} GiB</td>
       <td>${meter(vramPct, 120, 8, C.purple)}</td>
       <td>${trim1(g.temp_c)}°C</td><td>${g.power_w == null ? (g.power_absence === "driver_not_available" ? "not measured" : "—") : `${trim1(g.power_w)} W`}</td></tr>`;
   }).join("");
@@ -420,113 +418,14 @@ function consoleView(m: DashboardModel): string {
 }
 
 function topologyView(m: DashboardModel): string {
-  // Mini node map: LiteLLM -> backends -> GPUs -> models (SVG). No
-  // client nodes are drawn — the app has no data about which clients
-  // connect. Honest empty state when the backend reports nothing —
-  // never fake nodes.
+  // Gateway -> groups (containers of their models) -> GPUs. No client
+  // nodes: the app has no data about which clients connect. Honest
+  // empty state when the backend reports nothing — never fake nodes.
   if (!m.backends.length && !m.gpus.length && !m.gateway) {
     return `<div class="card"><div class="empty">No topology to draw — no backends or GPUs reported. Run the setup wizard to install and configure the stack.</div></div>`;
   }
-  const W = 980, H = 380;
-  const colX = [50, 290, 530, 770];
-  const nodeW = 130, nodeH = 56;
-  const backs = m.backends;
-  const gpus = m.gpus;
-  const models = m.placement;
-
-  /** Edge class follows the backend's lifecycle state (the shared
-   *  lifecycleEdge rule, as on the Service Map). */
-  const edgeCls = (s: LifecycleState): string => lifecycleEdge(s).cls;
-  /** A backend is linked in the topology only while it is live
-   *  (code-review 5.3): an edge asserts a live connection, and a
-   *  stopped or disabled backend has none. Its NODE still draws —
-   *  the map shows what is configured — but unconnected. */
-  const running = (s: Status | undefined): boolean => statusLive(s);
-
-  const cy = (i: number, n: number) => 60 + (i * (H - 120)) / Math.max(1, n - 1 || 1);
-  let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="display:block;width:100%" role="img" aria-label="Cluster topology mini map">`;
-  const edge = (x1: number, y1: number, x2: number, y2: number, label: string, cls = "") => {
-    const mx = (x1 + x2) / 2;
-    svg += `<path class="map-edge ${cls}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
-    if (label) svg += `<text class="map-edge-label" x="${mx}" y="${(y1 + y2) / 2 - 4}" text-anchor="middle">${esc(label)}</text>`;
-  };
-  const node = (x: number, y: number, title: string, sub: string, dot: string) => {
-    svg += `<g><rect class="map-node" x="${x}" y="${y - nodeH / 2}" width="${nodeW}" height="${nodeH}" rx="8"/>
-      <circle cx="${x + 14}" cy="${y - 8}" r="4" fill="${dot}"/>
-      <text class="map-node-text" x="${x + 26}" y="${y - 2}">${esc(title)}</text>
-      <text class="map-node-sub" x="${x + 14}" y="${y + 16}">${esc(sub)}</text></g>`;
-  };
-
-  node(colX[0], H / 2, "LiteLLM",
-    m.gateway
-      ? `:${m.gateway.port}${m.gateway.lifecycle !== "running" ? ` \u00b7 ${lifecycleLabel(m.gateway.lifecycle)}` : m.gatewayStrategy ? ` \u00b7 ${m.gatewayStrategy}` : ""}`
-      : "not reported",
-    m.gateway ? lifecycleColor(m.gateway.lifecycle) : LIFECYCLE_COLORS.grey);
-  backs.forEach((b, i) => {
-    const y = cy(i, backs.length);
-    const sub = b.lifecycle !== "running"
-      ? ` \u00b7 ${lifecycleLabel(b.lifecycle)}`
-      : b.throughput_toks !== undefined ? ` \u00b7 ${trim1(b.throughput_toks)} tok/s` : "";
-    node(colX[1], y, b.name, `:${b.port}${sub}`, lifecycleColor(b.lifecycle));
-    if (running(b.status)) {
-      edge(colX[0] + nodeW, H / 2, colX[1], y, "", edgeCls(b.lifecycle));
-    }
-  });
-  gpus.forEach((g, i) => {
-    node(colX[2], cy(i, gpus.length), g.name, `${trim1(g.util_pct)}% util`, gpuColor2(g.status));
-  });
-  // Backend -> GPU connectivity comes from the configured tensor
-  // splits (the placement rows' segments), exactly like the full
-  // Service Map — never a positional full mesh asserting links the
-  // configuration does not have. A segment that cannot be matched to
-  // a drawn GPU node draws no edge.
-  const backendIdxById = new Map(backs.map((b, i) => [b.id, i] as const));
-  const rowStatus = (p: (typeof models)[number]): Status | undefined =>
-    p.backendStatus ?? (p.backendId ? backs.find((b) => b.id === p.backendId)?.status : undefined);
-  const segGpuIdx = (seg: PlacementSegment): number => {
-    if (seg.gpuIndex !== undefined && gpus[seg.gpuIndex]) return seg.gpuIndex;
-    return gpus.findIndex((g) => g.name === seg.gpu || g.id === seg.gpu);
-  };
-  // Placement edges assert a configured split actually loaded on
-  // the GPUs, so they draw only for rows that are real placements
-  // of live backends (code-review 5.3): a `defaulted` row's single
-  // 100% segment is the no-split fallback, not a configuration; a
-  // disabled backend's placement is eventual; a stopped backend
-  // holds nothing. The Appliance view keeps every row (grayed /
-  // ghosted per those flags) — the Topology filters to what is
-  // actually connected. Model nodes follow the same filter.
-  const linked = (p: (typeof models)[number]): boolean =>
-    !p.defaulted && p.backendEnabled !== false && running(rowStatus(p));
-  for (const p of models) {
-    if (!p.backendId || !linked(p)) continue;
-    const bi = backendIdxById.get(p.backendId);
-    if (bi === undefined) continue;
-    p.segments.forEach((seg) => {
-      const gj = segGpuIdx(seg);
-      if (gj < 0) return;
-      edge(colX[1] + nodeW, cy(bi, backs.length), colX[2], cy(gj, gpus.length), "", edgeCls(backs[bi].lifecycle));
-    });
-  }
-  // Model nodes key to their owning backend's measured state: the dot
-  // is the backend's status color, and the sublabel is the split
-  // summary — configuration alone never asserts a model is "loaded".
-  const linkedModels = models.filter(linked);
-  linkedModels.slice(0, 4).forEach((p, i) => {
-    const y = cy(i, Math.min(4, linkedModels.length));
-    const owner = p.backendId ? backs.find((b) => b.id === p.backendId) : undefined;
-    const sub = p.segments.length ? p.segments.map((s) => `${s.pct}%`).join(" \u00b7 ") : "\u2014";
-    node(colX[3], y, p.model, sub, owner ? lifecycleColor(owner.lifecycle) : LIFECYCLE_COLORS.grey);
-    p.segments.forEach((seg) => {
-      const gj = segGpuIdx(seg);
-      if (gj < 0) return;
-      edge(colX[2] + nodeW, cy(gj, gpus.length), colX[3], y, "");
-    });
-  });
-  svg += `<text class="map-col-label" x="${colX[0]}" y="24">GATEWAY</text>
-    <text class="map-col-label" x="${colX[1]}" y="24">BACKENDS</text>
-    <text class="map-col-label" x="${colX[2]}" y="24">GPUS</text>
-    <text class="map-col-label" x="${colX[3]}" y="24">MODELS</text></svg>`;
-  return `<div class="card"><div class="sec-title">${icon("map")} Topology — same data, node view</div>
+  const svg = topologySvg(m);
+  return `<div class="card"><div class="sec-title">${icon("map")} Topology — groups and the models they route to</div>
     <div class="map-canvas" style="border:0;padding:0">${svg}</div>
     <div class="legend">${lifecycleLegend()}
     <a href="#/map" style="color:var(--accent)">Open full service map \u2192</a></div></div>`;
@@ -544,34 +443,7 @@ function lifecycleLegend(): string {
   return groups.map((g) => `<span><span class="sw" style="background:${g.color}"></span>${esc(g.states.map((s) => META[s].label).join(" / "))}</span>`).join("");
 }
 
-/** What Start All would start right now: enabled, configured backends
- *  that are stopped or failed (never disabled ones, never ones in
- *  transition), and the gateway when it is stopped or failed — never
- *  while it is restarting/starting (UI-2). An unmeasured gateway
- *  (status call failed) is not a target: its state is unknown. */
-function startAllTargets(m: DashboardModel): { backends: BackendInfo[]; gatewayDown: boolean } {
-  const backends = m.backends.filter(
-    (b) => b.enabled === true && b.configured !== false && (b.lifecycle === "stopped" || b.lifecycle === "failed"),
-  );
-  const gatewayDown = m.gateway !== null && (m.gatewayState === "stopped" || m.gatewayState === "failed");
-  return { backends, gatewayDown };
-}
-
-/** The Start All bar under the topbar: rendered only in live mode
- *  when something that should be running is not (or while a start is
- *  in flight). Count label + one button; no prose. */
-function startAllBar(m: DashboardModel): string {
-  if (!lastLive) return "";
-  const { backends, gatewayDown } = startAllTargets(m);
-  if (!startAllBusy && backends.length === 0 && !gatewayDown) return "";
-  // The shared count rule (enabled + configured backends) plus the gateway.
-  const sum = summarize({ backends: m.backends, gateway: m.gatewayState });
-  const running = sum.backendsRunning + (m.gatewayState === "running" ? 1 : 0);
-  const total = sum.backendsTotal + (m.gateway ? 1 : 0);
-  return `<div style="padding:12px 20px 0"><div class="banner" style="display:flex;align-items:center;gap:10px"><span>Services running: ${running} of ${total}</span><span class="spacer"></span><button class="btn primary" id="startAllBtn" ${startAllBusy ? "disabled" : ""}>${icon("play")} ${startAllBusy ? "Starting…" : "Start All Services"}</button></div></div>`;
-}
-
-function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: SystemVerdict, startAll = ""): string {
+function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: SystemVerdict): string {
   return `<div class="topbar">
     <h1>Dashboard</h1>
     <span class="status-pill"><span class="dot ${verdict.dot}"></span> ${esc(verdict.text)}</span>
@@ -587,11 +459,10 @@ function headerHtml(live: boolean, stale: boolean, updatedAgo: string, verdict: 
     <button class="btn icon-only" id="pauseBtn" title="${paused ? "Resume live" : "Pause live"}" aria-label="${paused ? "Resume live" : "Pause live"}">${icon(paused ? "play" : "pause")}</button>
     <a class="btn" href="#/wizard">Setup wizard</a>
   </div>
-  ${startAll}
   ${lastError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} backend error — showing last known data: ${esc(lastError)}</div></div>` : ""}
   ${lastGatewayError ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} Gateway status unavailable: ${esc(lastGatewayError)}</div></div>` : ""}
+  ${lastSpendBanner ? `<div style="padding:12px 20px 0">${lastSpendBanner}</div>` : ""}
   ${restartError ? `<div style="padding:12px 20px 0"><div class="banner" id="restartNotice">${icon("warn")} ${esc(restartError)}</div></div>` : ""}
-  ${startAllError ? `<div style="padding:12px 20px 0"><div class="banner" id="startAllNotice">${icon("warn")} ${esc(startAllError)}</div></div>` : ""}
   ${!live ? `<div style="padding:12px 20px 0"><div class="banner">${icon("warn")} disconnected — showing sample data (not running under Tauri)</div></div>` : ""}`;
 }
 
@@ -628,7 +499,11 @@ function render(): void {
     error: lastError,
   });
   const body = mode === "appliance" ? applianceView(m, lastLive) : mode === "console" ? consoleView(m) : topologyView(m);
-  el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict, startAllBar(m)) + `<div class="view">${body}</div>`;
+  // The repaint keeps the scroll position and the keyboard focus.
+  const top = el.querySelector(".view")?.scrollTop ?? 0;
+  keepFocus(el, () => { el.innerHTML = headerHtml(lastLive, staleNow, ago(m.updatedAt), verdict) + `<div class="view">${body}</div>`; });
+  const scroller = el.querySelector(".view");
+  if (scroller && top) scroller.scrollTop = top;
   el.querySelectorAll("[data-view]").forEach((b) =>
     b.addEventListener("click", () => { setMode((b as HTMLElement).dataset.view as ViewMode); render(); }));
   el.querySelectorAll("[data-trends]").forEach((b) =>
@@ -639,51 +514,12 @@ function render(): void {
     }));
   const pb = el.querySelector("#pauseBtn");
   pb?.addEventListener("click", () => { paused = !paused; render(); });
-  const sab = el.querySelector("#startAllBtn");
-  sab?.addEventListener("click", () => { void startAllServices(); });
   el.querySelectorAll("[data-act]").forEach((b) =>
     b.addEventListener("click", () => {
       const act = (b as HTMLElement).dataset.act;
       const id = (b as HTMLElement).dataset.id;
       if (act === "logs" && id) location.hash = `#/logs?scope=${encodeURIComponent(id)}&follow=1`;
     }));
-}
-
-/** Start everything that should be running and is not, through the
- *  shared lifecycle runner (the same entry points every surface uses:
- *  start_backend per backend — routed to the SCM in service mode —
- *  and the start-gateway step for the gateway, after the MCP
- *  credential prompt). Each start shows as "starting…" on every
- *  surface at once. Sequential, so one failure does not block the
- *  rest; failures are collected and reported together at the end.
- *  The server clears the activation plan itself after a gateway
- *  start — no client-side activationComplete. */
-async function startAllServices(): Promise<void> {
-  if (startAllBusy || !lastModel) return;
-  startAllBusy = true;
-  render();
-  const errors: string[] = [];
-  const { backends, gatewayDown } = startAllTargets(overlayModel(lastModel, serviceStore.get()));
-  for (const b of backends) {
-    if (disposed) break;
-    const r = await runLifecycle({ kind: "backend", id: b.id }, "start", { origin: "dashboard" });
-    if (!r.ok) errors.push(r.message);
-  }
-  if (gatewayDown && !disposed) {
-    // MCP credential prompt (Pete, 2026-10-18): same pre-start step
-    // as the Gateway view's Start button. Cancelling skips only the
-    // gateway leg; the backends above already started.
-    const r = await runLifecycle({ kind: "gateway" }, "start", { origin: "dashboard", promptMcp: true });
-    if (r.cancelled) errors.push("gateway: start cancelled at the MCP credential prompt");
-    else if (!r.ok) errors.push(r.message);
-  }
-  startAllBusy = false;
-  if (disposed) return;
-  await doPoll(serviceStore.get()); // refresh first; a successful poll clears prior notices
-  if (errors.length) {
-    startAllError = `Start All failed — ${errors.join("; ")}`;
-    render();
-  }
 }
 
 /** The full dashboard fetch (telemetry, metrics, config), fed the
@@ -701,7 +537,10 @@ async function doPoll(snap?: ServiceSnapshot): Promise<void> {
     : undefined;
   let r: Awaited<ReturnType<typeof getDashboard>>;
   try {
-    r = await getDashboard(prefetched); // never rejects; failures arrive as r.error
+    // Neither rejects; failures arrive as .error.
+    const [d, mr] = await Promise.all([getDashboard(prefetched), getModels()]);
+    r = d;
+    if (!mr.error) models = mr.data;
   } finally {
     fetching = false;
   }
@@ -715,11 +554,11 @@ async function doPoll(snap?: ServiceSnapshot): Promise<void> {
     lastLive = r.live;
     lastError = null;
     restartError = null; // a successful poll clears any restart notice
-    startAllError = null; // ...and any Start All notice
     // A gateway-probe failure rides along on an otherwise successful
     // poll: lastOk advances (the data IS fresh) and the failure shows
     // as its own banner, not as backend staleness.
     lastGatewayError = r.data.gatewayError ?? null;
+    lastSpendBanner = openRouterSpendBannerHtml(r.data.openrouterSpend, icon("warn"));
     lastOk = Date.now();
   }
   render();

@@ -111,6 +111,10 @@ pub struct ActivationExecution {
     pub gateway_up: bool,
     #[serde(default)]
     pub gateway_pending: bool,
+    /// The drain phase's result (`{drained, in_flight, timed_out}`);
+    /// absent when the apply did not drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiesce: Option<serde_json::Value>,
     #[serde(default)]
     pub items: Vec<ActivationExecutionItem>,
 }
@@ -232,6 +236,7 @@ mod tests {
     /// already-effective skip, one gateway change.
     fn sample_execution(status: &str) -> ActivationExecution {
         ActivationExecution {
+            quiesce: None,
             id: String::new(),
             started_at: "2026-10-18T12:00:00+00:00".to_string(),
             finished_at: "2026-10-18T12:00:42+00:00".to_string(),
@@ -261,8 +266,7 @@ mod tests {
                     activation: "next_start".to_string(),
                     outcome: "skipped".to_string(),
                     detail: Some(
-                        "Already effective — takes effect at the backend's next start"
-                            .to_string(),
+                        "Already effective — takes effect at the backend's next start".to_string(),
                     ),
                 },
                 ActivationExecutionItem {
@@ -338,11 +342,7 @@ mod tests {
         assert_eq!(history.executions.len(), HISTORY_CAP);
         // The first five are gone; the retained run is exactly the
         // newest HISTORY_CAP, in order.
-        let retained: Vec<&str> = history
-            .executions
-            .iter()
-            .map(|e| e.id.as_str())
-            .collect();
+        let retained: Vec<&str> = history.executions.iter().map(|e| e.id.as_str()).collect();
         let expected: Vec<&str> = ids[5..].iter().map(|s| s.as_str()).collect();
         assert_eq!(retained, expected);
         let _ = std::fs::remove_dir_all(&dir);

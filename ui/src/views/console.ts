@@ -48,7 +48,7 @@ function newSessionId(): string {
 
 function fmtTs(v: unknown): string {
   if (typeof v !== "number") return "—";
-  return new Date(v).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "medium" });
+  return new Date(v).toLocaleString(undefined, { dateStyle: "short", timeStyle: "medium" });
 }
 
 /** The results table from a run summary's rows. */

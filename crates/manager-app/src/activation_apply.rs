@@ -234,6 +234,39 @@ pub(crate) fn mark_gateway_result(items: &mut [ActivationExecutionItem], ok: boo
     }
 }
 
+/// The drain timed out and the gateway was restarted under running
+/// requests: say so on every gateway item that has no other detail.
+/// Pure.
+pub(crate) fn note_drain_timeout(items: &mut [ActivationExecutionItem], quiesce: Option<&Value>) {
+    let Some(q) = quiesce.filter(|q| q["timed_out"] == json!(true)) else {
+        return;
+    };
+    let detail = crate::drain_timeout_detail(q);
+    for item in items.iter_mut() {
+        if item.scope != "backend" && item.detail.is_none() {
+            item.detail = Some(detail.clone());
+        }
+    }
+}
+
+/// The start-gateway step's own warnings ("LiteLLM gateway running on
+/// :4001 — warning: the Windows firewall was not changed …"): the part
+/// of its message an applied change must not hide. Pure.
+pub(crate) fn gateway_step_warning(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once(" — warning: ")?;
+    Some(rest.replace(" — warning: ", "; ").trim().to_string())
+}
+
+/// Say on every gateway item what the gateway's start warned about.
+pub(crate) fn note_gateway_warning(items: &mut [ActivationExecutionItem], warning: &str) {
+    for item in items.iter_mut().filter(|i| i.scope != "backend") {
+        item.detail = Some(match item.detail.take() {
+            Some(d) => format!("{d} Warning: {warning}"),
+            None => format!("Warning: {warning}"),
+        });
+    }
+}
+
 /// The execution status after the gateway step (the last step: reaching
 /// it means every step was attempted, so a failure there completes the
 /// execution with failures rather than aborting it). Pure.
@@ -255,7 +288,8 @@ impl ProgressGuard<'_> {
     fn set(&self, progress: ApplyProgress) {
         *self
             .state
-            .activation_progress
+            .activation
+            .progress
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(progress);
     }
@@ -265,7 +299,8 @@ impl Drop for ProgressGuard<'_> {
     fn drop(&mut self) {
         *self
             .state
-            .activation_progress
+            .activation
+            .progress
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -274,7 +309,8 @@ impl Drop for ProgressGuard<'_> {
 /// The running apply's progress, `None` when no apply is in flight.
 pub fn current_progress(state: &AppState) -> Option<ApplyProgress> {
     state
-        .activation_progress
+        .activation
+        .progress
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -329,7 +365,7 @@ pub async fn op_activation_apply(
 ) -> ApiResult {
     let (apply_mode, mode_label) = parse_mode(mode.as_deref())?;
     let source = parse_source(source.as_deref())?;
-    let _lock = match state.activation_apply_lock.try_lock() {
+    let _lock = match state.activation.apply_lock.try_lock() {
         Ok(g) => g,
         Err(_) => {
             return Err(ApiError::Busy(busy_message(
@@ -441,7 +477,7 @@ pub async fn op_activation_apply(
         if plan.gateway_pending {
             let drain = apply_mode == ApplyMode::Drain;
             let line = if drain {
-                "Waiting for in-flight gateway requests, then restarting the gateway…".to_string()
+                "Draining gateway requests and restarting the gateway…".to_string()
             } else {
                 "Restarting the gateway…".to_string()
             };
@@ -458,6 +494,7 @@ pub async fn op_activation_apply(
                 Some(Origin::Activation),
                 Some(&line),
             );
+            let mut warning: Option<String> = None;
             let (ok, error) = match crate::op_gateway_restart(
                 state,
                 sink,
@@ -471,6 +508,7 @@ pub async fn op_activation_apply(
                         quiesce = p.get("quiesce").cloned();
                     }
                     if p["ok"] == json!(true) {
+                        warning = p["message"].as_str().and_then(gateway_step_warning);
                         (true, String::new())
                     } else {
                         manual_command = p["manual_command"].as_str().map(str::to_string);
@@ -506,10 +544,21 @@ pub async fn op_activation_apply(
                 }
             };
             mark_gateway_result(&mut items, ok, &error);
+            note_drain_timeout(&mut items, quiesce.as_ref());
+            if let Some(w) = &warning {
+                note_gateway_warning(&mut items, w);
+            }
             gateway_restarted = ok;
             status = completed_status(&items);
             message = if ok {
-                "Gateway restarted — the saved changes are live.".to_string()
+                let mut text = "Gateway restarted — the saved changes are live.".to_string();
+                if let Some(q) = quiesce.as_ref().filter(|q| q["timed_out"] == json!(true)) {
+                    text.push_str(&format!(" {}", crate::drain_timeout_detail(q)));
+                }
+                if let Some(w) = &warning {
+                    text.push_str(&format!(" Warning: {w}"));
+                }
+                text
             } else {
                 error
             };
@@ -529,6 +578,7 @@ pub async fn op_activation_apply(
         drift: plan.drift,
         gateway_up: plan.gateway_up,
         gateway_pending: plan.gateway_pending,
+        quiesce: quiesce.clone(),
         items: items.clone(),
     };
     let execution_id = activation_history::record_execution(&state.data_dir, &mut execution);

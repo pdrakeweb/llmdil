@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+getrandom = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 zip = "2.2"

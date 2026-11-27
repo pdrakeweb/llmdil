@@ -4,6 +4,8 @@ Scope: the transient add-a-backend form and its post-submit confirmation card, r
 
 Post-v0.1.40 note (2026-10-18): the checklist now runs to 16 questions, and the form has since gained a *Launch parameters* section (tracker #49: context, batch, expert-offload draft, and GPU placement, sharing the flags-editor controls — `#addBackParams` in `wireBackends`, current `ui/src/views/static.ts`). The audit below predates both; its line numbers and its "no summary of the outcome" finding (Q3/Q8) should be re-scored against the current form before being cited.
 
+Status (2026-11-12): all findings closed. The Q8 remainder (GPU RAM / System RAM tiles and the split preview bar) landed from an additive `memory` object on `backend_add_preview`; see IMPLEMENTATION.md.
+
 ## Scorecard
 
 | # | Checklist question (short) | Verdict | Evidence |

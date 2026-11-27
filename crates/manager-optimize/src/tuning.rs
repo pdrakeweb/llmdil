@@ -119,8 +119,7 @@ impl TuningCoords {
     /// axes omitted. An empty result is the incumbent itself.
     pub fn delta_labels(&self, incumbent: &TuningCoords) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        if self.gpu_indices != incumbent.gpu_indices
-            || self.tensor_split != incumbent.tensor_split
+        if self.gpu_indices != incumbent.gpu_indices || self.tensor_split != incumbent.tensor_split
         {
             out.push(format!(
                 "Placement: {} → {}",
@@ -223,9 +222,6 @@ pub struct TuningGpu {
     pub total_mib: u64,
     /// Compute capability, e.g. (8, 6); (0, 0) = unknown.
     pub compute_capability: (u32, u32),
-    /// Whether the pinned llama.cpp can run flash attention
-    /// on this architecture (§B.1: absent on Pascal sm_60).
-    pub fa_supported: bool,
 }
 
 /// Everything sweep planning resolves about the target,
@@ -255,6 +251,13 @@ pub struct TuningInputs {
     /// cache/FA parameters stay at the incumbent's values and
     /// only context size varies.
     pub predicted_cache: Option<CacheSelection>,
+    /// The model's MoE block map when its GGUF was parsed (code
+    /// review v0.1.60 item 11): offload coordinates count MoE
+    /// layers and are written at their `--n-cpu-moe` block-index
+    /// bound through it. Absent (older records, catalog-only
+    /// models) is the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe_block_map: Option<manager_models::MoeBlockMap>,
 }
 
 /// The fixed axis order of the descent (§B.5).
@@ -296,13 +299,7 @@ pub fn offload_values(inputs: &TuningInputs) -> Vec<u32> {
         return Vec::new();
     };
     let mut out: Vec<u32> = Vec::new();
-    for v in [
-        0,
-        l.div_ceil(4),
-        l.div_ceil(2),
-        (3 * l).div_ceil(4),
-        l,
-    ] {
+    for v in [0, l.div_ceil(4), l.div_ceil(2), (3 * l).div_ceil(4), l] {
         if !out.contains(&v) {
             out.push(v);
         }
@@ -390,9 +387,9 @@ pub fn moe_cache_values(offload_layers: Option<u32>, free_after_mib: u64) -> Vec
 /// prediction was wrong" is a measured outcome. When no
 /// prediction could be priced, only the incumbent's values
 /// are offered (an unpriced parameter is not swept, §B.1).
-/// Flash-attention-on values are offered only when every
-/// placed GPU supports it; the caller filters through
-/// [`cache_fa_offered`].
+/// Flash attention is offered on every architecture: the pinned
+/// build runs it on Pascal too (observed on compute capability
+/// 6.0 with f16, q8_0 and q4_0 V caches).
 pub fn context_cache_values(inputs: &TuningInputs) -> Vec<CacheSelection> {
     let inc = inputs.incumbent.cache;
     let mut out: Vec<CacheSelection> = vec![inc];
@@ -433,16 +430,6 @@ pub fn context_cache_values(inputs: &TuningInputs) -> Vec<CacheSelection> {
         out.push(flipped);
     }
     out
-}
-
-/// Whether a cache selection may be offered on a placement:
-/// flash attention on requires every placed GPU to support
-/// it (§B.1 capability gating — absent, not disabled).
-pub fn cache_fa_offered(sel: &CacheSelection, placed: &[&TuningGpu]) -> bool {
-    if sel.flash_attn != manager_models::FlashAttn::On {
-        return true;
-    }
-    !placed.is_empty() && placed.iter().all(|g| g.fa_supported)
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +574,12 @@ impl Descent {
         let mut out: Vec<TuningCoords> = Vec::new();
         let mut push = |c: TuningCoords, out: &mut Vec<TuningCoords>| {
             let key = c.fingerprint_key();
-            if c == self.current || self.visited.contains(&key) || out.iter().any(|o: &TuningCoords| o.fingerprint_key() == key) {
+            if c == self.current
+                || self.visited.contains(&key)
+                || out
+                    .iter()
+                    .any(|o: &TuningCoords| o.fingerprint_key() == key)
+            {
                 return;
             }
             self.visited.push(key);
@@ -806,7 +798,9 @@ pub fn rank_arms(arms: &[TuningArm]) -> Vec<usize> {
                     .unwrap_or(f64::MAX),
             )
         };
-        key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal)
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut rest: Vec<usize> = arms
         .iter()
@@ -821,6 +815,30 @@ pub fn rank_arms(arms: &[TuningArm]) -> Vec<usize> {
 /// The best rankable arm's index, when any arm measured.
 pub fn winner_index(arms: &[TuningArm]) -> Option<usize> {
     rank_arms(arms).into_iter().find(|&i| arms[i].rankable())
+}
+
+/// Smallest generation-rate lead, percent, that is not noise.
+pub const WIN_MARGIN_PCT: f64 = 2.0;
+
+/// Whether `a`'s median generation rate beats `b`'s beyond noise: by
+/// at least [`WIN_MARGIN_PCT`] and by more than either side's own
+/// run-to-run spread.
+pub fn beats(a: &crate::BenchResult, b: &crate::BenchResult) -> bool {
+    let (Some(ga), Some(gb)) = (a.predicted_per_second, b.predicted_per_second) else {
+        return false;
+    };
+    if gb <= 0.0 {
+        return ga > 0.0;
+    }
+    let lead = (ga - gb) / gb * 100.0;
+    lead >= WIN_MARGIN_PCT && lead > a.spread_pct() && lead > b.spread_pct()
+}
+
+/// A backend a job stopped and could not start again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreFailure {
+    pub id: String,
+    pub error: String,
 }
 
 /// The confirmation arm's outcome (§B.6): reproducibility of
@@ -888,6 +906,9 @@ pub struct TuningSweep {
     pub truncated: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Backends the sweep stopped and could not start again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore_failures: Vec<RestoreFailure>,
     /// The winning arm was adopted into the backend's saved
     /// configuration through the structured save ops (§B.6).
     pub adopted: bool,
@@ -911,7 +932,12 @@ pub fn adopt_is_default(sweep: &TuningSweep) -> bool {
     let Some(winner) = sweep.winner_arm else {
         return false;
     };
-    if sweep.arms.get(winner).map(|a| a.coords == sweep.incumbent).unwrap_or(true) {
+    if sweep
+        .arms
+        .get(winner)
+        .map(|a| a.coords == sweep.incumbent)
+        .unwrap_or(true)
+    {
         return false;
     }
     match &sweep.confirmation {
@@ -953,11 +979,17 @@ impl TuningStore {
     }
 
     pub fn latest_for(&self, backend_id: &str) -> Option<&TuningSweep> {
-        self.sweeps.iter().rev().find(|s| s.backend_id == backend_id)
+        self.sweeps
+            .iter()
+            .rev()
+            .find(|s| s.backend_id == backend_id)
     }
 
     pub fn running(&self) -> Option<&TuningSweep> {
-        self.sweeps.iter().rev().find(|s| s.state == SweepState::Running)
+        self.sweeps
+            .iter()
+            .rev()
+            .find(|s| s.state == SweepState::Running)
     }
 }
 
@@ -984,6 +1016,21 @@ pub fn tuning_temp_backend(
     port: u16,
     moe_layers: Option<u32>,
 ) -> BackendConfig {
+    tuning_temp_backend_mapped(incumbent, coords, temp_id, port, moe_layers, None)
+}
+
+/// [`tuning_temp_backend`] with the model's MoE block map: the
+/// coordinate's `offload_layers` counts MoE layers and is written
+/// at its `--n-cpu-moe` block-index bound (code review v0.1.60
+/// item 11). `None` is the identity.
+pub fn tuning_temp_backend_mapped(
+    incumbent: &BackendConfig,
+    coords: &TuningCoords,
+    temp_id: &str,
+    port: u16,
+    moe_layers: Option<u32>,
+    moe_block_map: Option<&manager_models::MoeBlockMap>,
+) -> BackendConfig {
     let mut temp = incumbent.clone();
     temp.id = temp_id.to_string();
     temp.port = port;
@@ -997,17 +1044,20 @@ pub fn tuning_temp_backend(
     let mut raw = incumbent.raw_flags.clone();
     if let Some(layers) = coords.offload_layers {
         let offload = match moe_layers {
-            Some(moe) => manager_models::offload_for_layers(layers, moe),
+            Some(moe) => manager_models::offload_for_moe_layers(layers, moe, moe_block_map),
             None => manager_models::ExpertOffload::CpuMoeLayers(layers),
         };
         raw = manager_models::set_expert_offload(raw.as_deref(), offload);
     }
     raw = manager_models::set_moe_cache(raw.as_deref(), coords.moe_cache_mib);
     raw = match coords.mtp_n_max {
-        Some(n) => manager_models::set_mtp_draft(raw.as_deref(), manager_models::MtpDraft::On(Some(n))),
+        Some(n) => {
+            manager_models::set_mtp_draft(raw.as_deref(), manager_models::MtpDraft::On(Some(n)))
+        }
         None => manager_models::set_mtp_draft(raw.as_deref(), manager_models::MtpDraft::Off),
     };
-    raw = manager_models::set_parallel_slots(raw.as_deref(), Some(i64::from(coords.parallel_slots)));
+    raw =
+        manager_models::set_parallel_slots(raw.as_deref(), Some(i64::from(coords.parallel_slots)));
     raw = manager_models::set_cache_selection(raw.as_deref(), Some(coords.cache));
     temp.raw_flags = raw;
     temp
@@ -1018,13 +1068,12 @@ mod tests {
     use super::*;
     use manager_models::{CacheType, FlashAttn};
 
-    fn gpu(index: u32, total: u64, cc: (u32, u32), fa: bool) -> TuningGpu {
+    fn gpu(index: u32, total: u64, cc: (u32, u32)) -> TuningGpu {
         TuningGpu {
             index,
             name: format!("GPU{index}"),
             total_mib: total,
             compute_capability: cc,
-            fa_supported: fa,
         }
     }
 
@@ -1045,15 +1094,13 @@ mod tests {
             moe_layers: Some(48),
             mtp_capable: true,
             ctx_max: 262144,
-            gpus: vec![
-                gpu(0, 16384, (8, 6), true),
-                gpu(1, 16384, (6, 0), false),
-            ],
+            gpus: vec![gpu(0, 16384, (8, 6)), gpu(1, 16384, (6, 0))],
             predicted_cache: Some(CacheSelection {
                 k: CacheType::Q8_0,
                 v: CacheType::Q4_0,
                 flash_attn: FlashAttn::On,
             }),
+            moe_block_map: None,
         }
     }
 
@@ -1108,16 +1155,26 @@ mod tests {
     }
 
     #[test]
-    fn fa_on_is_not_offered_on_pascal() {
-        let inp = inputs();
-        let pascal = &inp.gpus[1];
-        let on = CacheSelection {
-            k: CacheType::F16,
-            v: CacheType::F16,
-            flash_attn: FlashAttn::On,
+    fn a_winner_must_beat_the_incumbent_beyond_noise() {
+        let runs = |rates: &[f64]| {
+            crate::BenchResult::from_runs(
+                rates
+                    .iter()
+                    .map(|r| crate::BenchRun {
+                        prompt_per_second: None,
+                        predicted_per_second: Some(*r),
+                        ttft_ms: None,
+                        latency_ms: 0,
+                        prompt_n: None,
+                    })
+                    .collect(),
+            )
         };
-        assert!(!cache_fa_offered(&on, &[pascal]));
-        assert!(cache_fa_offered(&on, &[&inp.gpus[0]]));
+        // Under 2 %: noise. Over 2 % with tight runs: a win.
+        assert!(!beats(&runs(&[50.5]), &runs(&[50.0])));
+        assert!(beats(&runs(&[52.0]), &runs(&[50.0])));
+        // 4 % ahead, but the runs themselves spread over 10 %.
+        assert!(!beats(&runs(&[47.0, 52.0, 53.0]), &runs(&[50.0])));
     }
 
     #[test]
@@ -1133,25 +1190,41 @@ mod tests {
                 },
             })
         };
-        let arm = |index: usize, status: ArmStatus, residency: Option<ResidencyVerdict>, gen: f64| {
-            TuningArm {
-                index,
-                axis: "spec".to_string(),
-                coords: inputs().incumbent.clone(),
-                status,
-                detail: None,
-                measured: measured(gen),
-                residency,
-                free_vram_mib: vec![],
-                temp_start_c: None,
-                temp_peak_c: None,
-                fingerprint: None,
-            }
-        };
+        let arm =
+            |index: usize, status: ArmStatus, residency: Option<ResidencyVerdict>, gen: f64| {
+                TuningArm {
+                    index,
+                    axis: "spec".to_string(),
+                    coords: inputs().incumbent.clone(),
+                    status,
+                    detail: None,
+                    measured: measured(gen),
+                    residency,
+                    free_vram_mib: vec![],
+                    temp_start_c: None,
+                    temp_peak_c: None,
+                    fingerprint: None,
+                }
+            };
         let arms = vec![
-            arm(0, ArmStatus::Completed, Some(ResidencyVerdict::VerifiedExclusive), 22.5),
-            arm(1, ArmStatus::Completed, Some(ResidencyVerdict::VerifiedExclusive), 29.5),
-            arm(2, ArmStatus::Completed, Some(ResidencyVerdict::Unverified { reason: "x".into() }), 99.0),
+            arm(
+                0,
+                ArmStatus::Completed,
+                Some(ResidencyVerdict::VerifiedExclusive),
+                22.5,
+            ),
+            arm(
+                1,
+                ArmStatus::Completed,
+                Some(ResidencyVerdict::VerifiedExclusive),
+                29.5,
+            ),
+            arm(
+                2,
+                ArmStatus::Completed,
+                Some(ResidencyVerdict::Unverified { reason: "x".into() }),
+                99.0,
+            ),
             arm(3, ArmStatus::Failed, None, 0.0),
         ];
         let order = rank_arms(&arms);
@@ -1199,5 +1272,26 @@ mod tests {
         assert!(raw.contains("--parallel 1"), "{raw}");
         assert_eq!(temp.id, "opt-exp-tuning-1");
         assert_eq!(temp.port, 19000);
+        // Review item 11: an offload coordinate counts MoE layers
+        // and is written at its block-index bound through the map
+        // (2 leading dense blocks: 16 layers is `--n-cpu-moe 18`).
+        coords.offload_layers = Some(16);
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50);
+        let temp = tuning_temp_backend_mapped(&incumbent, &coords, "t", 1, Some(48), map.as_ref());
+        assert!(temp.raw_flags.unwrap().contains("--n-cpu-moe 18"));
+        let temp = tuning_temp_backend(&incumbent, &coords, "t", 1, Some(48));
+        assert!(temp.raw_flags.unwrap().contains("--n-cpu-moe 16"));
+        // The map is additive on the persisted inputs: older
+        // records without it deserialize.
+        let mut v = serde_json::to_value(inputs()).unwrap();
+        assert!(v.get("moe_block_map").is_none());
+        v.as_object_mut().unwrap().remove("moe_block_map");
+        let back: TuningInputs = serde_json::from_value(v).unwrap();
+        assert_eq!(back.moe_block_map, None);
+        let mut with = inputs();
+        with.moe_block_map = map;
+        let back: TuningInputs =
+            serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
     }
 }

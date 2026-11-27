@@ -3,13 +3,15 @@
    framework can replace this file later without changing command contracts. */
 
 import "./styles.css";
-import { appUpdateRestart, getActivationPlan, getAppConfig, getAppUpdateStatus, getSetupStatus, getStatus, isTauri } from "./api";
+import { appUpdateRestart, getActivationPlan, getAppConfig, getAppUpdateStatus, getBackends, getGatewayStatus, getSetupStatus, getStatus, getWizardSteps, isTauri } from "./api";
 import type { ActivationPlanData, AppUpdateInfo } from "./api";
 import { META, lifecycleDot, lifecycleLabel, serviceStore } from "./lifecycle";
 import type { ServiceSnapshot } from "./lifecycle";
 import { stackedBar } from "./charts";
 import { esc, setHtml } from "./html";
 import { icon, type IconName } from "./icons";
+import { setupNeedsWizard } from "./setupGate";
+import { onStartAllClick, paintStartAll } from "./startAll";
 import { renderBench, wireBench } from "./views/bench";
 import { renderConsole, wireConsole } from "./views/console";
 import { mountDashboard } from "./views/dashboard";
@@ -54,21 +56,22 @@ function shell(): string {
   return `<aside class="sidebar">
       <div class="brand"><div class="name">Local LLM Service</div><div class="sub">Dell Precision 7865</div></div>
       <nav class="nav">${ROUTES.map((r) => `<a href="${r.hash}" data-route="${r.hash}">${icon(r.icon)}<span class="lbl">${esc(r.label)}</span></a>`).join("")}</nav>
+      <div id="sideServices"></div>
       <div class="side-foot" id="sideFoot"><div class="row"><span class="dot idle"></span> status…</div></div>
     </aside>
     <div class="main">
+      <div id="view" style="display:flex;flex-direction:column;flex:1;min-height:0"></div>
       <div id="updateBanner"></div>
       <div id="activationBanner"></div>
-      <div id="view" style="display:flex;flex-direction:column;flex:1;min-height:0"></div>
       <div class="taskbar" id="taskbar"></div>
     </div>`;
 }
 
 /* ---------------- Global activation-plan banner ----------------
- * A header at the very top of the main column, above every view's
- * title, shown whenever an activation plan is pending — across
- * scopes (gateway routes, backend flags/splits, model assignment,
- * GPU placement). Review navigates to the dedicated Activation
+ * A bar docked under the view, above the task bar, shown whenever an
+ * activation plan is pending — across scopes (gateway routes, backend
+ * flags/splits, model assignment, GPU placement). It is docked at the
+ * bottom so its late arrival never moves what the pointer is on. Review navigates to the dedicated Activation
  * Plan view; Apply executes the plan directly through the same
  * routine the plan card uses. It polls independently of the
  * current view, and a view-level dismissal (the plan card's X) never
@@ -203,6 +206,22 @@ async function onBannerClick(ev: Event): Promise<void> {
   void render();
 }
 
+/* Scroll position per route: kept when a page is left and returned to,
+ * and across a re-render of the same page (an apply, a save). */
+const scrollByRoute = new Map<string, number>();
+let shownRoute: string | null = null;
+
+function rememberScroll(): void {
+  const el = document.querySelector("#view > .view");
+  if (shownRoute !== null && el) scrollByRoute.set(shownRoute, el.scrollTop);
+}
+
+function restoreScroll(route: string): void {
+  const el = document.querySelector("#view > .view");
+  const top = scrollByRoute.get(route) ?? 0;
+  if (el && top > 0) el.scrollTop = top;
+}
+
 /* ---------------- Global app-update banner ----------------
  * Shown whenever the app-update state carries a staged update
  * newer than the running version — the banner is derived from
@@ -261,12 +280,12 @@ async function onUpdateBannerClick(ev: Event): Promise<void> {
 
 /** Sidebar footer data that is not lifecycle (config-load outcome,
  *  MXC mode): fetched on navigation, not on every store refresh. */
-let sideFootStatic: { reachable: boolean; cfgRow: string; mxc: string | null } | null = null;
+let sideFootStatic: { reachable: boolean; cfgRow: string; mxc: string | null; mxcInstalled: boolean | null } | null = null;
 
 async function refreshSideFootStatic(): Promise<void> {
   if (!isTauri()) return;
   const [s, cfg] = await Promise.all([getStatus(), getAppConfig()]);
-  if (s.error) { sideFootStatic = { reachable: false, cfgRow: "", mxc: null }; paintSideFoot(serviceStore.get()); return; }
+  if (s.error) { sideFootStatic = { reachable: false, cfgRow: "", mxc: null, mxcInstalled: null }; paintSideFoot(serviceStore.get()); return; }
   // Abnormal-condition row only (design rule 5): the config came from
   // the .bak copy or from built-in defaults (code review v0.1.60 F2).
   // Details (error, preserved copies) live in the tooltip.
@@ -275,7 +294,7 @@ async function refreshSideFootStatic(): Promise<void> {
     ? `<div class="row" title="${esc([cl.error ?? "", ...cl.preserved.map((p) => `Preserved: ${p}`)].filter(Boolean).join("\n"))}"><span class="dot err"></span> Config: ${cl.source === "backup" ? "restored from .bak" : "defaults (load failed)"}</div>`
     : "";
   const mxc = (cfg.data?.mxc as { mode?: string } | undefined)?.mode ?? null;
-  sideFootStatic = { reachable: true, cfgRow, mxc };
+  sideFootStatic = { reachable: true, cfgRow, mxc, mxcInstalled: s.data.mxc_runtime_installed ?? null };
   paintSideFoot(serviceStore.get());
 }
 
@@ -299,9 +318,11 @@ function paintSideFoot(snap: ServiceSnapshot): void {
   const gwState = serviceStore.gatewayState();
   // An errored status call paints no port and no green dot (the state
   // is unknown, not up).
+  const gwPort = snap.gateway ? snap.gateway.running_port ?? snap.gateway.port : 0;
+  const portPending = Boolean(snap.gateway) && gwPort !== snap.gateway?.port;
   const gwRow = !snap.gateway || gwState === null
     ? `<div class="row"><span class="dot idle"></span> LiteLLM status unknown</div>`
-    : `<div class="row" title="${esc(lifecycleLabel(gwState, serviceStore.transitionOf("gateway", snap.gateway.transition)))}">${lifecycleDot(gwState)} LiteLLM :${snap.gateway.port}${gwState === "running" ? "" : ` · ${esc(lifecycleLabel(gwState))}`}</div>`;
+    : `<div class="row" title="${esc(lifecycleLabel(gwState, serviceStore.transitionOf("gateway", snap.gateway.transition)))}">${lifecycleDot(gwState)} LiteLLM :${gwPort}${portPending ? ` · saved :${snap.gateway.port}` : ""}${gwState === "running" ? "" : ` · ${esc(lifecycleLabel(gwState))}`}</div>`;
   const sum = serviceStore.summary();
   const backDot = sum.backendsFailed ? "err"
     : sum.backendsTotal && sum.backendsRunning === sum.backendsTotal ? "ok"
@@ -313,7 +334,9 @@ function paintSideFoot(snap: ServiceSnapshot): void {
     ${sideFootStatic?.cfgRow ?? ""}
     ${gwRow}
     <div class="row"><span class="dot ${backDot}"></span> ${sum.backendsRunning}/${sum.backendsTotal} backends up${changing}</div>
-    <div class="row"><span class="dot warn"></span> MXC · ${mxc ? esc(mxc) : "unknown"}</div>`;
+    ${sideFootStatic?.mxcInstalled === false
+      ? `<div class="row"><span class="dot idle"></span> MXC · not installed</div>`
+      : `<div class="row"><span class="dot ${mxc ? "warn" : "idle"}"></span> MXC · ${mxc ? esc(mxc) : "unknown"}</div>`}`;
 }
 
 /** Repaint the sidebar and the activation banner from every store
@@ -324,6 +347,7 @@ function paintSideFoot(snap: ServiceSnapshot): void {
 let lastApplying = false;
 function onStoreSnapshot(snap: ServiceSnapshot): void {
   paintSideFoot(snap);
+  paintStartAll(snap);
   const applying = Boolean(snap.gateway?.activation_applying);
   if (applying !== lastApplying) {
     lastApplying = applying;
@@ -353,6 +377,7 @@ function hashParams(): URLSearchParams {
 
 async function render(): Promise<void> {
   const gen = ++renderGen;
+  rememberScroll();
   if (cleanup) { cleanup(); cleanup = null; }
   const hash = location.hash || "#/dashboard";
   // Routes match on the path part only; the query carries view params.
@@ -484,6 +509,8 @@ async function render(): Promise<void> {
       view.innerHTML = "";
   }
   if (gen !== renderGen) return; // a newer render took over mid-flight
+  shownRoute = route.hash;
+  restoreScroll(route.hash);
   renderTaskbar();
   void refreshActivationBanner();
   void refreshUpdateBanner();
@@ -499,6 +526,7 @@ async function main(): Promise<void> {
   app.innerHTML = shell();
   window.addEventListener("hashchange", () => void render());
   document.getElementById("activationBanner")?.addEventListener("click", (ev) => void onBannerClick(ev));
+  document.getElementById("sideServices")?.addEventListener("click", onStartAllClick);
   document.getElementById("updateBanner")?.addEventListener("click", (ev) => void onUpdateBannerClick(ev));
   void refreshActivationBanner();
   void refreshUpdateBanner();
@@ -506,13 +534,18 @@ async function main(): Promise<void> {
   // store; the plan itself (pending changes) is re-read on a slower
   // cadence and whenever an apply starts or ends.
   serviceStore.subscribe(onStoreSnapshot);
-  window.setInterval(() => { void refreshActivationBanner(); }, 15000);
+  window.setInterval(() => { void refreshActivationBanner(); }, 5000);
   window.setInterval(() => { void refreshUpdateBanner(); }, 30000);
-  // First launch: open the setup wizard until it is marked complete.
+  // First launch: open the setup wizard while setup is not marked
+  // complete AND a part the app cannot run without is missing. An
+  // existing installation that never pressed Finish starts normally.
   if (isTauri() && !location.hash) {
     try {
       const s = await getSetupStatus();
-      if (s.live && !s.data.setup_completed) location.hash = "#/wizard";
+      if (s.live && !s.data.setup_completed) {
+        const [b, g, w] = await Promise.all([getBackends(), getGatewayStatus(), getWizardSteps()]);
+        if (setupNeedsWizard({ backends: b.error ? null : b.data, gateway: g.error ? null : g.data.state, steps: w.data }) && !location.hash) location.hash = "#/wizard";
+      }
     } catch { /* fall through to default route */ }
   }
   void render();

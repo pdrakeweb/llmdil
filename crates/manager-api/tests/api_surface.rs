@@ -32,6 +32,7 @@ async fn admin_token(ctx: &Arc<ApiCtx>) -> String {
         must_change_password: false,
         totp_enabled: false,
         recovery_code_hashes: vec![],
+        last_totp_step: None,
         created_ms: manager_api::users::now_ms(),
         updated_ms: manager_api::users::now_ms(),
     };
@@ -142,7 +143,13 @@ async fn identity_and_status() {
     let (status, _) = body_json(router.clone().oneshot(get("/api/v1/status")).await.unwrap()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let token = admin_token(&ctx).await;
-    let (status, v) = body_json(router.oneshot(get_auth("/api/v1/status", &token)).await.unwrap()).await;
+    let (status, v) = body_json(
+        router
+            .oneshot(get_auth("/api/v1/status", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(v.is_object());
     let _ = std::fs::remove_dir_all(&dir);
@@ -168,7 +175,8 @@ async fn read_endpoints_respond() {
         "/api/v1/mxc/policy",
         "/api/v1/logs/scopes",
     ] {
-        let (status, _) = body_json(router.clone().oneshot(get_auth(uri, &token)).await.unwrap()).await;
+        let (status, _) =
+            body_json(router.clone().oneshot(get_auth(uri, &token)).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -191,7 +199,13 @@ async fn get_one_and_not_found_envelope() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["id"], "planner");
 
-    let (status, v) = body_json(router.oneshot(get_auth("/api/v1/backends/nope", &token)).await.unwrap()).await;
+    let (status, v) = body_json(
+        router
+            .oneshot(get_auth("/api/v1/backends/nope", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(v["error"]["code"], "NOT_FOUND");
     assert_eq!(v["error"]["kind"], "NotFound");
@@ -289,7 +303,8 @@ async fn redaction_structure() {
     let (router, _) = build_router(ctx.clone());
     let token = admin_token(&ctx).await;
     for uri in ["/api/v1/config", "/api/v1/gateway/config", "/api/v1/status"] {
-        let (status, v) = body_json(router.clone().oneshot(get_auth(uri, &token)).await.unwrap()).await;
+        let (status, v) =
+            body_json(router.clone().oneshot(get_auth(uri, &token)).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
         let text = v.to_string();
         assert!(!text.contains("PRIVATE KEY"), "key material in {uri}");

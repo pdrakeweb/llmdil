@@ -240,7 +240,8 @@ Coverage positions across the documents:
   MCP mode toggles — while still specifying them for completeness.
   The auth classes already cover them (Class X, admin-only)
   **[auth §1]**, so adding them later is additive. Decision 10.
-- **Stubs stay stubs.** `updates_check_all` and `updates_apply`
+- **Stubs stay stubs.** (Superseded: both are implemented and routed,
+  apply for admins; rest-api.md §6.14.) `updates_check_all` and `updates_apply`
   always error `Unsupported` in the app today **[audit §12]**;
   the contract reserves their paths and returns `501 UNSUPPORTED`
   **[rest §6.14]**. **[impl D7]** additionally recommends
@@ -432,9 +433,8 @@ From **[rest]**, the contract the Android client is built against:
   keeps it (download byte progress on the model resource), so the
   operation is a completion handle, not the progress channel.
   `POST /operations/{id}/abort` maps to the app's task abort with
-  its real semantics stated plainly: it is bookkeeping-level
-  best-effort per kind, and the response reports the resulting
-  state (§2.5).
+  its real semantics stated plainly: it is best-effort per kind, and
+  the response reports the resulting state (§2.5, rest-api.md §6.10).
 - **Collections** return the app's envelope key, complete and
   unpaged (operator-scale lists). The one true paged query is logs,
   keeping `get_logs`' exact semantics (offset/limit, filters,
@@ -769,6 +769,10 @@ except where you override them here.
     **Recommendation: exclude the peripheral trio from v1;
     include updates policy writes; `updates_apply` local-only.**
     All exclusions are additive to reverse.
+    **Reversed (November 2026):** MCP reads and the
+    connection test, and everything else that had been left
+    desktop-only, have routes; what stays out, and why, is
+    rest-api.md §6.16.
 11. **The broad raw config patch in v1.**
     `PATCH /api/v1/config` mirrors `update_config`: one endpoint
     that can merge any field of `AppConfig`, including gateway
@@ -778,6 +782,8 @@ except where you override them here.
     needs arbitrary config merge; the user-store separation
     (§3.4) already removes its worst hazard, and the endpoint
     can be added additively if a real need appears.
+    **Kept (November 2026)** for the raw patch; a section without a
+    domain endpoint gets a narrow route (`PUT /settings/supervision`).
 12. **Remote wizard / install-class operations.**
     `run_wizard_step` installs software, reconciles firewall
     rules with UAC prompts on the server console, and runs for
@@ -860,12 +866,29 @@ truth:
   WinML) are likewise unimplemented over REST per decision 10;
   the "every endpoint implemented" sentence above covers the v1
   committed surface only.
+- **MCP spawn rules bind any future MCP-config endpoint** (review
+  v0.1.60 PS-5). Local-exposure MCP servers are now spawned from
+  `AppConfig.mcp`, so whoever can write an MCP server definition
+  chooses a program the app runs. Any future Admin API endpoint
+  that writes MCP server config must go through the existing ops
+  (`mcp_save_server` / `mcp_set_exposure` / `mcp_delete_server`)
+  or `manager_mcp::local::prepare_spawn`, and so adopt their
+  rules: Local means stdio with a non-empty command (anything else
+  is an explicit error); the program is launched directly, never
+  through a shell; a bare command is resolved from absolute `PATH`
+  entries (Windows: `PATHEXT` extensions only, so `npx` is
+  `npx.cmd`); a command path must be absolute and inside a known
+  install directory; the stdio allowlist and banned args are
+  re-checked at spawn, not only at save; credential values are read
+  only at spawn, go only into the child's environment, and never
+  appear in logs, errors, or the supervisor's retained spec; and
+  editing or deleting a running Local server stops its process
+  first. See `docs/mcp-capabilities-design.md` §5.1.
 - `GET /api/v1/events` (SSE) is an API-layer derived route, not a
   registry operation; the audit-log read path is
   `GET /api/v1/admin/audit` (§3.4's `GET /admin/audit` omits the
-  prefix). Both `POST /updates/check` and
-  `POST /updates/components/{component_id}/apply` return 501
-  UNSUPPORTED from the app's stubs.
+  prefix). (`POST /updates/check` and the component apply, stubs when
+  this was written, are implemented since; rest-api.md §6.14.)
 
 **Registry drift mechanism.** As specified in section 3.1:
 `for_each_operation!` in manager-app is the single declaration;
@@ -888,25 +911,37 @@ read-modify-write sequences are serialized by a per-context lock.
 **Asynchronous endpoints.** AsyncOp routes, gateway start, and
 the activation apply answer 202 with an API-side operation record
 (TaskRecord shape), retained for the process lifetime and merged
-into `GET /operations`. Abort is bookkeeping with the app's
-semantics: the record flips to aborted; the underlying work is
-not cancellable and its completion never overwrites the abort.
+into `GET /operations`. A record knows the app task its work runs as;
+its abort cancels that task. Work without a task cannot be cancelled:
+its record is marked aborted and keeps what the work did later. A
+finished record is never rewritten (rest-api.md §6.10).
 
 **Events.** `GET /api/v1/events` (SSE) carries the app's
 operation events with process-global ids. Live-only: nothing is
 replayed on reconnect; ids let a client detect gaps.
 
 **Deviations.**
-- TLS private key custody: a key file under
-  `<data_dir>/admin-api/tls/` rather than Windows Credential
-  Manager. The in-process server reads it at startup before any
-  UI exists; the directory is per-user app data alongside
-  `admin-users.json`. Moving custody is future hardening.
-- QR rendering: the desktop pairing surface shows the payload
-  (`base_url`, `cert_sha256`, enrollment code) as copyable values;
-  no QR library was installable in the build environment. The
-  payload format is the QR content, so rendering is additive
-  later.
+- TLS private key custody (resolved, SEC-N3): on Windows the key is
+  a per-user Credential Manager generic credential
+  (`llmdil/admin-api/tls-key/<id>`, named by
+  `<data_dir>/admin-api/tls/key-store.txt`); the certificate,
+  fingerprint and SANs stay as files. A plaintext `server.key` from
+  earlier versions is imported at startup, read back, and deleted
+  only once the protected copy matches; the certificate and
+  fingerprint are unchanged, so pairings survive. If Credential
+  Manager refuses the key the plaintext file stays in use. The
+  Remote Access status reports `key_storage` (`credential_manager` |
+  `file`). Other platforms keep the plaintext file.
+- QR rendering (resolved Nov 2026): the desktop pairing surface
+  shows the payload (`base_url`, `cert_sha256`, enrollment code) as
+  copyable values **and** as a QR code encoding the same three values
+  as compact JSON (`{"base_url":…,"cert_sha256":…,"enrollment_code":…}`).
+  The shell renders it with the `qrcode` crate (0.14, SVG renderer
+  only, error-correction level M; `manager_api::pairing`) and returns
+  it as `qr_svg` beside the values on `admin_api_create_enrollment`
+  / `admin_api_get_pairing`; the card inlines the `<svg>` (the CSP
+  admits no `data:` images). No value beyond those already shown as
+  text is encoded.
 - Certificate SAN set: hostname + primary LAN IP + Tailscale IP
   (when the CLI reports one) + loopback, regenerated when the set
   changes at enable time; rotation is a desktop action that

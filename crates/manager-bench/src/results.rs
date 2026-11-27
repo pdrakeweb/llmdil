@@ -217,6 +217,74 @@ pub struct ConditionWinner {
     pub median_gen_tps: f64,
     pub baseline_gen_tps: Option<f64>,
     pub delta_pct: Option<f64>,
+    /// The lead is beyond noise: at least [`WIN_MARGIN_PCT`] and more
+    /// than either arm's own run-to-run spread. Judged against the
+    /// baseline arm, or against the runner-up when the winner is the
+    /// baseline (or none was measured here). False reads "no clear
+    /// winner".
+    pub clear: bool,
+}
+
+/// Smallest lead, percent, that is not noise.
+pub const WIN_MARGIN_PCT: f64 = 2.0;
+
+/// Run-to-run spread of an arm's generation rate, percent of the
+/// median; 0 with fewer than two measured runs.
+fn spread_pct(arm: &ArmRecord) -> f64 {
+    let rates: Vec<f64> = arm
+        .runs
+        .iter()
+        .filter(|r| !r.warmup)
+        .filter_map(|r| r.gen_tps)
+        .collect();
+    let max = rates.iter().copied().fold(f64::MIN, f64::max);
+    let min = rates.iter().copied().fold(f64::MAX, f64::min);
+    match median(&rates) {
+        Some(m) if m > 0.0 && rates.len() > 1 => (max - min) / m * 100.0,
+        _ => 0.0,
+    }
+}
+
+fn gen_tps(arm: &ArmRecord) -> f64 {
+    arm.summary
+        .as_ref()
+        .and_then(|s| s.median_gen_tps)
+        .unwrap_or(0.0)
+}
+
+fn beats(a: &ArmRecord, b: &ArmRecord) -> bool {
+    let (ga, gb) = (gen_tps(a), gen_tps(b));
+    if gb <= 0.0 {
+        return ga > 0.0;
+    }
+    let lead = (ga - gb) / gb * 100.0;
+    lead >= WIN_MARGIN_PCT && lead > spread_pct(a) && lead > spread_pct(b)
+}
+
+/// The status a finished sweep ends in: `failed` when nothing was
+/// measured, `partial` when it was cut short, else `complete`.
+pub fn final_status(arms: &[ArmRecord], partial: bool) -> &'static str {
+    let measured = arms.iter().any(|a| a.status == ArmStatus::Measured);
+    match (measured, partial) {
+        (false, false) => "failed",
+        (_, true) => "partial",
+        (true, false) => "complete",
+    }
+}
+
+/// Minutes per arm this backend and model have actually taken: the
+/// median over every measured arm of earlier sweeps. `None` without
+/// history.
+pub fn minutes_per_arm(sweeps: &[SweepRecord], backend_id: &str, model_path: &str) -> Option<f64> {
+    let minutes: Vec<f64> = sweeps
+        .iter()
+        .filter(|s| s.backend_id == backend_id && s.model.path == model_path)
+        .flat_map(|s| &s.arms)
+        .filter(|a| a.status == ArmStatus::Measured)
+        .filter_map(|a| Some((a.ended_ms? - a.started_ms?) as f64 / 60_000.0))
+        .filter(|m| *m > 0.0)
+        .collect();
+    median(&minutes)
 }
 
 /// Compute the per-condition winners of a sweep. Only arms with
@@ -253,12 +321,9 @@ pub fn condition_winners(sweep: &SweepRecord) -> Vec<ConditionWinner> {
             .as_ref()
             .and_then(|s| s.median_gen_tps)
             .expect("winner was filtered to measured arms");
-        let baseline = arms
-            .iter()
-            .find(|a| a.index == sweep.baseline_arm_index);
-        let baseline_gen_tps = baseline.and_then(|a| {
-            a.summary.as_ref().and_then(|s| s.median_gen_tps)
-        });
+        let baseline = arms.iter().find(|a| a.index == sweep.baseline_arm_index);
+        let baseline_gen_tps =
+            baseline.and_then(|a| a.summary.as_ref().and_then(|s| s.median_gen_tps));
         let delta_pct = baseline_gen_tps.and_then(|base| {
             if base != 0.0 {
                 Some((winner_tps - base) / base * 100.0)
@@ -266,7 +331,15 @@ pub fn condition_winners(sweep: &SweepRecord) -> Vec<ConditionWinner> {
                 None
             }
         });
+        let against = match baseline {
+            Some(b) if b.index != winner.index => Some(b),
+            _ => arms
+                .iter()
+                .filter(|a| a.index != winner.index)
+                .max_by(|a, b| gen_tps(a).total_cmp(&gen_tps(b))),
+        };
         winners.push(ConditionWinner {
+            clear: against.is_some_and(|a| beats(winner, a)),
             depth,
             arm_index: winner.index,
             median_gen_tps: winner_tps,
@@ -484,6 +557,60 @@ mod tests {
     }
 
     #[test]
+    fn a_winner_is_clear_only_beyond_noise() {
+        let clear = |a: f64, b: f64| {
+            condition_winners(&sweep(
+                vec![measured_arm(0, 0, a), measured_arm(1, 0, b)],
+                0,
+            ))[0]
+                .clear
+        };
+        assert!(clear(50.0, 75.0));
+        assert!(!clear(50.0, 50.5));
+        // The baseline winning counts against the runner-up.
+        assert!(clear(75.0, 50.0));
+        assert!(!clear(50.5, 50.0));
+        // A lead smaller than the runs' own spread is noise.
+        let mut noisy = measured_arm(1, 0, 52.0);
+        noisy.runs = vec![run(false, 48.0), run(false, 52.0), run(false, 55.0)];
+        let s = sweep(vec![measured_arm(0, 0, 50.0), noisy], 0);
+        assert!(!condition_winners(&s)[0].clear);
+        // One arm alone wins nothing.
+        let s = sweep(vec![measured_arm(0, 0, 50.0)], 0);
+        assert!(!condition_winners(&s)[0].clear);
+    }
+
+    #[test]
+    fn final_status_needs_a_measured_arm() {
+        let measured = measured_arm(0, 0, 50.0);
+        let mut failed = measured.clone();
+        failed.status = ArmStatus::Failed;
+        assert_eq!(
+            final_status(&[measured.clone(), failed.clone()], false),
+            "complete"
+        );
+        assert_eq!(final_status(&[failed.clone()], false), "failed");
+        assert_eq!(final_status(&[], false), "failed");
+        assert_eq!(final_status(&[failed], true), "partial");
+        assert_eq!(final_status(&[measured], true), "partial");
+    }
+
+    #[test]
+    fn minutes_per_arm_is_the_median_of_history() {
+        let timed = |i: usize, secs: i64| ArmRecord {
+            started_ms: Some(0),
+            ended_ms: Some(secs * 1000),
+            ..measured_arm(i, 0, 50.0)
+        };
+        let s = sweep(vec![timed(0, 6), timed(1, 12), timed(2, 60)], 0);
+        assert_eq!(
+            minutes_per_arm(std::slice::from_ref(&s), "coder", "coder.gguf"),
+            Some(0.2)
+        );
+        assert_eq!(minutes_per_arm(&[s], "other", "coder.gguf"), None);
+    }
+
+    #[test]
     fn condition_winners_skip_unmeasured_arms() {
         let mut failed = measured_arm(1, 8192, 999.0);
         failed.status = ArmStatus::Failed;
@@ -509,10 +636,8 @@ mod tests {
 
     #[test]
     fn results_roundtrip_and_missing_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "manager-bench-results-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("manager-bench-results-test-{}", std::process::id()));
         let path = dir.join("bench-results.json");
         let store = BenchResults::load(&path).expect("missing loads empty");
         assert!(store.sweeps.is_empty());

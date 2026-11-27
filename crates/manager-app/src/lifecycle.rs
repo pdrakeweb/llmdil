@@ -127,6 +127,22 @@ impl Failure {
     }
 }
 
+/// The automatic restarts of a crashed backend (`restart_policy`), as
+/// the backend rows report them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AutoRestart {
+    /// The attempt that is scheduled, running or last made (1-based).
+    pub attempt: u32,
+    pub max: u32,
+    /// When the scheduled attempt is due; `None` once it began.
+    pub next_at_ms: Option<i64>,
+    /// No further attempt will be made.
+    pub gave_up: bool,
+    /// When the attempt began (the stable-run clock).
+    #[serde(skip)]
+    pub began: Option<Instant>,
+}
+
 /// Everything the registry knows about one service.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceRecord {
@@ -146,6 +162,9 @@ pub struct ServiceRecord {
     pub last_settled_at: Option<DateTime<Utc>>,
     /// Gateway: the last liveness probe (when, answered).
     pub last_probe: Option<(Instant, bool)>,
+    /// Backends: pending or exhausted automatic restarts. An operator
+    /// stop or start drops it.
+    pub auto_restart: Option<AutoRestart>,
 }
 
 /// Why [`LifecycleRegistry::try_begin`] refused: another operation
@@ -286,12 +305,24 @@ impl LifecycleRegistry {
         lock(&self.records).values().any(|r| r.transition.is_some())
     }
 
-    /// Record operator intent; bumps the generation.
+    /// Record operator intent; bumps the generation. A stop cancels any
+    /// pending automatic restart.
     pub fn set_intent(&self, key: &str, intent: Intent) {
         self.with(key, |r| {
             r.intent = Some(intent);
             r.generation += 1;
+            if intent == Intent::Stopped {
+                r.auto_restart = None;
+            }
         });
+    }
+
+    pub fn auto_restart(&self, key: &str) -> Option<AutoRestart> {
+        lock(&self.records).get(key).and_then(|r| r.auto_restart)
+    }
+
+    pub fn set_auto_restart(&self, key: &str, auto_restart: Option<AutoRestart>) {
+        self.with(key, |r| r.auto_restart = auto_restart);
     }
 
     pub fn intent(&self, key: &str) -> Option<Intent> {
@@ -429,13 +460,7 @@ pub fn log_path(data_dir: &Path, key: &str) -> PathBuf {
 }
 
 /// Append one lifecycle marker for `key` to its own log. Best-effort.
-pub fn mark(
-    data_dir: &Path,
-    key: &str,
-    event: &str,
-    detail: Option<&str>,
-    origin: Option<Origin>,
-) {
+pub fn mark(data_dir: &Path, key: &str, event: &str, detail: Option<&str>, origin: Option<Origin>) {
     let line = marker_line(Utc::now(), key, event, detail, origin);
     append_marker(&log_path(data_dir, key), &line);
 }
@@ -506,6 +531,10 @@ pub async fn begin(
         .lifecycle
         .try_begin(key, kind, origin)
         .map_err(|busy| ApiError::Busy(busy.to_string()))?;
+    // Any other operation supersedes the automatic restarts.
+    if origin != Origin::RestartPolicy {
+        state.lifecycle.set_auto_restart(key, None);
+    }
     // The previous failure is kept until the operation succeeds
     // ([`finish`] clears it): a start refused or abandoned after this
     // point must not make a failed service read `stopped`.
@@ -709,7 +738,10 @@ fn query_scm(data_dir: &Path, backend_ids: &[String]) -> HashMap<String, Service
             manager_services::GATEWAY_SERVICE_NAME.to_string(),
             Some(manager_wizard::gateway_pid_path(data_dir)),
         ),
-        (manager_services::LOG_RECEIVER_SERVICE_NAME.to_string(), None),
+        (
+            manager_services::LOG_RECEIVER_SERVICE_NAME.to_string(),
+            None,
+        ),
     ];
     for id in backend_ids {
         names.push((
@@ -983,7 +1015,18 @@ pub async fn backend_liveness_for(
     let owned: std::collections::HashSet<String> = lock(&state.backend_spec_ids).clone();
     let sup: Vec<ProcessStatus> = {
         let sup = state.supervisor().await.lock().await;
-        sup.status()
+        let mut rows = sup.status();
+        // A process that died since the monitor's last look: the exit
+        // is the reason until the monitor records it.
+        for s in rows
+            .iter_mut()
+            .filter(|s| s.state == ProcessState::Failed && s.failure_reason.is_none())
+        {
+            s.failure_reason = sup.last_exit_status(&s.id).map(|x| {
+                crate::lifecycle_monitor::crash_reason(Some(x.to_string().as_str()), None)
+            });
+        }
+        rows
     }
     .into_iter()
     .filter(|s| owned.contains(&s.id) || configured.iter().any(|(id, _)| *id == s.id))
@@ -1106,14 +1149,11 @@ pub const GATEWAY_PROBE_MAX_AGE: Duration = Duration::from_secs(2);
 /// gateway pid (`manager_wizard::resolve_gateway_pid`), intent and the
 /// recorded failure.
 pub async fn gateway_view(state: &AppState) -> GatewayView {
-    let (port, probe_host, service_mode) = {
-        let cfg = state.config.read().await;
-        (
-            cfg.gateway.port,
-            manager_wizard::steps::gateway_probe_host(&cfg),
-            cfg.supervision.mode == manager_config::SupervisionMode::Service,
-        )
-    };
+    // The running gateway's endpoint: a saved port change is not live
+    // until the next start.
+    let (probe_host, port) = crate::gateway_endpoint(state).await;
+    let service_mode =
+        state.config.read().await.supervision.mode == manager_config::SupervisionMode::Service;
     let rec = state.lifecycle.record(GATEWAY);
     let scm = scm_snapshot(state, Duration::from_secs(1)).await;
     let scm_row = scm
@@ -1252,7 +1292,11 @@ pub async fn postgres_view(state: &AppState) -> PostgresView {
         ),
         pid: st.pid.filter(|_| st.pid_alive),
         port: st.configured_port,
-        port_mismatch: if st.port_mismatch() { st.pid_port } else { None },
+        port_mismatch: if st.port_mismatch() {
+            st.pid_port
+        } else {
+            None
+        },
         transition: rec.transition,
     }
 }
@@ -1385,10 +1429,7 @@ pub async fn startup_reconcile(state: &AppState, sink: &dyn EventSink) {
 
     let gw = gateway_view(state).await;
     state.lifecycle.observe(GATEWAY, gw.state);
-    if let Some(intent) = seed_intent(
-        state.lifecycle.intent(GATEWAY),
-        gw.up || gw.pid.is_some(),
-    ) {
+    if let Some(intent) = seed_intent(state.lifecycle.intent(GATEWAY), gw.up || gw.pid.is_some()) {
         state.lifecycle.set_intent(GATEWAY, intent);
         mark(
             &data_dir,
@@ -1460,7 +1501,7 @@ pub async fn on_app_exit(state: &AppState, reason: &str) {
                 None,
             );
         }
-        let port = state.config.read().await.gateway.port;
+        let (_, port) = crate::gateway_endpoint(state).await;
         let dd = data_dir.clone();
         let gateway_pid =
             tokio::task::spawn_blocking(move || manager_wizard::resolve_gateway_pid(&dd, port))
@@ -1468,18 +1509,36 @@ pub async fn on_app_exit(state: &AppState, reason: &str) {
                 .ok()
                 .flatten();
         if let Some((pid, _)) = gateway_pid {
-            mark(&data_dir, GATEWAY, &exit_marker(reason, Some(pid)), None, None);
+            mark(
+                &data_dir,
+                GATEWAY,
+                &exit_marker(reason, Some(pid)),
+                None,
+                None,
+            );
         }
         let pg = postgres_view(state).await;
         if pg.installed && pg.state.is_live() {
-            mark(&data_dir, POSTGRES, &exit_marker(reason, pg.pid), None, None);
+            mark(
+                &data_dir,
+                POSTGRES,
+                &exit_marker(reason, pg.pid),
+                None,
+                None,
+            );
         }
         let scm = scm_snapshot(state, Duration::from_secs(1)).await;
         if let Some(s) = scm
             .get(manager_services::LOG_RECEIVER_SERVICE_NAME)
             .filter(|s| scm_live(s))
         {
-            mark(&data_dir, LOG_RECEIVER, &exit_marker(reason, s.pid), None, None);
+            mark(
+                &data_dir,
+                LOG_RECEIVER,
+                &exit_marker(reason, s.pid),
+                None,
+                None,
+            );
         }
         // Keep-running is explicit, not an accident of process exit
         // skipping destructors: release the supervised backend processes
@@ -1518,7 +1577,10 @@ mod tests {
             exit_marker("update", Some(7)),
             "app exiting (update); left running (pid 7)"
         );
-        assert_eq!(exit_marker("exit", None), "app exiting (exit); left running");
+        assert_eq!(
+            exit_marker("exit", None),
+            "app exiting (exit); left running"
+        );
     }
 
     #[test]
@@ -1643,7 +1705,10 @@ mod tests {
         );
         assert_eq!(reg.cached_probe(GATEWAY, Duration::from_secs(2)), None);
         reg.set_probe(GATEWAY, true);
-        assert_eq!(reg.cached_probe(GATEWAY, Duration::from_secs(2)), Some(true));
+        assert_eq!(
+            reg.cached_probe(GATEWAY, Duration::from_secs(2)),
+            Some(true)
+        );
         assert_eq!(reg.cached_probe(GATEWAY, Duration::ZERO), None);
     }
 
@@ -1729,17 +1794,14 @@ mod tests {
             },
         );
         let start = |_pid: u32| Some(Utc::now() - chrono::Duration::seconds(90));
-        let rows = merge_backend_liveness(
-            &sup,
-            &scm,
-            &records,
-            &configured,
-            true,
-            Utc::now(),
-            &start,
-        );
+        let rows =
+            merge_backend_liveness(&sup, &scm, &records, &configured, true, Utc::now(), &start);
         assert_eq!(rows["a"].state, LifecycleState::Starting, "not ready yet");
-        assert_eq!(rows["b"].state, LifecycleState::Running, "adopted counts as ready");
+        assert_eq!(
+            rows["b"].state,
+            LifecycleState::Running,
+            "adopted counts as ready"
+        );
         assert_eq!(rows["c"].state, LifecycleState::Running);
         // Service-managed: readiness is keyed on the child pid; the
         // start instant comes from the process start time.
@@ -1774,7 +1836,10 @@ mod tests {
             &no_start,
         );
         assert_eq!(rows["a"].state, LifecycleState::Failed);
-        assert_eq!(rows["a"].failure_reason.as_deref(), Some("exited with code 3"));
+        assert_eq!(
+            rows["a"].failure_reason.as_deref(),
+            Some("exited with code 3")
+        );
         assert_eq!(rows["orphan"].state, LifecycleState::Running);
         // An operator stop is never shown as failed.
         records.get_mut(&backend_key("a")).unwrap().intent = Some(Intent::Stopped);
@@ -1845,7 +1910,13 @@ mod tests {
                 },
                 L::Running,
             ),
-            (GatewayInputs { probe_up: true, ..base }, L::Running),
+            (
+                GatewayInputs {
+                    probe_up: true,
+                    ..base
+                },
+                L::Running,
+            ),
             (
                 GatewayInputs {
                     pid_alive: true,
@@ -1854,7 +1925,13 @@ mod tests {
                 },
                 L::Starting,
             ),
-            (GatewayInputs { pid_alive: true, ..base }, L::Degraded),
+            (
+                GatewayInputs {
+                    pid_alive: true,
+                    ..base
+                },
+                L::Degraded,
+            ),
             (
                 // Service host running, gateway child not up yet or
                 // being respawned: alive, never an operator stop.
@@ -1951,25 +2028,62 @@ mod tests {
     #[test]
     fn derive_postgres_and_receiver_states() {
         use LifecycleState as L;
-        assert_eq!(derive_postgres_state(false, None, true, true, true, false), L::NotInstalled);
         assert_eq!(
-            derive_postgres_state(true, Some(TransitionKind::Stopping), true, true, true, false),
+            derive_postgres_state(false, None, true, true, true, false),
+            L::NotInstalled
+        );
+        assert_eq!(
+            derive_postgres_state(
+                true,
+                Some(TransitionKind::Stopping),
+                true,
+                true,
+                true,
+                false
+            ),
             L::Stopping
         );
-        assert_eq!(derive_postgres_state(true, None, true, true, false, false), L::Running);
-        assert_eq!(derive_postgres_state(true, None, true, false, false, false), L::Starting);
-        assert_eq!(derive_postgres_state(true, None, false, false, true, false), L::Failed);
-        assert_eq!(derive_postgres_state(true, None, false, false, false, false), L::Stopped);
+        assert_eq!(
+            derive_postgres_state(true, None, true, true, false, false),
+            L::Running
+        );
+        assert_eq!(
+            derive_postgres_state(true, None, true, false, false, false),
+            L::Starting
+        );
+        assert_eq!(
+            derive_postgres_state(true, None, false, false, true, false),
+            L::Failed
+        );
+        assert_eq!(
+            derive_postgres_state(true, None, false, false, false, false),
+            L::Stopped
+        );
         // A live postmaster on the old port (configured port changed) is
         // running and awaiting a restart, never "starting" forever.
-        assert_eq!(derive_postgres_state(true, None, true, false, true, true), L::Running);
+        assert_eq!(
+            derive_postgres_state(true, None, true, false, true, true),
+            L::Running
+        );
 
-        assert_eq!(derive_log_receiver_state(None, None, false), L::NotInstalled);
+        assert_eq!(
+            derive_log_receiver_state(None, None, false),
+            L::NotInstalled
+        );
         let running = st("llm-log-receiver", ServiceState::Running, 0, 0);
-        assert_eq!(derive_log_receiver_state(None, Some(&running), true), L::Running);
-        assert_eq!(derive_log_receiver_state(None, Some(&running), false), L::Degraded);
+        assert_eq!(
+            derive_log_receiver_state(None, Some(&running), true),
+            L::Running
+        );
+        assert_eq!(
+            derive_log_receiver_state(None, Some(&running), false),
+            L::Degraded
+        );
         let crashed = st("llm-log-receiver", ServiceState::Stopped, 1066, 3);
-        assert_eq!(derive_log_receiver_state(None, Some(&crashed), false), L::Failed);
+        assert_eq!(
+            derive_log_receiver_state(None, Some(&crashed), false),
+            L::Failed
+        );
         assert_eq!(scm_exit_code(&crashed), Some(3));
         assert_eq!(
             derive_log_receiver_state(Some(TransitionKind::Restarting), Some(&crashed), false),
@@ -1994,7 +2108,9 @@ mod tests {
             Some("busy: start-gateway is running".to_string())
         );
         assert_eq!(
-            payload_failure(&json!({ "busy": true, "error": "gateway restart already in progress" })),
+            payload_failure(
+                &json!({ "busy": true, "error": "gateway restart already in progress" })
+            ),
             Some("gateway restart already in progress".to_string())
         );
         assert_eq!(payload_failure(&json!({ "busy": false, "ok": true })), None);
@@ -2020,7 +2136,9 @@ mod tests {
         );
         assert_eq!(
             log_path(dir, LOG_RECEIVER),
-            dir.join("log-receiver").join("logs").join("receiver.lifecycle.log")
+            dir.join("log-receiver")
+                .join("logs")
+                .join("receiver.lifecycle.log")
         );
         let p = event_payload(
             "backend:planner",
@@ -2033,7 +2151,13 @@ mod tests {
         assert_eq!(p["id"], "planner");
         assert_eq!(p["state"], "restarting");
         assert_eq!(p["origin"], "activation");
-        let g = event_payload(GATEWAY, "stopped", LifecycleState::Stopped, None, Some("pid 4"));
+        let g = event_payload(
+            GATEWAY,
+            "stopped",
+            LifecycleState::Stopped,
+            None,
+            Some("pid 4"),
+        );
         assert_eq!(g["kind"], "gateway");
         assert!(g["id"].is_null());
         assert!(g["origin"].is_null());
@@ -2064,7 +2188,9 @@ mod tests {
         let rec = Arc::new(RecSink::default());
         let sink: Arc<dyn EventSink> = rec.clone();
         let key = backend_key("planner");
-        state.lifecycle.set_failure(&key, Failure::now("old crash", None));
+        state
+            .lifecycle
+            .set_failure(&key, Failure::now("old crash", None));
         let guard = begin(
             &state,
             &sink,
@@ -2077,18 +2203,37 @@ mod tests {
         .unwrap();
         // The old failure stands until the operation succeeds.
         assert!(state.lifecycle.record(&key).failure.is_some());
-        let busy = begin(&state, &sink, &key, TransitionKind::Stopping, Origin::Ui, None)
-            .await
-            .unwrap_err();
+        let busy = begin(
+            &state,
+            &sink,
+            &key,
+            TransitionKind::Stopping,
+            Origin::Ui,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(busy, ApiError::Busy(_)), "{busy}");
         finish(&state, sink.as_ref(), guard, Ok("pid 42".to_string()));
         assert!(state.lifecycle.transition(&key).is_none());
         assert!(state.lifecycle.record(&key).failure.is_none());
 
-        let guard = begin(&state, &sink, &key, TransitionKind::Starting, Origin::Ui, None)
-            .await
-            .unwrap();
-        finish(&state, sink.as_ref(), guard, Err("port 8081 in use".to_string()));
+        let guard = begin(
+            &state,
+            &sink,
+            &key,
+            TransitionKind::Starting,
+            Origin::Ui,
+            None,
+        )
+        .await
+        .unwrap();
+        finish(
+            &state,
+            sink.as_ref(),
+            guard,
+            Err("port 8081 in use".to_string()),
+        );
         assert_eq!(
             state.lifecycle.record(&key).failure.map(|f| f.reason),
             Some("port 8081 in use".to_string())

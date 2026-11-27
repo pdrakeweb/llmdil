@@ -390,6 +390,37 @@ fn moe_cache_problems(
     Vec::new()
 }
 
+/// An expert-offload position (or an all-experts request) needs a
+/// candidate that has experts — the same rule plan items are held to.
+/// A candidate the app does not know yet (an HF file the plan will
+/// register) is not judged here.
+fn offload_problems(
+    proposal: &ExperimentProposal,
+    cfg: &AppConfig,
+    layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
+) -> Vec<String> {
+    let Some(layers) = proposal.flags.offload_layers.filter(|n| *n > 0) else {
+        return Vec::new();
+    };
+    let candidate = proposal.candidate_model_id.trim();
+    match candidate_moe_layers(candidate, cfg, layouts) {
+        Some(moe) if layers > moe => vec![format!(
+            "offload_layers {layers} exceeds the {moe} MoE layers of candidate '{candidate}'"
+        )],
+        Some(_) => Vec::new(),
+        None if !cfg.models.iter().any(|m| m.id == candidate)
+            && !manager_models::curated_models()
+                .iter()
+                .any(|s| s.id == candidate) =>
+        {
+            Vec::new()
+        }
+        None => vec![format!(
+            "offload_layers cannot be encoded for candidate '{candidate}': it is a dense model or its MoE layer count is unknown"
+        )],
+    }
+}
+
 /// The non-candidate problems (flags and `requires_stopping`
 /// ids), shared by both validation entry points.
 fn non_candidate_problems(
@@ -398,6 +429,7 @@ fn non_candidate_problems(
     layouts: Option<&HashMap<String, crate::fit::LayoutFacts>>,
 ) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
+    problems.extend(offload_problems(proposal, cfg, layouts));
     problems.extend(moe_cache_problems(proposal, cfg, layouts));
     // Addendum B extension E1: an MTP draft length is only
     // encodable for a candidate the catalog (or the model
@@ -405,8 +437,7 @@ fn non_candidate_problems(
     // the pin, never inferred (§B.1) — and within the control's
     // range; a slot count must be at least 1.
     if let Some(n) = proposal.flags.mtp_n_max {
-        if !(manager_models::mtp::MTP_N_MAX_MIN..=manager_models::mtp::MTP_N_MAX_MAX).contains(&n)
-        {
+        if !(manager_models::mtp::MTP_N_MAX_MIN..=manager_models::mtp::MTP_N_MAX_MAX).contains(&n) {
             problems.push(format!(
                 "mtp_n_max {n} is outside the draft-length range {}..={}",
                 manager_models::mtp::MTP_N_MAX_MIN,
@@ -562,7 +593,10 @@ pub fn apply_experiment_decision(
     experiment_id: usize,
     decision: Decision,
 ) -> Option<Vec<String>> {
-    let pos = plan.experiments.iter().position(|e| e.id == experiment_id)?;
+    let pos = plan
+        .experiments
+        .iter()
+        .position(|e| e.id == experiment_id)?;
     let provisioning = plan.experiments[pos].provisioning.clone();
     let mut newly_denied: Vec<String> = Vec::new();
     if decision == Decision::Denied && plan.experiments[pos].decision != Decision::Denied {
@@ -664,9 +698,10 @@ pub fn resolve_candidate(
     }
     if is_hf_form(candidate) {
         let file_name = candidate.rsplit('/').next().unwrap_or_default();
-        if let Some(m) = registered.iter().find(|m| {
-            m.path.file_name().map(|n| n.to_string_lossy()) == Some(file_name.into())
-        }) {
+        if let Some(m) = registered
+            .iter()
+            .find(|m| m.path.file_name().map(|n| n.to_string_lossy()) == Some(file_name.into()))
+        {
             return if file_exists(&m.path) {
                 CandidateResolution::OnDisk {
                     model_id: candidate.to_string(),
@@ -683,7 +718,10 @@ pub fn resolve_candidate(
                 path: under_models,
             }
         } else {
-            not_on_disk(candidate, "no file with that name is in the models directory")
+            not_on_disk(
+                candidate,
+                "no file with that name is in the models directory",
+            )
         };
     }
     not_on_disk(
@@ -696,15 +734,18 @@ pub fn resolve_candidate(
 // Ports, fit text, and the temporary backend
 // ---------------------------------------------------------------------------
 
-/// The lowest free port from 8081 up, skipping every used port
-/// (configured backends, this batch's earlier temp backends)
-/// plus the gateway and Postgres ports — the `backend.create`
-/// parser's rule, mirrored for temp backends.
+/// First port for temporary backends: clear of the range backends
+/// are configured in (8081 up) and of the Windows ML server's 8090.
+pub const TEMP_PORT_BASE: u16 = 8400;
+
+/// The lowest free port from [`TEMP_PORT_BASE`] up, skipping every
+/// used port (configured ports, this batch's earlier temp backends)
+/// plus the gateway and Postgres ports.
 pub fn lowest_free_port(used: &HashSet<u16>, gateway_port: u16, postgres_port: u16) -> u16 {
     let mut used = used.clone();
     used.insert(gateway_port);
     used.insert(postgres_port);
-    (8081..=8999)
+    (TEMP_PORT_BASE..=8999)
         .find(|p| !used.contains(p))
         .unwrap_or(8999)
 }
@@ -784,10 +825,24 @@ pub fn temp_backend_config(
     port: u16,
     moe_layers: Option<u32>,
 ) -> BackendConfig {
+    temp_backend_config_mapped(proposal, model_file, port, moe_layers, None)
+}
+
+/// [`temp_backend_config`] with the model's MoE block map: the
+/// proposal's `offload_layers` counts MoE layers and is written at
+/// its `--n-cpu-moe` block-index bound (code review v0.1.60 item
+/// 11). `None` is the identity.
+pub fn temp_backend_config_mapped(
+    proposal: &ExperimentProposal,
+    model_file: PathBuf,
+    port: u16,
+    moe_layers: Option<u32>,
+    moe_block_map: Option<&manager_models::MoeBlockMap>,
+) -> BackendConfig {
     let split = proposal.flags.tensor_split.clone().unwrap_or_default();
     let mut raw_flags = proposal.flags.offload_layers.and_then(|n| {
         let offload = match moe_layers {
-            Some(moe) => manager_models::offload_for_layers(n, moe),
+            Some(moe) => manager_models::offload_for_moe_layers(n, moe, moe_block_map),
             None => manager_models::ExpertOffload::CpuMoeLayers(n),
         };
         manager_models::set_expert_offload(None, offload)
@@ -850,9 +905,7 @@ pub fn experiment_result_fact(result: &ExperimentResult) -> crate::context::Expe
     let (prompt, predicted, ttft, short_pred, long_pred) = match &result.measured {
         Some(m) => (
             m.long.prompt_per_second.or(m.short.prompt_per_second),
-            m.short
-                .predicted_per_second
-                .or(m.long.predicted_per_second),
+            m.short.predicted_per_second.or(m.long.predicted_per_second),
             m.short.ttft_ms.or(m.long.ttft_ms),
             m.short.predicted_per_second,
             m.long.predicted_per_second,
@@ -1052,8 +1105,8 @@ mod tests {
             mtp: None,
         });
         for cand in [
-            "my-model",              // registered
-            "qwen3-coder-30b",       // curated catalog id
+            "my-model",                                          // registered
+            "qwen3-coder-30b",                                   // curated catalog id
             "Qwen/Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q4_K_M.gguf", // HF form
         ] {
             let v = validate_experiment(&proposal(cand), &c, &[], None);
@@ -1141,6 +1194,48 @@ mod tests {
     }
 
     #[test]
+    fn validation_refuses_offload_for_a_dense_candidate() {
+        let cfg = AppConfig::default_config();
+        let check = |candidate: &str, layers: u32| {
+            let mut p = proposal(candidate);
+            p.flags.offload_layers = Some(layers);
+            validate_experiment(&p, &cfg, &[], None).status
+        };
+        // Dense: refused. 0 is no offload. MoE: up to its layers.
+        assert_eq!(check("qwen3-8b", 24), ValidationStatus::Invalid);
+        assert_eq!(check("qwen3-8b", 0), ValidationStatus::Valid);
+        assert_eq!(check("qwen3-coder-30b", 48), ValidationStatus::Valid);
+        assert_eq!(check("qwen3-coder-30b", 49), ValidationStatus::Invalid);
+        // Not registered yet: judged when it is.
+        assert_eq!(check("owner/repo/moe.gguf", 24), ValidationStatus::Valid);
+    }
+
+    #[test]
+    fn temp_backend_writes_moe_layers_at_their_block_bound() {
+        // Review item 11: 2 leading dense blocks, 48 MoE blocks
+        // (2..=49). 24 MoE layers is `--n-cpu-moe 26`.
+        let map = manager_models::MoeBlockMap::from_block_indices(2..50);
+        let mut p = proposal("qwen3-coder-30b");
+        p.flags.offload_layers = Some(24);
+        let temp = temp_backend_config_mapped(
+            &p,
+            PathBuf::from("models/coder.gguf"),
+            18099,
+            Some(48),
+            map.as_ref(),
+        );
+        assert_eq!(temp.raw_flags.as_deref(), Some("--n-cpu-moe 26"));
+        // Endpoints are unaffected; no map is the identity.
+        p.flags.offload_layers = Some(48);
+        let temp =
+            temp_backend_config_mapped(&p, PathBuf::from("m.gguf"), 1, Some(48), map.as_ref());
+        assert_eq!(temp.raw_flags.as_deref(), Some("-ot exps=CPU"));
+        p.flags.offload_layers = Some(24);
+        let temp = temp_backend_config_mapped(&p, PathBuf::from("m.gguf"), 1, Some(48), None);
+        assert_eq!(temp.raw_flags.as_deref(), Some("--n-cpu-moe 24"));
+    }
+
+    #[test]
     fn temp_backend_carries_the_expert_cache_token() {
         // Full offload + cache: the token rides the all-experts
         // form the offload encoding writes.
@@ -1204,7 +1299,10 @@ mod tests {
         // Catalog id with no registered model: not on disk.
         match resolve_candidate("catalog-only", &registered, &catalog, models_dir, exists) {
             CandidateResolution::NotOnDisk { message } => {
-                assert!(message.contains("register and download it in the Models view"), "{message}");
+                assert!(
+                    message.contains("register and download it in the Models view"),
+                    "{message}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -1243,7 +1341,10 @@ mod tests {
             }];
             match resolve_candidate(cand, &registered2, &catalog, models_dir, exists) {
                 CandidateResolution::NotOnDisk { message } => {
-                    assert!(message.contains("register and download it in the Models view"), "{cand}: {message}");
+                    assert!(
+                        message.contains("register and download it in the Models view"),
+                        "{cand}: {message}"
+                    );
                 }
                 other => panic!("{cand}: {other:?}"),
             }
@@ -1252,11 +1353,13 @@ mod tests {
 
     #[test]
     fn lowest_free_port_skips_configured_gateway_and_postgres() {
-        let used: HashSet<u16> = [8081, 8082, 8084].into_iter().collect();
-        assert_eq!(lowest_free_port(&used, 4000, 54329), 8083);
-        let used: HashSet<u16> = [8081].into_iter().collect();
-        // Gateway on 8082 must be skipped even though unused.
-        assert_eq!(lowest_free_port(&used, 8082, 54329), 8083);
+        let used: HashSet<u16> = [8400, 8401, 8403].into_iter().collect();
+        assert_eq!(lowest_free_port(&used, 4000, 54329), 8402);
+        let used: HashSet<u16> = [8400].into_iter().collect();
+        // Gateway on 8401 must be skipped even though unused.
+        assert_eq!(lowest_free_port(&used, 8401, 54329), 8402);
+        // Never the Windows ML default, whatever is configured.
+        assert!(lowest_free_port(&HashSet::new(), 4000, 54329) > 8090);
     }
 
     #[test]
@@ -1265,14 +1368,11 @@ mod tests {
         assert!(alongside.contains("fits alongside"), "{alongside}");
         assert!(alongside.contains("9000 MiB"), "{alongside}");
         assert!(alongside.contains("12000 MiB"), "{alongside}");
-        let stopping = fit_verdict_text(
-            9000,
-            12000,
-            false,
-            true,
-            &["coder".to_string()],
+        let stopping = fit_verdict_text(9000, 12000, false, true, &["coder".to_string()]);
+        assert!(
+            stopping.contains("fits only after stopping coder"),
+            "{stopping}"
         );
-        assert!(stopping.contains("fits only after stopping coder"), "{stopping}");
         let no = fit_verdict_text(24000, 12000, false, false, &["coder".to_string()]);
         assert!(no.contains("does not fit"), "{no}");
         assert!(no.contains("24000 MiB"), "{no}");
@@ -1350,12 +1450,14 @@ mod tests {
                 predicted_per_second: Some(44.0),
                 ttft_ms: Some(120.0),
                 latency_ms: 1000,
+                prompt_n: Some(200),
             }]),
             long: BenchResult::from_runs(vec![BenchRun {
                 prompt_per_second: Some(700.0),
                 predicted_per_second: Some(40.0),
                 ttft_ms: Some(5000.0),
                 latency_ms: 6000,
+                prompt_n: Some(200),
             }]),
             batch_id: "estimate-batch".to_string(),
             temp_backend_id: "opt-exp-1".to_string(),
@@ -1440,10 +1542,7 @@ mod tests {
                 reason: None,
             }],
         );
-        r.comparison = Some(crate::eval::compare(
-            &run.scores,
-            &aggregate_results(&[]),
-        ));
+        r.comparison = Some(crate::eval::compare(&run.scores, &aggregate_results(&[])));
         r.eval = Some(run);
         let text = serde_json::to_string(&r).unwrap();
         let back: ExperimentResult = serde_json::from_str(&text).unwrap();

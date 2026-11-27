@@ -1,0 +1,811 @@
+//! Log views (file-backed scopes, wizard/optimize logs), tasks, and the
+//! diagnostics bundle.
+
+use crate::*;
+
+/// Lines read from the tail of each file-backed log file.
+pub(crate) const FILE_SCOPE_TAIL_LINES: usize = 2000;
+
+/// One file-backed log line with what is known about when it was
+/// written: exactly its own stamp, or somewhere between `lo` and `hi`
+/// (`estimated`).
+pub(crate) struct TimedRecord {
+    pub record: LogRecord,
+    lo: chrono::DateTime<chrono::Utc>,
+    hi: chrono::DateTime<chrono::Utc>,
+    pub estimated: bool,
+}
+
+impl TimedRecord {
+    fn exact(record: LogRecord) -> Self {
+        Self {
+            lo: record.ts,
+            hi: record.ts,
+            estimated: false,
+            record,
+        }
+    }
+
+    /// Whether the line can have been written inside the (inclusive)
+    /// window. A line without its own stamp is dropped only when it
+    /// surely lies outside.
+    fn within(&self, since_ms: Option<i64>, until_ms: Option<i64>) -> bool {
+        since_ms.is_none_or(|s| self.hi.timestamp_millis() >= s)
+            && until_ms.is_none_or(|u| self.lo.timestamp_millis() <= u)
+    }
+}
+
+/// The timestamp a log line starts with.
+enum LineStamp {
+    Full(chrono::DateTime<chrono::Utc>),
+    /// LiteLLM's `HH:MM:SS - ` prefix: local time of day, no date.
+    Clock(chrono::NaiveTime),
+}
+
+/// Read a line's own timestamp: the app's `[<rfc3339>]`, a bare RFC
+/// 3339 stamp, `YYYY-MM-DD HH:MM:SS[.fff]` (PostgreSQL; local time
+/// unless the zone says UTC/GMT), or LiteLLM's `HH:MM:SS - `.
+fn line_stamp(line: &str) -> Option<LineStamp> {
+    if let Some(ts) = manager_supervisor::lifecycle::parse_line_ts(line) {
+        return Some(LineStamp::Full(ts));
+    }
+    // Skip a leading ANSI color sequence.
+    let text = line
+        .strip_prefix("\x1b[")
+        .and_then(|r| r.split_once('m'))
+        .map_or(line, |(_, rest)| rest);
+    if !text.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut words = text.split_whitespace();
+    let (first, second, third) = (words.next()?, words.next()?, words.next());
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(first) {
+        return Some(LineStamp::Full(ts.with_timezone(&chrono::Utc)));
+    }
+    if second == "-" {
+        return chrono::NaiveTime::parse_from_str(first, "%H:%M:%S")
+            .ok()
+            .map(LineStamp::Clock);
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(
+        &format!("{first} {}", second.replace(',', ".")),
+        "%Y-%m-%d %H:%M:%S%.f",
+    )
+    .ok()?;
+    Some(LineStamp::Full(match third {
+        Some("UTC" | "GMT") => naive.and_utc(),
+        _ => local_to_utc(naive)?,
+    }))
+}
+
+fn local_to_utc(naive: chrono::NaiveDateTime) -> Option<chrono::DateTime<chrono::Utc>> {
+    naive
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Resolve every line's stamp (`None`: the line carries none). Walks
+/// from the end: a time-only stamp is dated by the next known instant
+/// after it, starting from the file's modification time.
+fn resolve_stamps(
+    lines: &[&str],
+    mtime: chrono::DateTime<chrono::Utc>,
+) -> Vec<Option<chrono::DateTime<chrono::Utc>>> {
+    let mut anchor = mtime;
+    let mut out = vec![None; lines.len()];
+    for (i, line) in lines.iter().enumerate().rev() {
+        let ts = match line_stamp(line) {
+            Some(LineStamp::Full(ts)) => Some(ts),
+            Some(LineStamp::Clock(t)) => {
+                let day = anchor.with_timezone(&chrono::Local).date_naive();
+                let same_day = local_to_utc(day.and_time(t));
+                match same_day {
+                    // A little slack: the writer's clock and the file
+                    // time are not read at the same instant.
+                    Some(ts) if ts <= anchor + chrono::Duration::seconds(5) => Some(ts),
+                    _ => day.pred_opt().and_then(|d| local_to_utc(d.and_time(t))),
+                }
+            }
+            None => None,
+        };
+        if let Some(ts) = ts {
+            anchor = ts;
+            out[i] = Some(ts);
+        }
+    }
+    out
+}
+
+/// Records of a file-backed log scope: each file in `files` (and, with
+/// `with_prev`, its rotated `.prev` run, marked archived), stamped as
+/// `source`. A line with its own timestamp ([`line_stamp`]) carries it.
+/// Any other line takes the time of the stamped line before it (the
+/// first one after it, at the head of the file); in a file with no
+/// stamps at all, the file's modification time — never the read time —
+/// and is marked estimated. Lines are emitted newest-first within each
+/// file so same-timestamp groups keep their order under the caller's
+/// stable sort. At most the last 2,000 lines of each file are read.
+/// Returns the records and whether any `.prev` run exists.
+pub(crate) fn timed_file_records(
+    source: &str,
+    files: &[(PathBuf, LogStream)],
+    with_prev: bool,
+) -> (Vec<TimedRecord>, bool) {
+    let mut records = Vec::new();
+    let mut has_previous = false;
+    for (base, stream) in files {
+        let variants: &[bool] = if with_prev { &[false, true] } else { &[false] };
+        for &archived in variants {
+            let path = if archived {
+                prev_log_path(base)
+            } else {
+                base.clone()
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if archived {
+                has_previous = true;
+            }
+            let meta = std::fs::metadata(&path).ok();
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .unwrap_or_else(chrono::Utc::now);
+            let created = meta
+                .and_then(|m| m.created().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .filter(|c| *c <= mtime)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
+            let text = String::from_utf8_lossy(&bytes);
+            let all: Vec<&str> = text.lines().collect();
+            let lines = &all[all.len().saturating_sub(FILE_SCOPE_TAIL_LINES)..];
+            let stamps = resolve_stamps(lines, mtime);
+            // A lifecycle log is not rotated per run: everything above
+            // the newest start belongs to previous runs.
+            let run_start = base
+                .to_string_lossy()
+                .ends_with(".lifecycle.log")
+                .then(|| lines.iter().rposition(|l| begins_run(l)))
+                .flatten();
+            let first = stamps.iter().flatten().next().copied();
+            let mut prev: Option<chrono::DateTime<chrono::Utc>> = None;
+            let mut next_after: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+                vec![None; lines.len()];
+            let mut upcoming = None;
+            for i in (0..lines.len()).rev() {
+                next_after[i] = upcoming;
+                upcoming = stamps[i].or(upcoming);
+            }
+            let mut file_records: Vec<TimedRecord> = Vec::with_capacity(lines.len());
+            for (i, line) in lines.iter().enumerate() {
+                prev = stamps[i].or(prev);
+                let ts = prev.or(first).unwrap_or(mtime);
+                let estimated = stamps[i].is_none();
+                file_records.push(TimedRecord {
+                    record: LogRecord {
+                        ts,
+                        stream: *stream,
+                        line: line.to_string(),
+                        source: source.to_string(),
+                        archived: archived || run_start.is_some_and(|s| i < s),
+                    },
+                    lo: if estimated {
+                        prev.unwrap_or(created)
+                    } else {
+                        ts
+                    },
+                    hi: if estimated {
+                        next_after[i].unwrap_or(mtime).max(ts)
+                    } else {
+                        ts
+                    },
+                    estimated,
+                });
+            }
+            records.extend(file_records.into_iter().rev());
+        }
+    }
+    (records, has_previous)
+}
+
+/// Whether a lifecycle marker is the first line of a service's run.
+fn begins_run(line: &str) -> bool {
+    use manager_supervisor::lifecycle::{is_marker_line, MARKER_TAG};
+    is_marker_line(line)
+        && line
+            .split_once(MARKER_TAG)
+            .and_then(|(_, rest)| rest.split_once(": "))
+            .is_some_and(|(_, event)| {
+                [
+                    "start requested",
+                    "restart requested",
+                    "adopted",
+                    "started: outside the app",
+                ]
+                .iter()
+                .any(|e| event.starts_with(e))
+            })
+}
+
+/// [`timed_file_records`] without the timing detail.
+pub(crate) fn file_scope_records(
+    source: &str,
+    files: &[(PathBuf, LogStream)],
+    with_prev: bool,
+) -> (Vec<LogRecord>, bool) {
+    let (records, has_previous) = timed_file_records(source, files, with_prev);
+    (
+        records.into_iter().map(|r| r.record).collect(),
+        has_previous,
+    )
+}
+
+/// Whether a file-backed scope has anything to show (a non-empty file
+/// or `.prev` run) and whether a `.prev` run exists — metadata only,
+/// for listing scopes without reading them.
+pub(crate) fn file_scope_presence(files: &[(PathBuf, LogStream)]) -> (bool, bool) {
+    let nonempty = |p: &std::path::Path| std::fs::metadata(p).is_ok_and(|m| m.len() > 0);
+    let mut any = false;
+    let mut prev = false;
+    for (base, _) in files {
+        let p = prev_log_path(base);
+        if nonempty(&p) {
+            any = true;
+            prev = true;
+        }
+        if nonempty(base) {
+            any = true;
+        }
+    }
+    (any, prev)
+}
+
+/// Every file-backed log scope and its files (design H):
+/// - `gateway`: LiteLLM stdout/stderr plus `gateway.lifecycle.log`;
+/// - `wizard`, `optimize`: the step and pipeline logs;
+/// - `postgres`: `postgres.log` plus `postgres.lifecycle.log`;
+/// - `log-receiver`: the receiver's stdout/stderr/lifecycle logs and
+///   its `deploy.log`;
+/// - `services`: `service-manage.log` (the elevated service helper);
+/// - `<id>` for each backend id: `backend-<id>.lifecycle.log` and, in
+///   service mode, the shim's `backend-<id>.stdout/stderr.log` — merged
+///   with the supervisor ring of the same id by `get_logs`.
+pub(crate) fn file_log_scopes(
+    data_dir: &std::path::Path,
+    backend_ids: &[String],
+) -> Vec<(String, Vec<(PathBuf, LogStream)>)> {
+    let logs = data_dir.join("logs");
+    let receiver = manager_services::log_receiver_definition(
+        data_dir,
+        std::path::Path::new("llmdil-log-receiver.exe"),
+    );
+    let receiver_dir = manager_services::log_receiver_dir(data_dir);
+    let mut receiver_files: Vec<(PathBuf, LogStream)> = Vec::new();
+    if let Some(p) = receiver.stdout_log.clone() {
+        receiver_files.push((p, LogStream::Stdout));
+    }
+    if let Some(p) = receiver.stderr_log.clone() {
+        receiver_files.push((p, LogStream::Stderr));
+    }
+    receiver_files.push((
+        lifecycle::log_path(data_dir, lifecycle::LOG_RECEIVER),
+        LogStream::Stdout,
+    ));
+    receiver_files.push((receiver_dir.join("deploy.log"), LogStream::Stdout));
+    let mut scopes = vec![
+        (
+            "gateway".to_string(),
+            vec![
+                (logs.join("gateway.stdout.log"), LogStream::Stdout),
+                (logs.join("gateway.stderr.log"), LogStream::Stderr),
+                (
+                    lifecycle::log_path(data_dir, lifecycle::GATEWAY),
+                    LogStream::Stdout,
+                ),
+            ],
+        ),
+        (
+            "wizard".to_string(),
+            vec![(logs.join("wizard.log"), LogStream::Stdout)],
+        ),
+        (
+            "optimize".to_string(),
+            vec![(logs.join("optimize.log"), LogStream::Stdout)],
+        ),
+        (
+            "postgres".to_string(),
+            vec![
+                (
+                    manager_wizard::steps::postgres_log_path(data_dir),
+                    LogStream::Stdout,
+                ),
+                (
+                    lifecycle::log_path(data_dir, lifecycle::POSTGRES),
+                    LogStream::Stdout,
+                ),
+            ],
+        ),
+        ("log-receiver".to_string(), receiver_files),
+        (
+            "services".to_string(),
+            vec![(logs.join("service-manage.log"), LogStream::Stdout)],
+        ),
+    ];
+    for id in backend_ids {
+        scopes.push((
+            id.clone(),
+            vec![
+                (
+                    lifecycle::log_path(data_dir, &lifecycle::backend_key(id)),
+                    LogStream::Stdout,
+                ),
+                (
+                    logs.join(format!("backend-{id}.stdout.log")),
+                    LogStream::Stdout,
+                ),
+                (
+                    logs.join(format!("backend-{id}.stderr.log")),
+                    LogStream::Stderr,
+                ),
+            ],
+        ));
+    }
+    scopes
+}
+
+/// The scope ids [`file_log_scopes`] serves from files alone (no
+/// supervisor ring): `get_logs` skips the supervisor lock for these.
+pub(crate) const FILE_ONLY_SCOPES: [&str; 6] = [
+    "gateway",
+    "wizard",
+    "optimize",
+    "postgres",
+    "log-receiver",
+    "services",
+];
+
+/// The records of one named file-only scope (tests).
+#[cfg(test)]
+pub(crate) fn named_file_scope_records(
+    data_dir: &std::path::Path,
+    scope: &str,
+) -> (Vec<LogRecord>, bool) {
+    file_log_scopes(data_dir, &[])
+        .into_iter()
+        .find(|(id, _)| id == scope)
+        .map(|(id, files)| file_scope_records(&id, &files, true))
+        .unwrap_or_default()
+}
+
+/// Wizard step output, persisted to `<data_dir>/logs/wizard.log` and
+/// served by `get_logs` as the `wizard` scope. Step outcomes otherwise
+/// live only in the in-memory wizard report: a step that hangs or an
+/// app restart loses them entirely, leaving nothing to inspect (the
+/// install-postgres hang, 2026-10-15). Appends are best-effort —
+/// logging must never fail the step it describes. Rotation mirrors
+/// the gateway logs: past ~1 MiB the file becomes `wizard.prev.log`.
+pub(crate) fn append_wizard_log(data_dir: &std::path::Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let logs = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs).is_err() {
+        return;
+    }
+    let path = logs.join("wizard.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1_048_576 {
+            let _ = std::fs::rename(&path, prev_log_path(&path));
+        }
+    }
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// One step's block in the wizard log: an outcome header plus the
+/// step's own log lines, each stamped so the file stays readable on
+/// its own (the reader stamps records with the file mtime, like the
+/// gateway files).
+pub(crate) fn wizard_log_block(
+    label: &str,
+    step_id: &str,
+    state: &str,
+    message: &str,
+    duration_ms: u64,
+    log_tail: &[String],
+) -> Vec<String> {
+    let ts = chrono::Utc::now().to_rfc3339();
+    let mut out = vec![format!(
+        "[{ts}] === step {step_id} ({label}): {state} — {message} ({duration_ms} ms) ==="
+    )];
+    for line in log_tail {
+        out.push(format!("[{ts}] {line}"));
+    }
+    out
+}
+
+/// Optimize pipeline output, persisted to
+/// `<data_dir>/logs/optimize.log` and served by `get_logs` as the
+/// `optimize` scope (tracker #52). The Optimize pipeline's
+/// decisions otherwise live only in the stored plan and the
+/// transient consultation response: when a plan comes back wrong
+/// (tracker #51's dead-end items) there was nothing to inspect.
+/// The optimize modules write very verbose, timestamped records
+/// of every consultation, parse, validation verdict, apply
+/// outcome, and experiment event through this one append.
+/// Appends are best-effort — logging must never fail the
+/// operation it describes. Rotation mirrors the wizard log: past
+/// ~1 MiB the file rotates to its `.prev` sibling
+/// (`optimize.log.prev`, via `prev_log_path`). Secret-free by
+/// construction: the only inputs are the operator's directive,
+/// the allowlist-built OptimizeContext document (sentinel-tested
+/// in manager-optimize), the consulted model's response to that
+/// document, and verdicts computed from them — no call site reads
+/// credential stores, environment values, or config fields
+/// outside the context document.
+pub(crate) fn append_optimize_log(data_dir: &std::path::Path, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let logs = data_dir.join("logs");
+    if std::fs::create_dir_all(&logs).is_err() {
+        return;
+    }
+    let path = logs.join("optimize.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1_048_576 {
+            let _ = std::fs::rename(&path, prev_log_path(&path));
+        }
+    }
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
+}
+
+/// The file-backed optimize scope (see [`file_log_scopes`]).
+#[cfg(test)]
+pub(crate) fn optimize_log_records(data_dir: &std::path::Path) -> (Vec<LogRecord>, bool) {
+    named_file_scope_records(data_dir, "optimize")
+}
+
+/// Query captured logs. `scope` is a process id — live, stopped, or an
+/// id that also has an archived previous-run ring; querying the id
+/// returns current and archived lines merged — `"gateway"`, the
+/// file-backed gateway log (also merged into `"all"`) — or `"all"`,
+/// which merges every source's records into one stream. `level` is an
+/// optional error/warn/info/debug heuristic filter; `search` is an
+/// optional case-insensitive substring over line text; `query` is an
+/// optional case-insensitive substring over line text and source.
+/// `since_ms`/`until_ms` optionally bound record timestamps (epoch
+/// milliseconds, both inclusive); a file line without its own
+/// timestamp is kept when it can lie inside the window. All filters apply before counting
+/// and paging, so the reported total is the filtered total.
+///
+/// Ordering is by timestamp: newest-first (`order` absent or
+/// `"desc"`, the default in every scope, archives included) or the
+/// exact mirror, oldest-first (`order = "asc"`). `offset` skips that
+/// many filtered, ordered records before the page.
+///
+/// Returns `{lines, total_matching, total, truncated, scopes}`:
+/// `lines` is the page (`limit` records from `offset`, default limit
+/// 200), each record stamped with its `source` process id and an
+/// `archived` flag for previous-run records; `total_matching` — and
+/// its alias `total` — counts every record that matched before
+/// paging, and `truncated` says whether paging cut records on either
+/// side of the page. `scopes` lists every retained scope as
+/// `{id, previous}`, where `previous` means the id also has an
+/// archived previous-run ring (incl. previous run). A line whose `ts`
+/// is not its own (an unstamped file line) carries
+/// `ts_estimated: true`.
+#[allow(clippy::too_many_arguments)] // argument list is the registry contract
+pub async fn op_get_logs(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+    scope: String,
+    level: Option<String>,
+    search: Option<String>,
+    query: Option<String>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    order: Option<String>,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> ApiResult {
+    let limit = limit.unwrap_or(200) as usize;
+    // Strict like `order`: an unknown level used to answer unfiltered.
+    let level = match level.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(l) => Some(LogLevelFilter::parse(l).ok_or_else(|| {
+            ApiError::InvalidInput(format!(
+                "unknown log level {l:?}; expected \"error\", \"warn\", \"info\" or \"debug\""
+            ))
+        })?),
+    };
+    let backend_ids: Vec<String> = state
+        .config
+        .read()
+        .await
+        .backends
+        .iter()
+        .map(|b| b.id.clone())
+        .collect();
+    // Unfiltered fetch: filtering, merging with the file-backed
+    // records, ordering, and pagination happen here so every source
+    // is treated identically. The supervisor lock is held only to
+    // copy the ring records and the scope list (never across a file
+    // read), and a file-only scope never waits for it (BE-11): it
+    // lists the supervisor scopes only when the lock is free.
+    let file_only = FILE_ONLY_SCOPES.contains(&scope.as_str());
+    let (sup_records, sup_scopes): (Vec<LogRecord>, Vec<manager_supervisor::LogScope>) =
+        if file_only {
+            match state.supervisor().await.try_lock() {
+                Ok(sup) => (Vec::new(), sup.log_scopes()),
+                Err(_) => (Vec::new(), Vec::new()),
+            }
+        } else {
+            let sup = state.supervisor().await.lock().await;
+            (
+                sup.logs_query(&scope, None, None, usize::MAX).records,
+                sup.log_scopes(),
+            )
+        };
+    // Ids whose output the supervisor ring already holds (process
+    // mode, this session): their persisted stdout/stderr files carry
+    // the same lines, so only the lifecycle file is merged for them.
+    // Service-mode and adopted backends have empty rings and are
+    // served from the files (debug console design §1).
+    let ring_ids: std::collections::HashSet<String> =
+        sup_records.iter().map(|r| r.source.clone()).collect();
+    let mut records: Vec<TimedRecord> = sup_records.into_iter().map(TimedRecord::exact).collect();
+    let mut scopes: Vec<Value> = sup_scopes
+        .into_iter()
+        .map(|s| json!({ "id": s.id, "previous": s.previous }))
+        .collect();
+    for (id, files) in file_log_scopes(&state.data_dir, &backend_ids) {
+        let files: Vec<_> = if ring_ids.contains(&id) {
+            files
+                .into_iter()
+                .filter(|(p, _)| {
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                    !name.is_some_and(|n| n.ends_with(".stdout.log") || n.ends_with(".stderr.log"))
+                })
+                .collect()
+        } else {
+            files
+        };
+        let wanted = scope == "all" || scope == id;
+        let (present, previous) = if wanted {
+            let (file_records, previous) = timed_file_records(&id, &files, true);
+            let present = !file_records.is_empty();
+            records.extend(file_records);
+            (present, previous)
+        } else {
+            file_scope_presence(&files)
+        };
+        if !present {
+            continue;
+        }
+        // A backend id may already be listed from its supervisor ring.
+        match scopes.iter_mut().find(|s| s["id"] == json!(id)) {
+            Some(existing) => {
+                if previous {
+                    existing["previous"] = json!(true);
+                }
+            }
+            None => scopes.push(json!({ "id": id, "previous": previous })),
+        }
+    }
+    if let Some(filter) = level {
+        records.retain(|r| filter.matches(&r.record.line));
+    }
+    if let Some(search) = &search {
+        let needle = search.to_lowercase();
+        records.retain(|r| r.record.line.to_lowercase().contains(&needle));
+    }
+    if let Some(query) = &query {
+        let needle = query.to_lowercase();
+        records.retain(|r| {
+            r.record.line.to_lowercase().contains(&needle)
+                || r.record.source.to_lowercase().contains(&needle)
+        });
+    }
+    // Time window, both bounds inclusive.
+    records.retain(|r| r.within(since_ms, until_ms));
+    // Newest first; the sort is stable, so records sharing a timestamp
+    // keep their source order (gateway files emit newest-first).
+    // "asc" is the exact mirror — the sorted vec reversed — so
+    // same-timestamp groups (file-backed lines share one mtime) keep
+    // their source order in the oldest-first view too, instead of
+    // flipping within the group, and page boundaries mirror between
+    // the two orders.
+    records.sort_by_key(|r| std::cmp::Reverse(r.record.ts));
+    // `order` is strict: an unrecognized value is a caller bug and
+    // is refused, not silently treated as the default (code-review
+    // 4.17).
+    match order.as_deref() {
+        None | Some("desc") => {}
+        Some("asc") => records.reverse(),
+        Some(other) => {
+            return Err(ApiError::InvalidInput(format!(
+                "unknown log order {other:?}; expected \"asc\" or \"desc\""
+            )))
+        }
+    }
+    let total_matching = records.len();
+    let offset = offset.unwrap_or(0) as usize;
+    let mut page: Vec<Value> = Vec::new();
+    for r in records.into_iter().skip(offset).take(limit) {
+        let mut line = serde_json::to_value(&r.record)?;
+        if r.estimated {
+            line["ts_estimated"] = json!(true);
+        }
+        page.push(line);
+    }
+    Ok(json!({
+        "lines": page,
+        "total_matching": total_matching,
+        "total": total_matching,
+        // Paging cut records when any matched record sits outside
+        // the page — before it (a nonzero offset into a non-empty
+        // result) or after it (code-review 4.9: the offset side was
+        // previously not reported).
+        "truncated": (offset > 0 && total_matching > 0) || total_matching > offset + page.len(),
+        "scopes": scopes,
+    }))
+}
+
+/// Abort a tracked task: cancels its work cooperatively (routing to the
+/// operation's own cancel op where one exists) and waits a bounded
+/// grace period for it to stop. See [`tasks`].
+pub async fn op_task_abort(
+    state: &Arc<AppState>,
+    sink: &Arc<dyn EventSink>,
+    task_id: String,
+) -> ApiResult {
+    tasks::abort(state, sink, task_id).await
+}
+
+/// All tracked tasks.
+pub async fn op_tasks_list(state: &Arc<AppState>, _sink: &Arc<dyn EventSink>) -> ApiResult {
+    let tasks = state.tasks.records.lock().await;
+    let list: Vec<&TaskRecord> = tasks.values().collect();
+    Ok(serde_json::to_value(list)?)
+}
+
+/// The app's own JSON Lines log (`logs/app.log` + its `.prev`, see
+/// [`logging`]) as the bundle's "app" scope: every tracing event the
+/// process logged, task-correlated, oldest first and verbatim so the
+/// bundle's `logs/app.log` stays machine-readable. `None` when the
+/// app has not logged anything yet.
+pub(crate) fn app_log_scope(data_dir: &std::path::Path) -> Option<(String, Vec<String>)> {
+    let lines = logging::app_log_lines(data_dir, logging::DIAGNOSTICS_MAX_LINES);
+    (!lines.is_empty()).then(|| ("app".to_string(), lines))
+}
+
+/// Export a diagnostics bundle (spec §14 `diagnostics_export_bundle`):
+/// zip of config snapshot + per-scope recent logs + telemetry snapshot +
+/// versions file. Returns the bundle path.
+pub async fn op_diagnostics_export_bundle(
+    state: &Arc<AppState>,
+    _sink: &Arc<dyn EventSink>,
+) -> ApiResult {
+    let cfg = state.config.read().await.clone();
+    // The telemetry poller starts lazily on first use; in a session
+    // that never opened a telemetry view, this call starts it and an
+    // immediate snapshot is still empty. Give the first poll a short
+    // window to land so the bundle carries the machine's GPU state
+    // instead of an empty array.
+    let store = state.telemetry().await;
+    let mut samples: Vec<GpuSample> = lock_telemetry(&store).snapshot();
+    for _ in 0..10 {
+        if !samples.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        samples = lock_telemetry(&store).snapshot();
+    }
+    let telemetry_json = serde_json::to_string_pretty(&samples)?;
+    // Every retained supervisor log scope (log_scopes() also covers
+    // scopes whose process was pruned but whose ring, incl. an archived
+    // previous run, is retained), copied under one short lock.
+    let mut scope_records: Vec<(String, Vec<LogRecord>)> = {
+        let sup = state.supervisor().await.lock().await;
+        let mut ids: Vec<String> = sup.log_scopes().into_iter().map(|s| s.id).collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let records = sup.logs_query(&id, None, None, 5000).records;
+                (id, records)
+            })
+            .collect()
+    };
+    // The file-backed scopes join the bundle (no lock held): the
+    // gateway's LiteLLM output and lifecycle markers (the record of
+    // the most recent gateway failures), the wizard log (step
+    // outcomes, unfinished steps, busy rejections), the optimize log,
+    // PostgreSQL's server log and markers, the log receiver's logs,
+    // the service helper's log, and each backend's lifecycle markers
+    // and service-mode output (merged into that backend's scope).
+    let backend_ids: Vec<String> = cfg.backends.iter().map(|b| b.id.clone()).collect();
+    for (id, files) in file_log_scopes(&state.data_dir, &backend_ids) {
+        let (records, _) = file_scope_records(&id, &files, true);
+        if records.is_empty() {
+            continue;
+        }
+        match scope_records.iter_mut().find(|(s, _)| *s == id) {
+            Some((_, existing)) => existing.extend(records),
+            None => scope_records.push((id, records)),
+        }
+    }
+    let mut log_scopes: Vec<(String, Vec<String>)> = Vec::new();
+    for (scope, mut records) in scope_records {
+        // Oldest first; reversing the newest-first sources first keeps
+        // same-timestamp groups in file order under the stable sort.
+        records.reverse();
+        records.sort_by_key(|r| r.ts);
+        let lines: Vec<String> = records
+            .iter()
+            .map(|r| {
+                // Archived (previous-run) records keep their marker in
+                // the bundle so the distinction survives export.
+                let archived = if r.archived { " [archived]" } else { "" };
+                format!(
+                    "[{}] [{:?}]{} {}",
+                    r.ts.format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+                    r.stream,
+                    archived,
+                    r.line
+                )
+            })
+            .collect();
+        log_scopes.push((scope, lines));
+    }
+    // The JSON Lines app log (T-05) joins as the "app" scope.
+    if let Some(scope) = app_log_scope(&state.data_dir) {
+        log_scopes.push(scope);
+    }
+    let versions = vec![
+        ("app".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        (
+            "config_schema".to_string(),
+            manager_config::CURRENT_VERSION.to_string(),
+        ),
+    ];
+    let dest_dir = state.data_dir.join("diagnostics");
+    let path = manager_config::export_diagnostics(
+        &cfg,
+        &log_scopes,
+        &telemetry_json,
+        &versions,
+        &dest_dir,
+    )
+    .map_err(ApiError::from)?;
+    Ok(json!({ "path": path }))
+}
+
+#[cfg(test)]
+mod tests;

@@ -9,14 +9,14 @@
 //! runs the admin-class start-gateway step, exactly as the desktop
 //! flow composes the same primitives for the signed-in user.
 
-use manager_app::registry::{dispatch, Op};
+use manager_app::registry::{dispatch_from, Op};
 use manager_app::ApiError;
 use serde_json::{json, Value};
 
-use crate::ApiCtx;
+use crate::{ApiCtx, API_ORIGIN};
 
 async fn call(ctx: &ApiCtx, op: Op, args: Value) -> Result<Value, ApiError> {
-    dispatch(&ctx.app, &ctx.sink, op, args).await
+    dispatch_from(&ctx.app, &ctx.sink, op, args, API_ORIGIN).await
 }
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -28,10 +28,7 @@ fn closed_object(body: &Value) -> Result<&serde_json::Map<String, Value>, ApiErr
         .ok_or_else(|| invalid("request body must be a JSON object"))
 }
 
-fn reject_unknown(
-    obj: &serde_json::Map<String, Value>,
-    allowed: &[&str],
-) -> Result<(), ApiError> {
+fn reject_unknown(obj: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<(), ApiError> {
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(invalid(format!("unknown field `{key}`")));
@@ -66,7 +63,13 @@ pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, A
     let obj = closed_object(&body)?;
     reject_unknown(
         obj,
-        &["display_name", "enabled", "moe_layers", "default_offload_layers", "mtp"],
+        &[
+            "display_name",
+            "enabled",
+            "moe_layers",
+            "default_offload_layers",
+            "mtp",
+        ],
     )?;
     if obj.is_empty() {
         return Err(invalid("no fields to apply"));
@@ -98,9 +101,9 @@ pub async fn patch_model(ctx: &ApiCtx, id: &str, body: Value) -> Result<Value, A
             match obj.get(key) {
                 None | Some(Value::Null) => Ok(Value::Null),
                 Some(v) => {
-                    let n = v
-                        .as_u64()
-                        .ok_or_else(|| invalid(format!("`{key}` must be a non-negative integer or null")))?;
+                    let n = v.as_u64().ok_or_else(|| {
+                        invalid(format!("`{key}` must be a non-negative integer or null"))
+                    })?;
                     u32::try_from(n)
                         .map(|n| json!(n))
                         .map_err(|_| invalid(format!("`{key}` is out of range")))
@@ -185,7 +188,10 @@ fn group_name(group: &Value) -> Option<&str> {
 /// API accepts is exactly what the app will read back.
 fn normalize_group(body: &Value) -> Result<Value, ApiError> {
     let obj = closed_object(body)?;
-    reject_unknown(obj, &["name", "members", "strategy", "fallbacks", "purpose"])?;
+    reject_unknown(
+        obj,
+        &["name", "members", "strategy", "fallbacks", "purpose"],
+    )?;
     let mut normalized = json!({
         "name": obj.get("name").cloned().unwrap_or(Value::Null),
         "members": obj.get("members").cloned().unwrap_or_else(|| json!([])),
@@ -209,8 +215,17 @@ pub async fn create_group(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> 
     create_group_inner(ctx, body).await
 }
 
+/// The name follows the app's own rule, and a body with a name alone IS
+/// the app's create (an empty group).
 async fn create_group_inner(ctx: &ApiCtx, body: Value) -> Result<Value, ApiError> {
-    let group = normalize_group(&body)?;
+    let mut group = normalize_group(&body)?;
+    let trimmed = group_name(&group).unwrap_or_default().trim().to_string();
+    manager_config::validate_group_name(&trimmed).map_err(invalid)?;
+    if body.as_object().is_some_and(|o| o.len() == 1) {
+        call(ctx, Op::GatewayCreateGroup, json!({ "name": trimmed })).await?;
+        return Ok(json!({ "name": trimmed }));
+    }
+    group["name"] = json!(trimmed);
     let name = group_name(&group).unwrap_or_default().to_string();
     let mut groups = gateway_groups(ctx).await?;
     if groups.iter().any(|g| group_name(g) == Some(name.as_str())) {
@@ -249,13 +264,15 @@ async fn patch_group_inner(ctx: &ApiCtx, name: &str, body: Value) -> Result<Valu
     Ok(json!({ "name": name }))
 }
 
-/// DELETE /api/v1/gateway/groups/{name}.
-pub async fn delete_group(ctx: &ApiCtx, name: &str) -> Result<Value, ApiError> {
+/// DELETE /api/v1/gateway/groups/{name}: the app's own delete, which
+/// refuses a group with members; with `cascade` the group goes with its
+/// membership.
+pub async fn delete_group(ctx: &ApiCtx, name: &str, cascade: bool) -> Result<Value, ApiError> {
     let _guard = ctx.config_write_lock.lock().await;
-    delete_group_inner(ctx, name).await
-}
-
-async fn delete_group_inner(ctx: &ApiCtx, name: &str) -> Result<Value, ApiError> {
+    if !cascade {
+        call(ctx, Op::GatewayDeleteGroup, json!({ "name": name })).await?;
+        return Ok(json!({ "deleted": name }));
+    }
     let mut groups = gateway_groups(ctx).await?;
     let before = groups.len();
     groups.retain(|g| group_name(g) != Some(name));
@@ -288,10 +305,7 @@ pub async fn gateway_start(ctx: &ApiCtx) -> Result<Value, ApiError> {
 pub fn validate_apply_body(body: &Value) -> Result<String, ApiError> {
     let obj = closed_object(body)?;
     reject_unknown(obj, &["mode"])?;
-    let mode = obj
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("now");
+    let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("now");
     if mode != "now" && mode != "drain" {
         return Err(invalid("`mode` must be \"drain\" or \"now\""));
     }
@@ -325,28 +339,19 @@ pub async fn activation_apply(ctx: &ApiCtx, body: Value) -> Result<Value, ApiErr
 /// route handler in place of a direct dispatch.
 pub async fn update_gateway_config(ctx: &ApiCtx, patch: Value) -> Result<Value, ApiError> {
     let _guard = ctx.config_write_lock.lock().await;
+    // The whole patch first, so a bad field beside `bind_host` does not
+    // leave the bind address saved.
+    manager_app::check_gateway_patch(&ctx.app, patch.clone()).await?;
     let mut patch = patch;
-    let bind = patch
-        .as_object_mut()
-        .and_then(|o| o.remove("bind_host"));
+    let bind = patch.as_object_mut().and_then(|o| o.remove("bind_host"));
     let mut bind_result: Option<Value> = None;
     if let Some(host) = bind {
         let host = host
             .as_str()
             .ok_or_else(|| invalid("`bind_host` must be a string"))?;
-        bind_result = Some(
-            call(
-                ctx,
-                Op::GatewaySetBindHost,
-                json!({ "host": host }),
-            )
-            .await?,
-        );
+        bind_result = Some(call(ctx, Op::GatewaySetBindHost, json!({ "host": host })).await?);
     }
-    let has_rest = patch
-        .as_object()
-        .map(|o| !o.is_empty())
-        .unwrap_or(false);
+    let has_rest = patch.as_object().map(|o| !o.is_empty()).unwrap_or(false);
     if has_rest {
         let mut result = call(ctx, Op::UpdateGatewayConfig, json!({ "patch": patch })).await?;
         if let (Some(b), Some(obj)) = (bind_result, result.as_object_mut()) {
