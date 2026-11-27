@@ -1118,7 +1118,16 @@ fn target_logical(cfg: &AppConfig, target: &str) -> Result<PathBuf, ApiError> {
                 ))
             });
     }
-    let p = PathBuf::from(target.trim());
+    // Logical paths are written `models\<file>.gguf` (the form the UI
+    // and this error show) on every OS: accept either separator. A
+    // leading separator stays as written, so an absolute path is still
+    // refused by `tier_relative`.
+    let t = target.trim();
+    let p: PathBuf = if t.starts_with(['\\', '/']) {
+        PathBuf::from(t)
+    } else {
+        t.split(['\\', '/']).filter(|s| !s.is_empty()).collect()
+    };
     if tier_relative(&p).is_some() {
         return Ok(p);
     }
