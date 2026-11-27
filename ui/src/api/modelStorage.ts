@@ -101,6 +101,16 @@ export interface StorageMoveRecord {
   instant: boolean;
 }
 
+/** A directory holding recorded cold copies that is no longer a
+ *  configured tier — usually a config saved by a build that does not
+ *  know `model_storage`. The models there look missing until it is
+ *  added back. */
+export interface StorageLostTier {
+  path: string;
+  files: number;
+  bytes: number;
+}
+
 export interface ModelStorageStatus {
   config: ModelStorageConfig;
   tiers: StorageTierStatus[];
@@ -108,6 +118,8 @@ export interface ModelStorageStatus {
   planned: StoragePlannedMove[];
   skipped: StoragePlannedMove[];
   moves: StorageMoveRecord[];
+  /** Absent from builds before the lost-tier warning. */
+  lost_tiers?: StorageLostTier[];
 }
 
 /** list_models' per-model `storage` block (null when the model's

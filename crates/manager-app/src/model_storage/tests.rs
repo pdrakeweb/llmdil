@@ -391,3 +391,52 @@ async fn startup_sweeps_partials_and_marks_interrupted_moves() {
     assert!(!dir.join("models").join("Z.gguf.partial").exists());
     assert_eq!(last_move(&state).outcome, MoveOutcome::Interrupted);
 }
+
+#[tokio::test]
+async fn a_tier_dropped_from_the_config_is_reported_while_its_files_remain() {
+    // The 2026-11-26 incident: a build without tiered storage saved the
+    // config and the cold tier's section vanished, so the demoted models
+    // looked missing with nothing saying why.
+    let content = b"gguf bytes for the lost tier".to_vec();
+    let (state, _dir, cold) = tiered_state(&content);
+    let sink = test_sink();
+    op_model_storage_demote(&state, &sink, "m1".into())
+        .await
+        .unwrap();
+    wait_idle(&state).await;
+    assert_eq!(last_move(&state).outcome, MoveOutcome::Done);
+
+    let status = op_model_storage_status(&state, &sink).await.unwrap();
+    assert_eq!(
+        status["lost_tiers"],
+        json!([]),
+        "a configured tier is not lost"
+    );
+
+    state.config.write().await.model_storage.cold_tiers.clear();
+    let status = op_model_storage_status(&state, &sink).await.unwrap();
+    let lost = status["lost_tiers"].as_array().unwrap();
+    assert_eq!(lost.len(), 1, "{status}");
+    assert_eq!(
+        path_key(Path::new(lost[0]["path"].as_str().unwrap())),
+        path_key(&cold)
+    );
+    assert_eq!(lost[0]["files"], json!(1));
+    assert_eq!(lost[0]["bytes"], json!(content.len()));
+
+    // Once the files are gone (a tier emptied on purpose), no warning.
+    std::fs::remove_file(cold.join("M1.gguf")).unwrap();
+    let status = op_model_storage_status(&state, &sink).await.unwrap();
+    assert_eq!(status["lost_tiers"], json!([]));
+}
+
+#[test]
+fn archive_roots_strip_the_relative_name() {
+    let root = unique_test_dir("llm-mgr-root");
+    let p = root.join("sub").join("X.gguf");
+    assert_eq!(
+        root_of(&p, &PathBuf::from("sub").join("x.GGUF")),
+        Some(root.clone())
+    );
+    assert_eq!(root_of(&p, Path::new("Y.gguf")), None);
+}

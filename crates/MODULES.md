@@ -39,6 +39,14 @@ request_log_len), `ModelGroup` (name, members, strategy, fallbacks),
 `WinMlConfig`, `UpdatePolicy`, `ComponentUpdate`, `NotificationConfig`,
 `ConfigError`.
 
+**Unknown settings survive a save** (`preserve`): `save` reads the file it
+replaces and carries over every field this build does not know (one that
+`migrate` + serialize does not reproduce) at the same place: object members
+by key, array elements by `"id"` (by index when the length is unchanged).
+Known fields are never carried, so deliberate removals stay removed, and a
+carried field that would change what this build reads is dropped. With
+nothing to carry the file is byte-for-byte `to_string_pretty(config)`.
+
 **Functions:**
 `load(path: &PathBuf) -> Result<AppConfig, ConfigError>` (migrate, validate,
 fall back to `.bak`); `load_detailed(path) -> Result<LoadReport, ConfigError>`

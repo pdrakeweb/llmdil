@@ -1047,8 +1047,9 @@ pub async fn op_model_storage_status(
     _sink: &Arc<dyn EventSink>,
 ) -> ApiResult {
     let cfg = state.config.read().await.clone();
-    let (entries, usage, moves) = with_state(state, |st| {
+    let (entries, usage, moves, lost) = with_state(state, |st| {
         let entries = inventory(&cfg, st);
+        let lost = lost_tiers(&cfg, st);
         let usage: HashMap<String, Value> = entries
             .iter()
             .map(|e| {
@@ -1064,7 +1065,7 @@ pub async fn op_model_storage_status(
             })
             .collect();
         let moves: Vec<MoveRecord> = st.moves.iter().rev().take(20).cloned().collect();
-        (entries, usage, moves)
+        (entries, usage, moves, lost)
     });
     let tiers: Vec<Value> = manager_config::all_tiers(&cfg.model_storage)
         .into_iter()
@@ -1098,7 +1099,78 @@ pub async fn op_model_storage_status(
         "planned": planned.iter().map(|m| json!({ "file": m.logical, "kind": m.kind.as_str(), "reason": m.reason })).collect::<Vec<_>>(),
         "skipped": skipped.iter().map(|m| json!({ "file": m.logical, "kind": m.kind.as_str(), "reason": m.reason })).collect::<Vec<_>>(),
         "moves": moves,
+        "lost_tiers": lost,
     }))
+}
+
+/// Directories that hold cold copies the state file recorded but that
+/// are no longer a configured tier — typically after a build that does
+/// not know `model_storage` saved the config and dropped the section.
+/// The Storage card warns and offers to add each back; until then the
+/// models there look missing. A tier removed on purpose had to be
+/// emptied first (`check_storage_paths`), so it never shows here: only
+/// recorded files that still exist count. Each entry: `path` (the
+/// tier root), `files`, `bytes`.
+pub(crate) fn lost_tiers(cfg: &AppConfig, st: &StorageState) -> Vec<Value> {
+    let mut configured: Vec<String> = manager_config::all_tiers(&cfg.model_storage)
+        .into_iter()
+        .filter_map(|t| tier_root(&cfg.data_dir, &cfg.model_storage, t))
+        .map(|r| path_key(&r))
+        .collect();
+    for r in &mut configured {
+        if !r.ends_with('\\') {
+            r.push('\\');
+        }
+    }
+    // Names under the tier roots the app knows, deepest first, to find
+    // each archive's root (`<root>\<rel>`).
+    let mut rels: Vec<PathBuf> = cfg
+        .models
+        .iter()
+        .map(|m| m.gguf_path.clone())
+        .chain(st.usage.values().map(|u| u.logical.clone()))
+        .filter_map(|l| tier_relative(&l))
+        .collect();
+    rels.sort_by_key(|r| std::cmp::Reverse(r.components().count()));
+    let mut groups: std::collections::BTreeMap<String, (PathBuf, u64, u64)> = Default::default();
+    for a in st.archives.values() {
+        let key = path_key(&a.path);
+        if configured.iter().any(|r| key.starts_with(r.as_str())) {
+            continue;
+        }
+        let root = rels
+            .iter()
+            .find_map(|rel| root_of(&a.path, rel))
+            .or_else(|| a.path.parent().map(Path::to_path_buf));
+        let Some(root) = root else { continue };
+        let Ok(meta) = std::fs::metadata(&a.path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let g = groups
+            .entry(path_key(&root))
+            .or_insert_with(|| (root.clone(), 0, 0));
+        g.1 += 1;
+        g.2 += meta.len();
+    }
+    groups
+        .into_values()
+        .map(|(path, files, bytes)| json!({ "path": path, "files": files, "bytes": bytes }))
+        .collect()
+}
+
+/// `path` minus a trailing `rel` (compared like [`path_key`]), if it
+/// ends with it.
+fn root_of(path: &Path, rel: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = path.components().collect();
+    let n = rel.components().count();
+    if n == 0 || comps.len() <= n {
+        return None;
+    }
+    let root: PathBuf = comps[..comps.len() - n].iter().collect();
+    (path_key(&root.join(rel)) == path_key(path)).then_some(root)
 }
 
 // ---------------------------------------------------------------------------

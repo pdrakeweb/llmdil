@@ -214,7 +214,7 @@ pub fn save(config: &AppConfig, path: &PathBuf) -> Result<(), ConfigError> {
             fs::create_dir_all(parent)?;
         }
     }
-    let json = serde_json::to_string_pretty(config)?;
+    let json = with_unknown_fields(config, path)?;
     let tmp = tmp_path(path);
     if let Err(e) = write_synced(&tmp, json.as_bytes()) {
         let _ = fs::remove_file(&tmp);
@@ -239,6 +239,31 @@ pub fn save(config: &AppConfig, path: &PathBuf) -> Result<(), ConfigError> {
         return Err(e.into());
     }
     Ok(())
+}
+
+/// The JSON to write: `config`, plus any field of the file being
+/// replaced that this build does not know (see [`crate::preserve`]), so
+/// an older build, or one from a branch without a feature, never deletes
+/// that feature's settings. A missing or unparsable file contributes
+/// nothing; with nothing carried the output is exactly what
+/// `to_string_pretty(config)` gives.
+fn with_unknown_fields(config: &AppConfig, path: &Path) -> Result<String, ConfigError> {
+    let on_disk = fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Some(on_disk) = on_disk {
+        let fresh = serde_json::to_value(config)?;
+        let (merged, carried) = crate::preserve::carry_unknown(&on_disk, &fresh);
+        if !carried.is_empty() {
+            tracing::info!(
+                carried = %carried.join(", "),
+                "config save kept {} setting(s) this build does not know",
+                carried.len()
+            );
+            return Ok(serde_json::to_string_pretty(&merged)?);
+        }
+    }
+    Ok(serde_json::to_string_pretty(config)?)
 }
 
 /// Write `bytes` to `path` and flush them to stable storage, so the
@@ -306,6 +331,53 @@ mod tests {
         let err = save(&cfg, &path).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
         assert!(!path.exists(), "invalid config must not be written");
+    }
+
+    #[test]
+    fn save_keeps_settings_this_build_does_not_know() {
+        let dir = unique_tmpdir("save-unknown");
+        let path = dir.join("config.json");
+        let cfg = working_config();
+        save(&cfg, &path).unwrap();
+        // A newer build (or another branch) added a section and a
+        // backend field.
+        let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["model_storage_next"] = serde_json::json!({"cold_tiers": [{"path": "E:/m"}]});
+        raw["backends"][0]["flags_next"] = serde_json::json!(["--x"]);
+        fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        // This build loads it, changes something it knows, and saves.
+        let mut cfg = load(&path).unwrap();
+        cfg.backends[0].port += 100;
+        save(&cfg, &path).unwrap();
+
+        let back: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back["model_storage_next"], raw["model_storage_next"]);
+        assert_eq!(
+            back["backends"][0]["flags_next"],
+            raw["backends"][0]["flags_next"]
+        );
+        assert_eq!(
+            back["backends"][0]["port"],
+            serde_json::json!(cfg.backends[0].port)
+        );
+        assert_eq!(
+            serde_json::to_value(load(&path).unwrap()).unwrap(),
+            serde_json::to_value(&cfg).unwrap()
+        );
+    }
+
+    #[test]
+    fn save_without_unknown_fields_is_unchanged() {
+        let dir = unique_tmpdir("save-plain");
+        let path = dir.join("config.json");
+        let cfg = working_config();
+        save(&cfg, &path).unwrap();
+        save(&cfg, &path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            serde_json::to_string_pretty(&cfg).unwrap()
+        );
     }
 
     #[test]

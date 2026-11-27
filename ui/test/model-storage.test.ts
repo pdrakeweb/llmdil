@@ -3,7 +3,7 @@ import type { ModelRow, ModelStorageConfig, ModelStorageRow } from "../src/api";
 import { isColdTier } from "../src/api";
 import { mockModelStorageStatus } from "../src/mock";
 import {
-  fmtAgo, modelStorageActionsHtml, modelStorageChipsHtml, modelStorageTilesHtml, moveButtonsHtml, storageCardHtml,
+  fmtAgo, lostTiersHtml, modelStorageActionsHtml, modelStorageChipsHtml, modelStorageTilesHtml, moveButtonsHtml, storageCardHtml,
   storageCtx, storageMoving, tierDisplayName,
 } from "../src/views/modelStorage";
 import { asStorageConfig, modelStoragePanelHtml, storageConfigFromDraft, storageDraftFrom } from "../src/views/settingsPanels";
@@ -83,6 +83,17 @@ describe("tiered storage: Storage card", () => {
     expect(open).toContain('data-storage-act="promote" data-storage-target="models\\scratch-merge-Q5_K_M.gguf"');
     const gone = { ...st, tiers: st.tiers.map((t) => t.tier === "cold" ? { ...t, available: false, free_bytes: null, total_bytes: null, files: [], model_bytes: 0 } : t) };
     expect(storageCardHtml(gone, null, [], { unregOpen: false, movesOpen: false, note: null })).toMatch(/badge-err[^>]*>Unavailable/);
+  });
+  it("warns about a lost cold tier with a button to add it back", () => {
+    const st = mockModelStorageStatus();
+    const ui = { unregOpen: false, movesOpen: false, note: null };
+    expect(storageCardHtml(st, null, [], ui)).not.toContain("restore-tier");
+    const lost = { ...st, lost_tiers: [{ path: "E:\\llm-models", files: 8, bytes: 121.8e9 }] };
+    const html = storageCardHtml(lost, null, [], ui);
+    expect(html).toContain("8 model files");
+    expect(html).toContain("no longer a configured cold tier");
+    expect(html).toContain('data-storage-act="restore-tier" data-storage-target="E:\\llm-models"');
+    expect(lostTiersHtml({ ...st, lost_tiers: [{ path: "D:\\x", files: 1, bytes: 1 }] })).toContain("1 model file (");
   });
   it("context and polling", () => {
     const st = mockModelStorageStatus();

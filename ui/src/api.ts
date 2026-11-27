@@ -164,6 +164,7 @@ export type {
   ModelStorageStatus,
   ModelStorageRow,
   StorageMoveStart,
+  StorageLostTier,
 } from "./api/modelStorage";
 export {
   getLogs,

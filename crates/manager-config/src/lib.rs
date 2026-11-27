@@ -24,6 +24,7 @@ mod catalog;
 mod mcp;
 mod migrate;
 mod persist;
+mod preserve;
 mod serving;
 mod settings;
 mod storage;

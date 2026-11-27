@@ -248,6 +248,19 @@ function unregisteredHtml(files: StorageFileStatus[], ui: StorageCardUi, ctx: St
   </div>`;
 }
 
+/** Warning per lost tier (a directory with recorded cold copies that
+ *  is no longer configured), with a button that adds it back. */
+export function lostTiersHtml(st: ModelStorageStatus): string {
+  const lost = st.lost_tiers ?? [];
+  return lost.map((t) => {
+    const n = t.files === 1 ? "1 model file" : `${t.files} model files`;
+    return `<div class="banner" style="margin:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap" role="alert">
+      ${icon("warn")}<span style="flex:1 1 240px;min-width:0">${n} (${esc(fmtBytes(t.bytes))}) ${t.files === 1 ? "is" : "are"} on <span style="font-family:var(--mono);word-break:break-all">${esc(t.path)}</span>, which is no longer a configured cold tier, so ${t.files === 1 ? "it shows" : "they show"} as missing. This happens when a build without tiered storage saves the settings.</span>
+      <button class="btn" data-storage-act="restore-tier" data-storage-target="${esc(t.path)}" title="Add ${esc(t.path)} back as a cold tier">${icon("plus")} Add back as cold tier</button>
+    </div>`;
+  }).join("");
+}
+
 function outcomeChip(r: StorageMoveRecord): string {
   if (r.outcome === "failed") return `<span class="chip badge-err"${r.error ? ` title="${esc(r.error)}"` : ""}>Failed</span>`;
   if (r.outcome === "running") return `<span class="chip badge-warn">Running</span>`;
@@ -300,6 +313,7 @@ export function storageCardHtml(st: ModelStorageStatus | null, error: string | n
   return `<div class="card" id="card-model-storage" style="margin-bottom:12px">
     <h3>${icon("layers")} Storage<span class="info-tip" title="Model files live on the hot tier (fast drive) or a cold tier (slower drive). Promoting copies a cold file to hot and keeps the cold copy as an archive; demoting deletes the hot copy when its archive is intact, and copies it to cold first otherwise. Each bar is the tier's volume: one segment per model file, other files gray, free space unfilled.">${icon("info")}</span>
       ${st.config.auto ? "" : ` <span class="chip" title="Policy-driven moves are off; Promote and Demote still work.">Auto moves: off</span>`}</h3>
+    ${lostTiersHtml(st)}
     ${st.tiers.map((t) => tierHtml(t, st, colorOf, nameOf)).join("")}
     ${movesInFlightHtml(st.files, nameOf)}
     ${unregisteredHtml(st.files, ui, ctx, nameOf)}

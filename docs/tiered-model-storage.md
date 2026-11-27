@@ -271,6 +271,7 @@ resolver; identity comparisons stay.
 | Start requested during a copy | start proceeds from the current location; copy pauses while the backend is Starting |
 | Download or verify in flight | moves for that model refused/queued |
 | Config edited to remove a cold tier holding models | `model_storage_set` refuses while that tier holds tierable models (demote/promote them first) |
+| `model_storage` dropped by another build's save | (2026-11-26: the console branch's build saved over the section.) Builds from this fix on keep settings they do not know (`manager-config` `preserve`). Older builds still drop them, so `model_storage_status` reports `lost_tiers`: directories holding recorded archive copies that still exist but are no longer a configured tier. The Storage card warns ("8 model files … no longer a configured cold tier") and offers *Add back as cold tier*. A tier removed on purpose had to be empty first, so it never shows there |
 
 ## 10. Operations (registry)
 

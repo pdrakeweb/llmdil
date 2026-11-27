@@ -1,6 +1,6 @@
 /* Models view (split from static.ts). */
 
-import { cancelDownload, deleteModel, downloadModel, getBackends, getModelStorageStatus, getModels, isTauri, modelAdd, modelHfHeader, modelHfLookup, modelHfSuggest, modelSetEnabled, modelSetKeepHot, modelSetMtp, modelSetOffloadSpec, modelSetShortName, modelStorageCancel, modelStorageDemote, modelStoragePromote, pauseModelDownload, resumeModelDownload, verifyModel } from "../api";
+import { cancelDownload, deleteModel, downloadModel, getBackends, getModelStorageStatus, getModels, isTauri, modelAdd, modelHfHeader, modelHfLookup, modelHfSuggest, modelSetEnabled, modelSetKeepHot, modelSetMtp, modelSetOffloadSpec, modelSetShortName, modelStorageCancel, modelStorageDemote, modelStoragePromote, modelStorageSet, pauseModelDownload, resumeModelDownload, verifyModel } from "../api";
 import type { HfHeaderResult, HfLookupQuant, HfLookupRepo, ModelRow, ModelStorageStatus } from "../api";
 import { fmtCount, meter, stackedBar, trim1 } from "../charts";
 import { confirmDialog } from "../dialog";
@@ -861,6 +861,18 @@ export async function wireModels(root: HTMLElement): Promise<() => void> {
         storageUi.note = { text: "Copy failed — copy the value manually.", err: true };
       }
       paintStorage();
+      return;
+    }
+    if (act === "restore-tier") {
+      if (!storageStatus) return;
+      (t as HTMLButtonElement).disabled = true;
+      const cfg = storageStatus.config;
+      const r = await modelStorageSet({ ...cfg, cold_tiers: [...cfg.cold_tiers, { path: target, label: "" }] });
+      if (disposed) return;
+      storageUi.note = r.error
+        ? { text: `Adding the cold tier failed: ${r.error}`, err: true }
+        : { text: `${target} is a cold tier again.`, err: false };
+      await load();
       return;
     }
     if (act !== "promote" && act !== "demote" && act !== "move-cancel") return;
