@@ -1,6 +1,6 @@
 [package]
 name = "manager-diag"
-version = "0.1.62"
+version = "0.1.63"
 edition = "2021"
 
 # Pure logic for the debug console (docs/debug-console.md): recipe
